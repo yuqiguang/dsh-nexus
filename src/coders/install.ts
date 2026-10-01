@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { access, constants, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { access, constants, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import type { CoderKind } from './types.js';
 import type { CodexSettings } from './settings.js';
 import { redact } from './normalize.js';
+import type { DownloadProgress } from './install-download.js';
 
 /** Versions Nexus installs for itself; bump deliberately and rerun the adapter tests. */
 export const MANAGED_PACKAGES: Record<CoderKind, { name: string; version: string }> = {
@@ -290,16 +291,19 @@ export async function ensureClaudeHome(layout: ManagedLayout): Promise<void> {
 export interface InstallProgress {
   coder: CoderKind;
   phase: 'installing' | 'installed' | 'failed';
-  stage?: 'preparing' | 'packages' | 'verifying' | 'configuring';
+  stage?: 'preparing' | 'downloading' | 'packages' | 'verifying' | 'configuring';
   startedAt: number;
   lastOutputAt?: number;
+  timeoutMs?: number;
+  download?: DownloadProgress;
   finishedAt?: number;
   error?: string;
   /** Bounded, sanitized tail of npm's output, for the page. */
   log: string;
 }
 
-export type NpmRunner = (args: string[], cwd: string, onOutput: (chunk: string) => void, signal: AbortSignal) => Promise<{ code: number | null; error?: string }>;
+export type NpmRunner = (args: string[], cwd: string, onOutput: (chunk: string) => void, signal: AbortSignal,
+  onDownload?: (progress?: DownloadProgress) => void) => Promise<{ code: number | null; error?: string }>;
 
 /**
  * Runs npm in its own process group so a timeout can end the whole tree:
@@ -307,15 +311,24 @@ export type NpmRunner = (args: string[], cwd: string, onOutput: (chunk: string) 
  * keep downloading otherwise.
  */
 export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner {
-  return async (args, cwd, onOutput, signal) => {
+  return async (args, cwd, onOutput, signal, onDownload) => {
     let invocation: Awaited<ReturnType<typeof npmInvocation>>;
     try { invocation = await npmInvocation(command, process.env); }
     catch (error) { return { code: null, error: (error as Error).message }; }
+    let worker: { command: string; args: string[] } | undefined;
+    if (onDownload && args[0] === 'install') {
+      // Use an external Node executable, never the desktop Electron executable.
+      const npm = invocation.args[0] ?? (isAbsolute(command) ? command : await onPath(command, process.env));
+      const cli = npm && await realpath(npm).catch(() => undefined);
+      const node = invocation.args.length ? invocation.command : await onPath('node', process.env);
+      if (cli && basename(cli) === 'npm-cli.js' && node) worker = { command: node,
+        args: [fileURLToPath(new URL('./install-worker.js', import.meta.url)), dirname(dirname(cli)), invocation.command, ...invocation.args, ...args] };
+    }
     if (signal.aborted) return { code: null, error: 'install_timeout' };
     return new Promise<{ code: number | null; error?: string }>(resolvePromise => {
       let child;
       try {
-        child = spawn(invocation.command, [...invocation.args, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true,
+        child = spawn(worker?.command ?? invocation.command, worker?.args ?? [...invocation.args, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe', worker ? 'pipe' : 'ignore'], detached: process.platform !== 'win32', windowsHide: true,
           env: { ...process.env, NPM_CONFIG_UPDATE_NOTIFIER: 'false' } });
       } catch (error) { resolvePromise({ code: null, error: (error as Error).message }); return; }
       const group = (signalName: NodeJS.Signals) => {
@@ -332,12 +345,34 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
       let killer: NodeJS.Timeout | undefined;
       const abort = () => { group('SIGTERM'); killer = setTimeout(() => group('SIGKILL'), killGraceMs); killer.unref(); };
       if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
-      child.stdout.on('data', chunk => onOutput(chunk.toString()));
-      child.stderr.on('data', chunk => onOutput(chunk.toString()));
+      child.stdout!.on('data', chunk => onOutput(chunk.toString()));
+      child.stderr!.on('data', chunk => onOutput(chunk.toString()));
+      let metrics = '', workerError: string | undefined;
+      child.stdio[3]?.on('data', chunk => {
+        metrics += chunk.toString();
+        if (metrics.length > 64_000) { metrics = ''; return; }
+        let end: number;
+        while ((end = metrics.indexOf('\n')) >= 0) {
+          const line = metrics.slice(0, end); metrics = metrics.slice(end + 1);
+          try {
+            const value = JSON.parse(line) as (DownloadProgress & { error?: string }) | null;
+            if (value === null) onDownload?.();
+            else if (typeof value.error === 'string' && /^(?:E[A-Z0-9_]+|ERR_[A-Z_]+|download_[a-z_]+|npm_launcher_missing)$/.test(value.error)) workerError = value.error;
+            else if (typeof value.package === 'string' && value.package.length <= 200
+              && ['connecting', 'downloading', 'cached', 'retrying', 'verified'].includes(value.state)
+              && [value.bytes, value.bytesPerSecond, value.attempt, value.total ?? 0].every(n => Number.isFinite(n) && n >= 0)) {
+              onDownload?.({ package: safeInstallText(value.package), state: value.state, bytes: value.bytes,
+                bytesPerSecond: value.bytesPerSecond, attempt: value.attempt,
+                ...(value.total !== undefined ? { total: value.total } : {}),
+                ...(typeof value.source === 'string' ? { source: safeInstallText(value.source).slice(0, 1000) } : {}) });
+            }
+          } catch { /* Ignore malformed worker metrics, never render raw data. */ }
+        }
+      });
       const finish = (result: { code: number | null; error?: string }) => {
         signal.removeEventListener('abort', abort);
         if (killer) clearTimeout(killer);
-        resolvePromise(signal.aborted ? { ...result, error: result.error ?? 'install_timeout' } : result);
+        resolvePromise(signal.aborted ? { ...result, error: result.error ?? 'install_timeout' } : { ...result, ...(workerError ? { error: workerError } : {}) });
       };
       child.on('error', error => finish({ code: null, error: error.message }));
       child.on('close', code => finish({ code }));
@@ -345,12 +380,12 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
   };
 }
 
-const INSTALL_TIMEOUT_MS = 15 * 60_000;
+const INSTALL_TIMEOUT_MS = 60 * 60_000;
 const LOG_LIMIT = 4096;
 
 const PUBLIC_NPM_REGISTRIES = new Set(['registry.npmjs.org', 'registry.npmmirror.com', 'registry.yarnpkg.com']);
 
-function safeDownloadUrl(raw: string): string {
+export function safeDownloadUrl(raw: string): string {
   try {
     const url = new URL(raw);
     const path = decodeURIComponent(url.pathname);
@@ -406,7 +441,7 @@ export class CoderInstaller {
     private readonly afterInstall: (coder: CoderKind) => Promise<void> = async () => {}, private readonly now: () => number = Date.now,
     private readonly host: HostPlatform = hostPlatform(), private readonly timeoutMs = INSTALL_TIMEOUT_MS) {}
 
-  progress(): InstallProgress | undefined { return this.current ? { ...this.current } : undefined; }
+  progress(): InstallProgress | undefined { return this.current ? { ...this.current, ...(this.current.download ? { download: { ...this.current.download } } : {}) } : undefined; }
 
   /** The coder whose install is running right now, if any. */
   installing(): CoderKind | undefined { return this.current?.phase === 'installing' ? this.current.coder : undefined; }
@@ -414,7 +449,7 @@ export class CoderInstaller {
   /** Starts an install; rejects when one is already running. The returned promise settles when npm finishes. */
   start(coder: CoderKind): Promise<void> {
     if (this.current?.phase === 'installing') throw new Error('install_in_progress');
-    this.current = { coder, phase: 'installing', stage: 'preparing', startedAt: this.now(), log: '' };
+    this.current = { coder, phase: 'installing', stage: 'preparing', startedAt: this.now(), timeoutMs: this.timeoutMs, log: '' };
     this.running = this.run(coder).catch(error => {
       if (this.current) Object.assign(this.current, { phase: 'failed', finishedAt: this.now(), error: safeInstallText((error as Error)?.message ?? String(error)).slice(-LOG_LIMIT) });
     });
@@ -444,7 +479,10 @@ export class CoderInstaller {
     let result: Awaited<ReturnType<NpmRunner>>;
     try {
       result = await this.npm(['install', '--no-audit', '--no-fund', '--loglevel=http', '--omit=dev', '--omit=optional'], this.layout.root,
-        chunk => log.write(chunk), controller.signal);
+        chunk => log.write(chunk), controller.signal, download => {
+          progress.download = download;
+          progress.stage = download ? 'downloading' : 'packages';
+        });
     } finally { clearTimeout(timer); log.flush(); }
     if (controller.signal.aborted) throw new Error('install_timeout');
     if (result.code !== 0) throw new Error(result.error ?? `npm exited with ${result.code}`);

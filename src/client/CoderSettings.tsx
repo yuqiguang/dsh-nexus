@@ -53,7 +53,18 @@ function Status({ status }: { status: CoderStatusView }) {
 
 function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12: false }); }
 
-const installStages = { preparing: '准备安装', packages: '下载并安装依赖', verifying: '检查程序文件', configuring: '写入配置' };
+const installStages = { preparing: '准备安装', downloading: '下载程序包', packages: '安装依赖', verifying: '检查程序文件', configuring: '写入配置' };
+const installFailures: Record<string, string> = {
+  install_timeout: '下载或安装超时，请检查网络或代理后重试。', ECONNRESET: '下载连接被重置，请检查网络或代理后重试。',
+  ETIMEDOUT: '连接下载源超时，请检查网络或代理。', ENOTFOUND: '无法解析下载源的域名。',
+  EAI_AGAIN: '暂时无法解析下载源的域名。', ECONNREFUSED: '下载源或代理拒绝连接。',
+  EINTEGRITY: '程序包校验失败，请重新下载。', download_incomplete: '下载不完整，请重试。',
+  download_stalled: '长时间未收到下载数据，请检查网络或代理后重试。',
+  download_manifest_invalid: '下载源没有返回匹配版本的程序包信息或校验值。', download_failed: '程序包下载失败，请检查下载源、网络或代理。',
+};
+function downloadBytes(bytes: number) {
+  return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
+}
 function elapsed(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
@@ -69,16 +80,28 @@ function InstallActivity({ progress, readError }: { progress: InstallProgress; r
     return () => clearInterval(timer);
   }, [active, progress.startedAt]);
   const quietFor = now - (progress.lastOutputAt ?? progress.startedAt);
-  const failure = progress.error === 'install_timeout' ? '下载或安装超时，请检查网络或代理后重试。' : progress.error;
+  const failure = progress.error && (installFailures[progress.error] ?? progress.error);
+  const download = active && progress.stage === 'downloading' ? progress.download : undefined;
+  const network = download?.state === 'downloading';
   return <div className="nexus-install-activity" aria-label={`${names[progress.coder]} 托管安装状态`}>
     <p role={progress.phase === 'failed' ? 'alert' : 'status'}>
       {names[progress.coder]} 托管安装：{active ? `进行中 · ${installStages[progress.stage ?? 'packages']}` : progress.phase === 'installed' ? '已完成' : `失败：${failure ?? '请查看安装日志'}`}
     </p>
-    {active && <progress aria-label={`${names[progress.coder]} 托管安装进度`} />}
+    {active && <progress aria-label={`${names[progress.coder]} 托管安装进度`}
+      {...(network && download.total ? { value: download.bytes, max: download.total } : {})} />}
+    {download && <div className="nexus-download-progress">
+      <p><code>{download.package}</code></p>
+      <p>{download.state === 'cached' ? '读取本地缓存' : download.state === 'verified' ? '程序包校验完成'
+        : download.state === 'retrying' ? `连接中断，正在第 ${download.attempt} 次尝试（重新下载此包）`
+        : download.state === 'connecting' ? '正在连接下载源…' : `下载速度：${downloadBytes(download.bytesPerSecond)}/s${download.bytesPerSecond === 0 ? '（等待数据）' : ''}`}</p>
+      <p>已{download.state === 'cached' ? '读取' : '下载'} {downloadBytes(download.bytes)}{download.total ? ` / ${downloadBytes(download.total)}` : '（总大小暂未知）'}
+        {network && download.total ? ` · ${Math.min(100, Math.floor(download.bytes / download.total * 100))}%` : ''}</p>
+      {download.source && <p className="nexus-channel-hint">下载来源：<code>{download.source}</code></p>}
+    </div>}
     <p className="nexus-channel-hint">{active ? '已用时' : '总用时'} {elapsed((progress.finishedAt ?? now) - progress.startedAt)}
       {active && progress.lastOutputAt !== undefined && ` · 最近输出在 ${elapsed(quietFor)}前`}</p>
     {active && (readError ? <p role="alert">安装状态暂时无法刷新：{readError}。连接恢复后会自动更新。</p>
-      : <p className="nexus-channel-hint">{quietFor >= 30 ? '暂时没有新日志，可能正在等待网络响应或解压文件；下载和安装超过 15 分钟会报超时。' : '状态会自动更新；关闭设置页面后安装仍会继续，请保持 DSH 运行。'}</p>)}
+      : <p className="nexus-channel-hint">{!download && quietFor >= 30 ? `暂时没有新日志，可能正在等待网络响应或解压文件；本次安装最多等待 ${Math.round((progress.timeoutMs ?? 15 * 60_000) / 60_000)} 分钟。` : '状态会自动更新；关闭设置页面后安装仍会继续，请保持 DSH 运行。'}</p>)}
     {progress.log && <>
       <p className="nexus-channel-hint">最近日志：<code>{progress.log.trim().split('\n').filter(Boolean).at(-1)}</code></p>
       <details><summary>查看安装日志（最近部分，已脱敏）</summary><pre><code>{progress.log}</code></pre></details>

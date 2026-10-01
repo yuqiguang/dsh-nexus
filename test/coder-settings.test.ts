@@ -215,7 +215,7 @@ test('the installer pins the package and its platform package, marks success onl
   assert.equal(installer.installing(), 'codex');
   assert.throws(() => installer.start('claude'), /install_in_progress/);
   await started;
-  assert.deepEqual(installer.progress(), { coder: 'codex', phase: 'installed', stage: 'configuring', startedAt: 1000, lastOutputAt: 1001, finishedAt: 1003, log: 'added 1 package\n' });
+  assert.deepEqual(installer.progress(), { coder: 'codex', phase: 'installed', stage: 'configuring', startedAt: 1000, timeoutMs: 60 * 60_000, lastOutputAt: 1001, finishedAt: 1003, log: 'added 1 package\n' });
   assert.equal(installer.installing(), undefined);
   assert.deepEqual(runs, [{ args: ['install', '--no-audit', '--no-fund', '--loglevel=http', '--omit=dev', '--omit=optional'], cwd: root }]);
   assert.deepEqual(after, ['codex']);

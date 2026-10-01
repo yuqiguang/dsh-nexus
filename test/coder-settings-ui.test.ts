@@ -227,7 +227,7 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   assert.match(claude.textContent!, /不会自动排队/);
   view = { ...view, install: { coder: 'codex', phase: 'installing', stage: 'packages', startedAt: Date.now() - 65_000, log: '' } };
   await act(async () => confirm(structuredClone(view)));
-  assert.match(codex.textContent!, /下载并安装依赖/);
+  assert.match(codex.textContent!, /安装依赖/);
   assert.match(codex.textContent!, /已用时 1 分/);
   assert.match(codex.textContent!, /暂时没有新日志/);
   assert.equal(codex.querySelector('progress')?.hasAttribute('value'), false, 'download totals are unknown');
@@ -263,7 +263,7 @@ test('reopening settings shows an existing Claude install, refresh failures and 
     return structuredClone(view);
   });
   const panel = () => ui.dom.window.document.querySelector('[aria-label="Claude Code 托管安装状态"]')!;
-  assert.match(panel().textContent!, /下载并安装依赖/);
+  assert.match(panel().textContent!, /安装依赖/);
   assert.match(panel().textContent!, /最近输出在/);
   const codex = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Codex')!;
   assert.match(codex.querySelector('footer button')!.textContent!, /请先等待 Claude Code 安装结束/);
@@ -293,6 +293,31 @@ test('a rejected install request gives feedback next to its button and releases 
   assert.match(card.textContent!, /安装请求未能确认/);
   assert.doesNotMatch(card.textContent!, /正在启动安装/);
   assert.equal((card.querySelector('footer button') as HTMLButtonElement).disabled, false);
+});
+
+test('download UI shows measured speed and bytes, unknown totals, cached data and a useful network failure', async t => {
+  let view: CodersView = { ...initial(), install: { coder: 'codex', phase: 'installing', stage: 'downloading', startedAt: Date.now(),
+    timeoutMs: 60 * 60_000, log: '', download: { package: '@openai/codex@0.155.1-win32-x64', state: 'downloading',
+      bytes: 1024 * 1024, total: 4 * 1024 * 1024, bytesPerSecond: 64 * 1024, attempt: 1, source: 'https://registry.npmjs.org/@openai/codex' } } };
+  const ui = await page(t, async () => structuredClone(view));
+  const panel = () => ui.dom.window.document.querySelector('[aria-label="Codex 托管安装状态"]')!;
+  assert.match(panel().textContent!, /下载速度：64.0 KB\/s/);
+  assert.match(panel().textContent!, /已下载 1.0 MB \/ 4.0 MB · 25%/);
+  assert.match(panel().textContent!, /下载来源：https:\/\/registry.npmjs.org/);
+  assert.equal(panel().querySelector('progress')?.getAttribute('value'), String(1024 * 1024));
+  view.install!.download = { ...view.install!.download!, total: undefined, bytesPerSecond: 0 };
+  await act(async () => { await delay(1700); });
+  assert.match(panel().textContent!, /0.0 KB\/s（等待数据）/);
+  assert.match(panel().textContent!, /总大小暂未知/);
+  assert.equal(panel().querySelector('progress')?.hasAttribute('value'), false);
+  view.install!.download = { ...view.install!.download!, state: 'cached' };
+  await act(async () => { await delay(1700); });
+  assert.match(panel().textContent!, /读取本地缓存/);
+  assert.doesNotMatch(panel().textContent!, /下载速度/);
+  view.install = { ...view.install!, phase: 'failed', error: 'ECONNRESET', finishedAt: Date.now() };
+  await act(async () => { await delay(1700); });
+  assert.match(panel().textContent!, /下载连接被重置/);
+  assert.doesNotMatch(panel().textContent!, /下载速度|ECONNRESET/);
 });
 
 test('a settings revision changed elsewhere blocks saving until the page reloads', async t => {

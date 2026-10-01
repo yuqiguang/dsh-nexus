@@ -1,6 +1,6 @@
 {
   "name": "nexus-next",
-  "version": "0.2.23",
+  "version": "0.2.24",
   "private": true,
   "type": "module",
   "exports": {
@@ -57,11 +57,14 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.66.1",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@npmcli/config": "10.4.2",
     "@wecom/aibot-node-sdk": "1.0.7",
+    "cacache": "20.0.0",
     "imapflow": "^1.7.8",
     "jszip": "^3.10.1",
     "mailparser": "^3.9.28",
     "nodemailer": "^10.0.10",
+    "npm-registry-fetch": "19.0.0",
     "qrcode": "1.5.4",
     "silk-wasm": "3.7.1"
   },
