@@ -1,0 +1,62 @@
+.nexus-channel-settings { color: var(--dsw-alias-label-primary); max-width: 680px; padding: 4px 0 24px; }
+.nexus-channel-settings h2 { font-size: 20px; margin: 0 0 10px; }
+.nexus-channel-settings p { font-size: 13px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
+.nexus-channel-card { border: 1px solid var(--dsw-alias-border-l2, #dedede); border-radius: 12px; margin-top: 18px; padding: 20px; }
+.nexus-channel-card header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nexus-channel-card h3 { font-size: 16px; margin: 0; }
+.nexus-channel-state { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.nexus-channel-state.connected { color: #15803d; }
+.nexus-channel-state.error, .nexus-channel-settings [role=alert] { color: var(--dsw-alias-label-error, #c2413c); }
+.nexus-channel-card label { display: block; font-size: 13px; margin: 16px 0 6px; }
+.nexus-channel-card input { box-sizing: border-box; width: 100%; font: inherit; font-size: 13px; color: inherit; background: var(--dsw-alias-bg-layer-3, transparent); border: 1px solid var(--dsw-alias-border-l4, #aaa); border-radius: 7px; padding: 9px 11px; }
+.nexus-channel-card input:focus-visible, .nexus-channel-card button:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4f6bff); outline-offset: 2px; }
+.nexus-channel-card footer { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.nexus-channel-card button { cursor: pointer; font: inherit; font-size: 13px; color: inherit; background: transparent; border: 1px solid var(--dsw-alias-border-l4, #aaa); border-radius: 7px; padding: 8px 13px; }
+.nexus-channel-card button.primary { background: var(--dsw-alias-brand-primary, #4f6bff); border-color: transparent; color: #fff; }
+.nexus-channel-card button:disabled { opacity: .5; cursor: default; }
+.nexus-channel-card .nexus-channel-hint { font-size: 12px; }
+.nexus-channel-qr { text-align: center; margin-top: 18px; }
+.nexus-channel-qr img { display: block; max-width: 100%; height: auto; margin: auto; border-radius: 8px; }
+.nexus-channel-card label.nexus-channel-manual { display: flex; align-items: center; gap: 8px; }
+.nexus-channel-manual input[type=checkbox] { width: auto; margin: 0; padding: 0; }
+.nexus-channel-pairing { border-top: 1px solid var(--dsw-alias-border-l2, #dedede); margin-top: 18px; padding-top: 12px; }
+.nexus-channel-pairing button { margin: 10px 8px 0 0; }
+.nexus-channel-pairing input { font-family: monospace; }
+.nexus-channel-account { overflow-wrap: anywhere; }
+@media (max-width: 480px) { .nexus-channel-card { padding: 14px; } }
+.nexus-channel-card select, .nexus-channel-card textarea { box-sizing: border-box; width: 100%; font: inherit; font-size: 13px; color: inherit; background: var(--dsw-alias-bg-layer-3, transparent); border: 1px solid var(--dsw-alias-border-l4, #aaa); border-radius: 7px; padding: 9px 11px; }
+.nexus-channel-card textarea { resize: vertical; min-height: 64px; }
+.nexus-channel-card code { font-size: 12px; overflow-wrap: anywhere; }
+.nexus-channel-card pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.nexus-memory-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
+.nexus-memory-list li { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 8px 0; border-top: 1px solid var(--dsw-alias-border-l2, #eee); overflow-wrap: anywhere; }
+.nexus-memory-list li:first-child { border-top: none; }
+.nexus-memory-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.nexus-memory-list button { padding: 4px 9px; font-size: 12px; flex-shrink: 0; }
+/* One line per turn: hide the rows DSH's compact transcript leaves outside the turn-process group (see chatFold.ts). Attribute names come from ui-chat and are checked on each DSH upgrade. */
+html[data-nexus-chat-fold=on] [data-chat-flow-kind=context]:not([data-turn-process-member]),
+html[data-nexus-chat-fold=on] [data-chat-flow-kind=system-prompt] { display: none; }
+.nexus-coder-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; border: 1px solid var(--dsw-alias-border-l2, #dedede); border-radius: 10px; padding: 8px 12px; margin: 4px 0; font-size: 13px; }
+.nexus-coder-row-title { font-weight: 600; }
+.nexus-coder-row-status { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--dsw-alias-bg-layer-3, #f2f2f2); }
+.nexus-coder-row-detail { flex-basis: 100%; color: var(--dsw-alias-text-secondary, #666); overflow-wrap: anywhere; }
+.nexus-coder-row-open { margin-left: auto; font: inherit; font-size: 12px; cursor: pointer; border: 1px solid var(--dsw-alias-border-l4, #aaa); border-radius: 7px; padding: 3px 10px; background: transparent; color: inherit; }
+.nexus-coder-panel { padding: 12px 16px; font-size: 13px; overflow-y: auto; height: 100%; box-sizing: border-box; }
+.nexus-coder-panel header { display: flex; align-items: center; gap: 10px; }
+.nexus-coder-panel h3 { font-size: 15px; margin: 0; }
+.nexus-coder-panel h4 { font-size: 13px; margin: 18px 0 6px; }
+.nexus-coder-panel-task { white-space: pre-wrap; margin: 8px 0 4px; }
+.nexus-coder-panel-pending { border-left: 3px solid #d98e04; padding-left: 8px; }
+.nexus-coder-panel-result { border: 1px solid var(--dsw-alias-border-l2, #dedede); border-radius: 8px; padding: 8px 10px; margin-top: 10px; }
+.nexus-coder-panel-result p { white-space: pre-wrap; margin: 6px 0; }
+.nexus-coder-entries { list-style: none; margin: 0; padding: 0; }
+.nexus-coder-entry { border-top: 1px solid var(--dsw-alias-border-l1, #eee); padding: 6px 0; }
+.nexus-coder-entry-head { display: flex; gap: 8px; align-items: baseline; }
+.nexus-coder-entry-head time { color: var(--dsw-alias-text-secondary, #888); font-variant-numeric: tabular-nums; flex: none; }
+.nexus-coder-entry-kind { flex: none; font-size: 12px; color: var(--dsw-alias-text-secondary, #666); }
+.nexus-coder-entry-title { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.nexus-coder-entry-facts { margin-left: auto; flex: none; font-size: 12px; color: var(--dsw-alias-text-secondary, #888); }
+.nexus-coder-entry[data-kind="reasoning"] .nexus-coder-entry-kind, .nexus-coder-entry[data-kind="reasoning"] summary { opacity: 0.75; }
+.nexus-coder-entry-body { white-space: pre-wrap; margin: 4px 0 0; }
+.nexus-coder-entry details summary { cursor: pointer; font-size: 12px; color: var(--dsw-alias-text-secondary, #666); margin-top: 2px; }
+.nexus-coder-entry pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 360px; overflow-y: auto; background: var(--dsw-alias-bg-layer-3, #f6f6f6); border-radius: 6px; padding: 6px 8px; margin: 4px 0 0; }

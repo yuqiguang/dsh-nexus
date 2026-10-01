@@ -1,0 +1,11 @@
+[Unit]
+Description=Check every five minutes whether a newer commit should be built and started
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=nexus-update.service
+
+[Install]
+WantedBy=timers.target

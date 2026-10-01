@@ -1,0 +1,20 @@
+node_modules/
+dist/
+dist.previous/
+.nexus/
+.dsh/
+.credentials.yaml
+.env
+.env.*
+!.env.example
+workspace/
+*.log
+coverage/
+*.tgz
+
+# Private development material is not part of this repository.
+docs/
+AGENTS.md
+dist.*/
+*.zip
+*.tar.gz

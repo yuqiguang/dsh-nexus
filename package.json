@@ -1,0 +1,112 @@
+{
+  "name": "nexus-next",
+  "version": "0.2.9",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/src/plugin.js",
+    "./client": "./dist/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/src",
+    "dist/client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "description": "Nexus for DSH: a community plugin for messaging channels, personal assistance, and supervised coding tasks.",
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "start": "node scripts/start.mjs",
+    "service:install": "node scripts/service.mjs install",
+    "service:uninstall": "node scripts/service.mjs uninstall",
+    "service:status": "node scripts/service.mjs status",
+    "health": "node scripts/health.mjs",
+    "update": "node scripts/update.mjs",
+    "build": "node --max-old-space-size=384 scripts/build.mjs",
+    "check": "node --max-old-space-size=512 node_modules/typescript/bin/tsc --noEmit",
+    "test": "node --max-old-space-size=384 --test --test-reporter=spec --test-concurrency=1 ${NEXUS_DIST:-dist}/test/*.test.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.66.1",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@wecom/aibot-node-sdk": "1.0.7",
+    "imapflow": "^1.7.8",
+    "jszip": "^3.10.1",
+    "mailparser": "^3.9.28",
+    "nodemailer": "^10.0.10",
+    "pptxgenjs": "^4.0.1",
+    "qrcode": "1.5.4",
+    "silk-wasm": "3.7.1"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.273",
+    "@deepseek-ai/cordis": "4.0.4",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-host-webserver": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-jobs": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-schedule": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-time-context": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-present": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-web": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-user-questions": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-web": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-win32-process": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-workspace": "0.2.0-rc.2",
+    "react": "18.3.1",
+    "zod": "^4.4.3"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/claude-agent-sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.273",
+    "@deepseek-ai/dsh": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.0-rc.2",
+    "@types/jsdom": "21.1.7",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "25.6.0",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "18.3.24",
+    "@types/react-dom": "18.3.7",
+    "esbuild": "0.25.10",
+    "jsdom": "26.1.0",
+    "react-dom": "18.3.1",
+    "typescript": "6.0.3",
+    "yaml": "2.9.1"
+  }
+}

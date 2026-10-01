@@ -1,0 +1,24 @@
+# Nexus as a user service. Install with: npm run service:install (copies this file, enables and starts it).
+# Logs: journalctl --user -u nexus -f    Restart after a rebuild: systemctl --user restart nexus
+[Unit]
+Description=Nexus personal assistant (DeepSeek Harness)
+After=network-online.target
+Wants=network-online.target
+# A crash loop is capped here; the health check timer keeps probing and reports what it sees.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT__
+ExecStart=/usr/bin/env node scripts/start.mjs --no-open
+# DSH gives the application tree 5 s to dispose; leave room for that before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+# Coder tools (codex, claude) and npm must be on PATH inside the unit; user units get a minimal one.
+Environment="PATH=__PATH__"
+
+[Install]
+WantedBy=default.target

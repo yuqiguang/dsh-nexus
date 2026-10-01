@@ -1,0 +1,11 @@
+[Unit]
+Description=Probe Nexus every minute and restart it when it stops answering
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=nexus-health.service
+
+[Install]
+WantedBy=timers.target

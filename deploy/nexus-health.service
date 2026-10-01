@@ -1,0 +1,8 @@
+[Unit]
+Description=Nexus health check (one probe)
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT__
+ExecStart=/usr/bin/env node scripts/health.mjs
+Environment="PATH=__PATH__"
