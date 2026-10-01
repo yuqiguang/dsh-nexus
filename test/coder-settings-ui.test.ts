@@ -212,13 +212,19 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   let view = initial();
   let confirm!: (view: CodersView) => void;
   const request = new Promise<CodersView>(resolve => { confirm = resolve; });
-  const ui = await page(t, async method => method === 'install' ? request : structuredClone(view));
+  const installs: unknown[] = [];
+  const ui = await page(t, async (method, payload) => {
+    if (method === 'install') { installs.push(payload); return request; }
+    return structuredClone(view);
+  });
   const codex = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Codex')!;
   const claude = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Claude Code')!;
   await ui.click('安装托管版本');
   assert.match(codex.textContent!, /正在启动 Codex 托管安装/);
   assert.equal((codex.querySelector('footer button') as HTMLButtonElement).textContent, '正在启动安装…');
   assert.equal((claude.querySelector('footer button') as HTMLButtonElement).disabled, true);
+  assert.match(claude.querySelector('footer button')!.textContent!, /请先等待 Codex 安装结束/);
+  assert.match(claude.textContent!, /不会自动排队/);
   view = { ...view, install: { coder: 'codex', phase: 'installing', stage: 'packages', startedAt: Date.now() - 65_000, log: '' } };
   await act(async () => confirm(structuredClone(view)));
   assert.match(codex.textContent!, /下载并安装依赖/);
@@ -227,10 +233,13 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   assert.equal(codex.querySelector('progress')?.hasAttribute('value'), false, 'download totals are unknown');
   assert.equal(claude.querySelector('progress'), null);
   assert.equal((codex.querySelector('footer button') as HTMLButtonElement).textContent, '正在安装…');
-  view.install = { ...view.install!, stage: 'verifying', lastOutputAt: Date.now(), log: 'npm http fetch GET 200 [下载地址已隐藏] 100ms\nadded 2 packages\n' };
+  await act(async () => { (claude.querySelector('footer button') as HTMLButtonElement).click(); });
+  assert.deepEqual(installs, [{ coder: 'codex' }], 'disabled controls must not enqueue a second installer');
+  view.install = { ...view.install!, stage: 'verifying', lastOutputAt: Date.now(), log: 'npm http fetch GET 200 https://registry.npmjs.org/@openai/codex 100ms\nadded 2 packages\n' };
   await act(async () => { await delay(1700); });
   assert.match(codex.textContent!, /检查程序文件/);
   assert.match(codex.querySelector('details pre')!.textContent!, /added 2 packages/);
+  assert.match(codex.querySelector('details pre')!.textContent!, /https:\/\/registry.npmjs.org\/@openai\/codex/);
   view.install = { ...view.install!, phase: 'installed', finishedAt: Date.now() };
   view.codex.managed = { installed: true, version: '0.155.1' };
   await act(async () => { await delay(1700); });
@@ -240,6 +249,10 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   assert.equal((codex.querySelector('footer button') as HTMLButtonElement).disabled, false);
   assert.match(codex.querySelector('footer button')!.textContent!, /重新安装托管版本/);
   assert.ok(codex.querySelector('details'), 'logs remain available after success');
+  assert.equal((claude.querySelector('footer button') as HTMLButtonElement).disabled, false);
+  assert.equal(claude.querySelector('footer button')!.textContent, '安装托管版本');
+  assert.doesNotMatch(claude.textContent!, /不会自动排队/);
+  assert.deepEqual(installs, [{ coder: 'codex' }], 'the second tool still requires an explicit click');
 });
 
 test('reopening settings shows an existing Claude install, refresh failures and timeout with retry', async t => {
@@ -252,6 +265,8 @@ test('reopening settings shows an existing Claude install, refresh failures and 
   const panel = () => ui.dom.window.document.querySelector('[aria-label="Claude Code 托管安装状态"]')!;
   assert.match(panel().textContent!, /下载并安装依赖/);
   assert.match(panel().textContent!, /最近输出在/);
+  const codex = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Codex')!;
+  assert.match(codex.querySelector('footer button')!.textContent!, /请先等待 Claude Code 安装结束/);
   failRead = true;
   await act(async () => { await delay(1700); });
   assert.match(panel().textContent!, /安装状态暂时无法刷新/);
@@ -264,6 +279,8 @@ test('reopening settings shows an existing Claude install, refresh failures and 
   assert.equal(panel().querySelector('progress'), null);
   const button = panel().closest('article')!.querySelector('footer button') as HTMLButtonElement;
   assert.equal(button.disabled, false);
+  assert.equal((codex.querySelector('footer button') as HTMLButtonElement).disabled, false);
+  assert.equal(codex.querySelector('footer button')!.textContent, '安装托管版本');
 });
 
 test('a rejected install request gives feedback next to its button and releases the starting state', async t => {

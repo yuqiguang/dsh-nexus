@@ -348,10 +348,25 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
 const INSTALL_TIMEOUT_MS = 15 * 60_000;
 const LOG_LIMIT = 4096;
 
+const PUBLIC_NPM_REGISTRIES = new Set(['registry.npmjs.org', 'registry.npmmirror.com', 'registry.yarnpkg.com']);
+
+function safeDownloadUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    const path = decodeURIComponent(url.pathname);
+    // Only retain standard public registry package paths. Custom mirrors/CDNs may
+    // put signatures in the path itself, so their origin is the useful safe part.
+    const publicPath = PUBLIC_NPM_REGISTRIES.has(url.hostname) && !url.port
+      && /^\/(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:\/-\/[a-z0-9][a-z0-9._-]*\.tgz)?\/?$/.test(path);
+    return url.origin + (publicPath ? path : path === '/' ? '/' : '/[路径已隐藏]')
+      + (url.search || url.hash ? ' [参数已隐藏]' : '')
+      + (url.username || url.password ? ' [认证信息已隐藏]' : '');
+  } catch { return '[下载地址已隐藏]'; }
+}
+
 function safeInstallText(text: string): string {
-  return redact(text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''))
-    // Registry URLs may include userinfo, signed paths or query credentials.
-    .replace(/\b(?:https?|ftp):\/\/[^\s"'<>]+/gi, '[下载地址已隐藏]')
+  return redact(text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/\b(?:https?|ftp):\/\/[^\s"'<>]+/gi, safeDownloadUrl))
     .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 ***')
     .replace(/\b((?:_auth(?:Token)?|authorization|[\w-]*(?:token|password|passwd|secret|api[_-]?key))["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1***')
     .replace(/\b(?:sk|npm)_[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]+/g, '***');

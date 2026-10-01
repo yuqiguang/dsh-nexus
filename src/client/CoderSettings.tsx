@@ -140,6 +140,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
       claude: { source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
   };
   const installing = view.install?.phase === 'installing';
+  const activeInstall = startingInstall ?? (installing ? view.install?.coder : undefined);
   const startInstall = async (coder: 'codex' | 'claude') => {
     setStartingInstall(coder); setInstallRequestFailed(undefined);
     const confirmed = await action('install', { coder });
@@ -148,9 +149,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   };
   const installButton = (coder: 'codex' | 'claude', status: CoderStatusView) =>
     <button type="button" disabled={busy || installing} onClick={() => void startInstall(coder)}>
-      {startingInstall === coder ? '正在启动安装…' : installing && view.install?.coder === coder ? '正在安装…' : status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
+      {startingInstall === coder ? '正在启动安装…' : installing && view.install?.coder === coder ? '正在安装…' : activeInstall ? `请先等待 ${names[activeInstall]} 安装结束` : status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
   const installActivity = (coder: 'codex' | 'claude') => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
     : <>
+      {activeInstall && activeInstall !== coder && <p className="nexus-channel-hint" role="status">正在安装 {names[activeInstall]}，一次只能安装一个工具。结束后请再点击安装 {names[coder]}，不会自动排队。</p>}
       {installRequestFailed?.coder === coder && error && <p role="alert">安装请求未能确认：{error}。请等待状态刷新后再决定是否重试。</p>}
       {view.install?.coder === coder && <InstallActivity progress={view.install} readError={readError} />}
     </>;

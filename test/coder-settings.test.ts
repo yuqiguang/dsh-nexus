@@ -260,7 +260,7 @@ test('installation logs redact split credentials and URLs, bound long lines, and
   }, async () => {}, Date.now, host);
   await installer.start('codex');
   assert.equal(snapshots[0], '', 'incomplete lines must not reach the page');
-  assert.match(snapshots[1]!, /npm http fetch GET 200 \[下载地址已隐藏\] 25ms/);
+  assert.match(snapshots[1]!, /npm http fetch GET 200 https:\/\/registry\.example\/\[路径已隐藏\] \[参数已隐藏\] \[认证信息已隐藏\] 25ms/);
   assert.match(snapshots[5]!, /过长日志行已省略/);
   assert.equal(installer.progress()?.phase, 'failed');
   assert.ok(installer.progress()?.lastOutputAt);
@@ -268,8 +268,40 @@ test('installation logs redact split credentials and URLs, bound long lines, and
   const published = [...snapshots, installer.progress()!.log, installer.progress()!.error!];
   for (const text of published) {
     assert.ok(text.length <= 4096);
-    assert.doesNotMatch(text, /https?:\/\/|splitPassword|hidden\w+|splitToken|splitSecret/);
+    assert.doesNotMatch(text, /splitPassword|hidden\w+|splitToken|splitSecret/);
   }
+});
+
+test('installation logs keep public npm package URLs while hiding credentials, query values and custom signed paths', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-install-url-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cases = [
+    ['https://registry.npmjs.org/@openai/codex/-/codex-0.155.1-linux-x64.tgz', 'https://registry.npmjs.org/@openai/codex/-/codex-0.155.1-linux-x64.tgz'],
+    ['https://registry.npmmirror.com/@anthropic-ai%2fclaude-agent-sdk', 'https://registry.npmmirror.com/@anthropic-ai/claude-agent-sdk'],
+    ['https://registry.yarnpkg.com/zod/-/zod-4.4.3.tgz', 'https://registry.yarnpkg.com/zod/-/zod-4.4.3.tgz'],
+    ['https://hiddenUser:hiddenPassword@registry.npmjs.org/@openai/codex?token=hiddenToken&X-Amz-Signature=hiddenSig#hiddenFragment',
+      'https://registry.npmjs.org/@openai/codex [参数已隐藏] [认证信息已隐藏]'],
+    ['https://registry.npmjs.org/zod?opaque=hiddenOpaque', 'https://registry.npmjs.org/zod [参数已隐藏]'],
+    ['https://cdn.example/hiddenSignature/codex.tgz?download=hiddenDownload', 'https://cdn.example/[路径已隐藏] [参数已隐藏]'],
+    ['https://registry.npmjs.org.evil.example/hiddenSignature', 'https://registry.npmjs.org.evil.example/[路径已隐藏]'],
+    ['https://registry.npmjs.org@mirror.example/hiddenSignature', 'https://mirror.example/[路径已隐藏] [认证信息已隐藏]'],
+    ['https://registry.npmjs.org:8443/hiddenSignature', 'https://registry.npmjs.org:8443/[路径已隐藏]'],
+    ['https://registry.npmjs.org/download/hiddenSignature/codex.tgz', 'https://registry.npmjs.org/[路径已隐藏]'],
+    ['https://hiddenUser:hiddenPassword@', '[下载地址已隐藏]'],
+  ];
+  const installer = new CoderInstaller(managedLayout(root), async (_args, _cwd, output) => {
+    for (const [url] of cases) {
+      // URLs may arrive in arbitrary chunks; only complete sanitized lines may be published.
+      const line = `npm http fetch GET 200 ${url} 25ms\n`;
+      for (let i = 0; i < line.length; i += 7) output(line.slice(i, i + 7));
+    }
+    return { code: 1, error: 'failed https://hiddenUser:hiddenPassword@registry.npmjs.org/@openai/codex?signature=hiddenSignature' };
+  }, async () => {}, Date.now, host);
+  await installer.start('codex');
+  const progress = installer.progress()!;
+  assert.equal(progress.log, cases.map(([, safe]) => `npm http fetch GET 200 ${safe} 25ms\n`).join(''));
+  assert.equal(progress.error, 'failed https://registry.npmjs.org/@openai/codex [参数已隐藏] [认证信息已隐藏]');
+  assert.doesNotMatch(progress.log + progress.error, /hidden\w+/);
 });
 
 test('a timed out installer cannot mark success even if npm exits with code zero', async t => {
