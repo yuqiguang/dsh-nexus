@@ -36,7 +36,7 @@ export interface CoderSettingsRecord {
   defaultCoder: CoderKind;
   /** Overrides the profile's coderRoots when non-empty. */
   roots?: string[];
-  /** Last project explicitly selected in the local UI; never changes existing sessions or tasks. */
+  /** Legacy project picker value, preserved on disk but no longer used. */
   projectRoot?: string;
   maxTaskMinutes?: number;
   maxConcurrent?: number;
@@ -163,7 +163,6 @@ export interface CoderSettingsView {
   revision: number;
   defaultCoder: CoderKind;
   roots?: string[];
-  projectRoot?: string;
   maxTaskMinutes?: number;
   maxConcurrent?: number;
   autoApproveSafe?: boolean;
@@ -177,7 +176,6 @@ export function redact(settings: CoderSettingsRecord): CoderSettingsView {
   const { apiKey, ...codex } = settings.codex;
   const { token, ...claude } = settings.claude;
   return { securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: coderConcurrency(settings.maxConcurrent), autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: networkDomains(settings.allowedNetworkDomains), ...(settings.roots ? { roots: [...settings.roots] } : {}),
-    ...(settings.projectRoot ? { projectRoot: settings.projectRoot } : {}),
     codex: { ...codex, apiKeyConfigured: apiKey.length > 0 }, claude: { ...claude, tokenConfigured: token.length > 0 } };
 }
 
@@ -220,19 +218,6 @@ export class CoderSettingsStore {
       const previous = decode(current) ?? defaultSettings();
       if (previous.revision !== expectedRevision) throw new ChannelError('configuration_changed');
       return next(previous);
-    });
-    return decode(result)!;
-  }
-
-  /** A project choice must not reset secrets, endpoints, or existing permission settings. */
-  async selectProject(expectedRevision: number, projectRoot: string, roots?: string[]): Promise<CoderSettingsRecord> {
-    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new ChannelError('invalid_revision');
-    if (rootsInput([projectRoot])?.[0] !== projectRoot) throw new ChannelError('invalid_root');
-    const nextRoots = roots === undefined ? undefined : rootsInput(roots);
-    const result = await this.records.modify(SETTINGS_KEY, async current => {
-      const previous = decode(current) ?? defaultSettings();
-      if (previous.revision !== expectedRevision) throw new ChannelError('configuration_changed');
-      return { ...previous, revision: previous.revision + 1, projectRoot, ...(nextRoots ? { roots: nextRoots } : {}) };
     });
     return decode(result)!;
   }

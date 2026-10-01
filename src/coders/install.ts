@@ -448,6 +448,16 @@ export class CoderInstaller {
     let manifest: { name: string; private: true; dependencies: Record<string, string> } = { name: 'nexus-coders', private: true, dependencies: {} };
     try { manifest = { ...manifest, ...JSON.parse(await readFile(manifestPath, 'utf8')) as Partial<typeof manifest> }; } catch { /* first install */ }
     manifest.dependencies = { ...manifest.dependencies, [pkg.name]: pkg.version, [native.name]: native.spec };
+    // A failed attempt leaves its dependency entries behind. Retrying the other
+    // tool must not silently resume that failed install through the shared npm root.
+    // Completed installs stay in the manifest so npm does not prune their files.
+    const other = coder === 'codex' ? 'claude' : 'codex';
+    if (!await readMarker(this.layout, other)) {
+      const name = MANAGED_PACKAGES[other].name;
+      for (const dependency of Object.keys(manifest.dependencies)) {
+        if (dependency === name || dependency.startsWith(name + '-')) delete manifest.dependencies[dependency];
+      }
+    }
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('install_timeout')), this.timeoutMs);

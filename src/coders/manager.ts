@@ -1,6 +1,4 @@
 import { requireWindowsFirewall } from './windows-firewall.js';
-import { inspectProject, type CodingProject, type CodingWorkspace } from './projects.js';
-import { isInside } from './rules.js';
 import { taskStatusLabel } from './status.js';
 import { windowsSandbox, type WindowsSandboxStatus } from './windows-sandbox.js';
 import { access, constants, mkdir } from 'node:fs/promises';
@@ -38,8 +36,6 @@ export interface CodersView {
   settings: CoderSettingsView;
   profileRoots: string[];
   effectiveRoots: string[];
-  workspaces?: CodingWorkspace[];
-  project?: CodingProject;
   managedRoot: string;
   claudeHome: string;
   claudeLogin?: ClaudeLoginInstructions;
@@ -77,7 +73,6 @@ export interface ManagerDeps {
   detect?: DetectOptions;
   /** Test seam for `codex login status`. */
   loginStatus?: (command: string, env: NodeJS.ProcessEnv) => Promise<string | CoderLoginStatus>;
-  workspaces?: () => CodingWorkspace[];
   env?: NodeJS.ProcessEnv;
   now?: () => number;
 }
@@ -343,18 +338,15 @@ export class CodersManager {
     claude.credentialState = settings.claude.token || claudeOauth ? 'configured' : 'missing';
     claude.login = settings.claude.token ? `使用设置里的 token${settings.claude.baseUrl ? `，端点 ${settings.claude.baseUrl}` : '，官方端点'}`
       : claudeOauth ? 'OAuth 登录（Nexus 专用配置目录）' : '未配置凭据';
-    const project = settings.projectRoot ? await inspectProject(settings.projectRoot, runtime.roots)
-      .catch(() => ({ path: settings.projectRoot!, allowed: false, problem: 'project_directory_unavailable' })) : undefined;
     const progress = this.deps.installer.progress();
     return {
       platform: this.deps.detect?.host?.platform ?? process.platform,
       settings: redact(settings), profileRoots: [...this.deps.profileRoots], effectiveRoots: runtime.roots,
-      workspaces: this.deps.workspaces?.() ?? [], ...(project ? { project } : {}),
       managedRoot: this.deps.layout.root, claudeHome: this.deps.layout.claudeHome, codex, claude,
       claudeLogin: this.claudeLogin(detection.claude, claudePick.active),
       ...(progress ? { install: progress } : {}),
       rules: (this.tasks?.rules() ?? []).map(rule => ({ id: rule.id, source: rule.source, text: describeRule(rule) })),
-      recentTasks: (this.tasks?.list() ?? []).filter(task => !settings.projectRoot || isInside(settings.projectRoot, task.cwd)).slice(0, 10).map(task => ({ id: task.id, coder: task.coder, status: task.status, statusLabel: taskStatusLabel(task),
+      recentTasks: (this.tasks?.list() ?? []).slice(0, 10).map(task => ({ id: task.id, coder: task.coder, status: task.status, statusLabel: taskStatusLabel(task),
         cwd: task.cwd, ownerSession: task.ownerSession, ...(task.brief ? { objective: task.brief.objective } : {}),
         description: task.description.length > 120 ? `${task.description.slice(0, 120)}…` : task.description, updatedAt: task.updatedAt })),
     };
@@ -371,15 +363,7 @@ export class CodersManager {
     }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new ChannelError('invalid_configuration');
     const input = payload as Record<string, unknown>;
-    if (method === 'project/select') {
-      const settings = await this.load();
-      if (settings.revision !== input.revision) throw new ChannelError('configuration_changed');
-      const roots = this.effectiveRoots(settings);
-      const project = await inspectProject(input.path, roots);
-      if (!project.allowed && input.allow !== true) throw new ChannelError('project_permission_required');
-      this.updateSettings(await this.deps.store.selectProject(input.revision as number, project.path,
-        project.allowed ? undefined : [...roots, project.path]));
-    } else if (method === 'save') {
+    if (method === 'save') {
       const saved = await this.deps.store.save(input.revision as number, input.config as Record<string, unknown>);
       this.updateSettings(saved);
       if (this.detection?.codex.managed.installed) await this.ensureCodexHome(saved);

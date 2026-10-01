@@ -39,14 +39,8 @@ export function apply(ctx: Context): void {
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-coders', order: 11, label: '编码工具',
   }, ({ close }: { close: () => void }) => createElement(CoderSettings, { close, navigation: () => {
-    // Public client services, read lazily so settings still work in a minimal host.
-    const ui = ctx.get('uiWorkspace') as { pickDirectory(): Promise<string | null>; openWorkspace(id: string): Promise<void> } | undefined;
-    const workspaces = ctx.get('workspaces') as { create(input: { path: string }): Promise<{ workspaceId: string }> } | undefined;
     const sidebar = ctx.get('sidebarRight') as TaskSeats['sidebarRight'] | undefined;
-    return ui && workspaces ? { pickDirectory: () => ui.pickDirectory(), openProject: async (path: string) => {
-      const workspace = await workspaces.create({ path });
-      await ui.openWorkspace(workspace.workspaceId);
-    }, ...(sidebar ? { openTask: (id: string) => sidebar.openResource(taskAddress(id)) } : {}) } : undefined;
+    return sidebar ? { openTask: (id: string) => sidebar.openResource(taskAddress(id)) } : undefined;
   } })));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-assistant', order: 14, label: '助理',

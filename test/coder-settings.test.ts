@@ -241,6 +241,39 @@ test('the installer pins the package and its platform package, marks success onl
   assert.equal(sawMarker, false);
 });
 
+for (const coder of ['codex', 'claude'] as const) {
+  test(`${coder} install does not retry the other tool's failed attempt and retains a completed install`, async t => {
+    const root = await mkdtemp(join(tmpdir(), 'nexus-install-selection-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const layout = managedLayout(root), other = coder === 'codex' ? 'claude' : 'codex';
+    const failed = new CoderInstaller(layout, async () => ({ code: 1 }), undefined, Date.now, host);
+    await failed.start(other);
+    assert.equal(failed.progress()?.phase, 'failed');
+    assert.equal(await readMarker(layout, other), undefined);
+    const selectedPackages = { [MANAGED_PACKAGES[coder].name]: MANAGED_PACKAGES[coder].version, [platformPackage(coder, host).name]: platformPackage(coder, host).spec };
+    let expected = selectedPackages;
+    const install = new CoderInstaller(layout, async (_args, cwd) => {
+      const manifest = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf8'));
+      assert.deepEqual(manifest.dependencies, expected, 'npm must not receive the failed tool as an install request');
+      await fakeManaged(root, coder);
+      await rm(join(layout.markers, `${coder}.json`));
+      return { code: 0 };
+    }, undefined, Date.now, host);
+    await install.start(coder);
+    assert.equal(install.progress()?.phase, 'installed');
+    assert.equal(await readMarker(layout, other), undefined, 'installing one tool never completes the other');
+    // A completed peer must stay in the manifest, or npm would prune its files.
+    await fakeManaged(root, other);
+    const before = await readFile(join(layout.markers, `${other}.json`), 'utf8');
+    expected = { ...selectedPackages, [MANAGED_PACKAGES[other].name]: MANAGED_PACKAGES[other].version,
+      [platformPackage(other, host).name]: platformPackage(other, host).spec };
+    await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'nexus-coders', private: true, dependencies: expected }));
+    await install.start(coder);
+    assert.equal(install.progress()?.phase, 'installed');
+    assert.equal(await readFile(join(layout.markers, `${other}.json`), 'utf8'), before);
+  });
+}
+
 test('installation logs redact split credentials and URLs, bound long lines, and flush diagnostics on failure', async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-install-log-'));
   t.after(() => rm(root, { recursive: true, force: true }));

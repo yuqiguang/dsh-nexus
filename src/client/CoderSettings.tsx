@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { CodersView, CoderStatusView } from '../coders/manager.js';
 import type { InstallProgress, InstallStatus } from '../coders/install.js';
 import { explain } from './ChannelSettings.js';
-import { CodingStart, type CodingNavigation } from './CodingStart.js';
+
+export interface CoderNavigation { openTask(id: string): void }
 
 export type CoderApi = (method: string, payload?: unknown, signal?: AbortSignal) => Promise<CodersView>;
 
@@ -49,6 +50,23 @@ function Install({ label, status }: { label: string; status: InstallStatus }) {
 function Status({ status }: { status: CoderStatusView }) {
   return <span className={`nexus-channel-state ${status.ready ? 'connected' : status.active === 'none' ? '' : 'error'}`}>
     {status.ready ? `可用（${sources[status.active]}${status.fallback ? `，首选的${sources[status.active === 'managed' ? 'system' : 'managed']}不可用` : ''}）` : status.active === 'none' ? '未安装' : '未就绪'}</span>;
+}
+
+function ToolReadiness({ view, disabled, refresh }: { view: CodersView; disabled: boolean; refresh(): void }) {
+  const coder = view[view.settings.defaultCoder];
+  const prepared = coder.ready && coder.credentialState === 'configured';
+  return <article className="nexus-channel-card" aria-label="工具状态检查">
+    <header><h3>工具状态检查</h3><span className="nexus-channel-state">{prepared ? '默认工具配置已准备' : '默认工具待配置'}</span></header>
+    <p>项目在 DSH 新建会话时选择，无需在此重复选择。这里检查已保存的默认编码工具配置。</p>
+    <ul className="nexus-readiness">
+      <li>默认工具：{names[view.settings.defaultCoder]}</li>
+      <li>安装：{coder.active === 'none' ? '尚未安装，请在下方安装或选择已有工具' : `已检测到${coder.active === 'managed' ? '托管' : '系统'}安装`}</li>
+      <li>凭据：{coder.credentialState === 'configured' ? '已检测到配置，实际可用性以任务结果为准' : coder.credentialState === 'missing' ? '尚未配置，请在下方登录或填写凭据' : '尚未确认，请检查下方登录状态'}</li>
+      <li>运行配置：{coder.ready ? '检查通过' : coder.problem ?? '请先完成安装与平台配置'}</li>
+    </ul>
+    <p className="nexus-channel-hint">打开 DSH 项目会话后即可提出编码需求。任务目录仍须在下方允许范围内。此处仅检查本机配置，不发起模型任务。</p>
+    <button type="button" disabled={disabled} onClick={refresh}>重新检查</button>
+  </article>;
 }
 
 function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12: false }); }
@@ -112,7 +130,7 @@ function InstallActivity({ progress, readError }: { progress: InstallProgress; r
   </div>;
 }
 
-export function CoderSettings({ api = coderApi, navigation, close }: { api?: CoderApi; navigation?: () => CodingNavigation | undefined; close?: () => void }) {
+export function CoderSettings({ api = coderApi, navigation, close }: { api?: CoderApi; navigation?: () => CoderNavigation | undefined; close?: () => void }) {
   const [view, setView] = useState<CodersView>();
   const [draft, setDraft] = useState<Draft>();
   const [dirty, setDirty] = useState(false);
@@ -184,10 +202,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
     </>;
   return <section className="nexus-channel-settings" aria-label="编码工具">
     <h2>编码工具</h2>
-    <CodingStart view={view} disabled={busy || dirty} action={action} navigation={navigation} close={close} />
-    {dirty && <p className="nexus-channel-hint">请先保存或放弃下方工具设置的修改，再切换项目。</p>}
+    <ToolReadiness view={view} disabled={busy || dirty} refresh={() => void action('refresh')} />
     <p>把编码任务派给本机的 Codex 或 Claude Code。Nexus 可以自己安装一份（托管）并用这里的端点和密钥运行，也可以使用系统里已有的安装。密钥保存在本机，不会回填到页面。</p>
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
+    <p className="nexus-channel-hint">Codex 和 Claude Code 共用托管安装目录，一次安装一个工具。npm 会检查已成功安装的另一工具的依赖；另一工具未完成的安装需单独重试。</p>
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">
         <header><h3>通用</h3></header>
@@ -296,7 +314,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
     </article>
     <article className="nexus-channel-card">
       <header><h3>最近任务</h3></header>
-      {view.project && <p className="nexus-channel-hint">当前项目：{view.project.path}。列出此目录及子目录中的最近 10 项任务。</p>}
+      <p className="nexus-channel-hint">列出各工作区最近 10 项编码任务，可打开任务查看所属会话与验收结果。</p>
       {view.recentTasks.length === 0 && <p className="nexus-channel-hint">还没有编码任务。</p>}
       {view.recentTasks.map(task => <div key={task.id} className="nexus-channel-account">
         <p>{task.id} · {names[task.coder]} · {task.statusLabel ?? taskStatus[task.status] ?? task.status}<br />{task.description}</p>

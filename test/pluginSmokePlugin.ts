@@ -250,21 +250,21 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         // The system source depends on the machine; a fresh runtime never has a managed install.
         assert.deepEqual([coders.result.value.claude.managed.installed, coders.result.value.codex.managed.installed], [false, false]);
         assert.equal(coders.result.value.settings.revision, 0);
-        const selected = await (await coderRequest('project/select', { revision: 0, path: config.packageDir, allow: true })).json();
-        assert.equal(selected.result.ok, true, selected.result.error?.code);
-        assert.equal(selected.result.value.project.path, realpathSync(config.packageDir));
-        assert.equal(selected.result.value.project.allowed, true);
-        assert.ok(Array.isArray(selected.result.value.workspaces));
-        checks.push('packaged_project_selection_without_im');
+        assert.equal(coders.result.value.project, undefined);
+        assert.equal(coders.result.value.workspaces, undefined);
+        const saved = await (await coderRequest('save', { revision: 0, config: { maxConcurrent: 1 } })).json();
+        assert.equal(saved.result.ok, true, saved.result.error?.code);
+        assert.deepEqual(saved.result.value.effectiveRoots, coders.result.value.effectiveRoots);
+        checks.push('packaged_tools_need_no_duplicate_project_selection');
         checks.push('tarball_bundle_activates', 'host_module_identity', 'packaged_client_loads', 'packaged_settings_save_redacted', 'packaged_coder_settings_route');
       } else {
         assert.equal(result.result.value.connections.find((item: { channel: string }) => item.channel === 'feishu').revision, 1);
         const coders = await (await coderRequest('list')).json();
         assert.equal(coders.result.ok, true, coders.result.error?.code);
         assert.equal(coders.result.value.settings.revision, 1);
-        assert.equal(coders.result.value.project.path, realpathSync(config.packageDir));
-        assert.equal(coders.result.value.project.allowed, true);
-        checks.push('project_selection_survives_restart');
+        assert.equal(coders.result.value.settings.maxConcurrent, 1);
+        assert.equal(coders.result.value.project, undefined);
+        checks.push('coder_settings_survive_restart_without_project_selection');
         checks.push(config.phase === 9 ? 'desktop_carrier_settings_restored' : 'installed_plugin_restart_restores_settings');
       }
       if (config.phase === 9) {

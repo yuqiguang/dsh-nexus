@@ -14,7 +14,7 @@ if (!/^dist(\.[a-z0-9-]+)?$/.test(outName)) {
 // Removed sources must not survive in an incremental build's tarball or test glob.
 // These paths contain only the retired component's generated files, never user documents.
 for (const path of ['src/documents', 'src/client/DocumentSettings.js', 'test/documents.test.js',
-  'test/document-ui.test.js', 'test/documentSmokePlugin.js']) {
+  'test/document-ui.test.js', 'test/documentSmokePlugin.js', 'src/client/CodingStart.js', 'src/coders/projects.js']) {
   await rm(`${projectRoot}/${outName}/${path}`, { recursive: true, force: true });
   if (path.endsWith('.js')) await rm(`${projectRoot}/${outName}/${path}.map`, { force: true });
 }

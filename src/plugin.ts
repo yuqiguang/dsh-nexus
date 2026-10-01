@@ -106,9 +106,9 @@ export async function installCoderSettings(ctx: Context, profileRoots: string[],
   const installer = new CoderInstaller(layout, seams.npm, coder => manager.afterInstall(coder));
   const { npm: _npm, ...managerSeams } = seams;
   manager = new CodersManager({ store: new CoderSettingsStore(new DshRecords(ctx.credentials, 'nexus-coders')), layout, profileRoots, installer,
-    workspaces: () => ctx.get('workspaceRegistry')?.list().map(({ id, title, path }) => ({ id, title, path })) ?? [], ...managerSeams });
+    ...managerSeams });
   await manager.load();
-  registerRpc(ctx, 'nexus-coders', ['list', 'refresh', 'project/select', 'save', 'clear-secret', 'install', 'windows-sandbox/setup', 'rules/remove'], (method, payload) => manager.handle(method, payload));
+  registerRpc(ctx, 'nexus-coders', ['list', 'refresh', 'save', 'clear-secret', 'install', 'windows-sandbox/setup', 'rules/remove'], (method, payload) => manager.handle(method, payload));
   return manager;
 }
 
