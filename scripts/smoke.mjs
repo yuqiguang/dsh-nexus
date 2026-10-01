@@ -98,7 +98,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     assert.ok(!removed.dsh.profile.bundles.includes('nexus-next'));
   }
   const previousPatch = installedPlugin ? parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8').catch(() => '[]')) ?? [] : [];
-  const componentOverrides = previousPatch.filter(row => ['nexus-documents', 'nexus-memory'].includes(row.id) && !row.insert);
+  const componentOverrides = previousPatch.filter(row => ['nexus-documents', 'nexus-memory', 'nexus-mail'].includes(row.id) && !row.insert);
   await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([
     ...componentOverrides,
     { id: 'session-title-llm', disabled: true },

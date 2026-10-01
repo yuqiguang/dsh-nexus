@@ -35,7 +35,7 @@ const rewritten = (): PatchRow[] => [
 test('back-filling adds coder roots and moves owned reminder rows to the official bundle', () => {
   const patch = backfillProfilePatch(original(), ['/nexus']);
   const inserted = patch[0]!.insert!;
-  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory']);
+  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail']);
   assert.deepEqual(inserted[0]!.config?.coderRoots, ['/nexus']);
   assert.deepEqual(inserted[0]!.config?.workspaceRoot, '/nexus/workspace', 'an existing workspace path is kept');
 });
@@ -62,6 +62,8 @@ test('document component is default-off and later native overrides survive setup
   assert.deepEqual(memory, { id: 'nexus-memory', name: 'file:///nexus/dist/src/memory/plugin.js', disabled: true });
   patch.push({ id: 'nexus-documents', disabled: false });
   patch.push({ id: 'nexus-memory', disabled: false });
+  assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-mail'), { id: 'nexus-mail', name: 'file:///nexus/dist/src/connectors/mail/plugin.js', disabled: true });
+  patch.push({ id: 'nexus-mail', disabled: false });
   const before = JSON.stringify(patch);
   assert.equal(JSON.stringify(backfillProfilePatch(patch, ['/nexus'])), before);
 });
@@ -91,7 +93,7 @@ test('moving reminder services into the official bundle preserves their explicit
     { id: 'nexus-channels', name: 'file:///nexus/dist/src/plugin.js', config: {} },
   ] }, { id: 'schedule', config: { deliveryHistoryDays: 10 } }];
   const patch = backfillProfilePatch(source, ['/nexus']);
-  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory']);
+  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail']);
   assert.deepEqual(patch.slice(1).map(row => [row.id, row.config]), [
     ['schedule', { deliveryHistoryDays: 7 }], ['time-context', {}], ['schedule', { deliveryHistoryDays: 10 }],
   ]);

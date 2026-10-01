@@ -167,6 +167,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, notifier: registry, manager,
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
   const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone, modules: modules.active });
+  ctx.provide('nexusConnectors', connectors);
   assistant.attachAgenda((now, days) => connectors.agendaFor(now, days));
   ctx.provide('nexusWorkspace', { root: workspace });
   installAssistantPrompt(ctx);

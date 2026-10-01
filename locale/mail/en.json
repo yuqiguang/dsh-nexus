@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mailbox",
+    "description": "Read mail, approve outgoing messages and watch arrivals. Off by default; configure an account after enabling. Disabling keeps credentials and watch rules."
+  }
+}

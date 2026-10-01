@@ -127,3 +127,19 @@ test('the agenda section saves its settings with the mail ones and lists, comple
   assert.deepEqual(calls.at(-1)!.payload.config.agenda, { enabled: true, remindMinutes: '30', todoReminderTime: '08:30' });
   assert.ok(calls.at(-1)!.payload.config.mail, 'the mail settings travel in the same save');
 });
+
+test('disabled native mailbox keeps configuration editable, blocks connection testing and points to native components', async t => {
+  const calls: string[] = [];
+  const view = initial();
+  view.modules = { mail: false, agenda: true };
+  view.settings.mail.passwordConfigured = true;
+  view.mail.watches = [{ id: 'mw-old', description: '保留的规则', keywords: ['fixture'], createdAt: 1 }];
+  const ui = await page(t, async method => { calls.push(method); return view; });
+  assert.match(ui.text(), /DSH 插件详情的组件列表中启用“邮箱”/);
+  assert.match(ui.text(), /保留的规则/);
+  assert.equal(ui.field('mail-address').disabled, false);
+  await ui.click('测试连接');
+  assert.deepEqual(calls, ['list']);
+  await ui.click('清除密码并停用');
+  assert.equal(calls.at(-1), 'clear-secret');
+});

@@ -8,8 +8,9 @@ import { AgendaConnector, type AgendaStatus } from './agenda/index.js';
 import type { Occurrence, Todo } from './agenda/render.js';
 import { ImapSmtpMail, type ImapOptions } from './mail/imap.js';
 import { MailConnector, type MailStatus } from './mail/index.js';
+import { MailData } from './mail/data.js';
 import type { MailClient } from './mail/types.js';
-import { ConnectorSettingsStore, mailInput, redactConnectors, type ConnectorSettingsRecord, type ConnectorSettingsView, type MailAccountSettings } from './settings.js';
+import { ConnectorSettingsStore, mailConfigured, mailInput, redactConnectors, type ConnectorSettingsRecord, type ConnectorSettingsView, type MailAccountSettings } from './settings.js';
 
 export interface ConnectorsView {
   modules?: { mail: boolean; agenda: boolean };
@@ -25,7 +26,7 @@ export interface ConnectorsView {
 }
 
 export interface ConnectorsDeps {
-  modules?: Readonly<{ mail: boolean; agenda: boolean }>;
+  modules?: Readonly<{ agenda: boolean }>;
   ctx: Context;
   registry: Pick<SessionNotifier, 'bound' | 'inject'>;
   /** Where agenda reminders go: the quiet-hours gate in front of the bridges. */
@@ -43,28 +44,56 @@ export interface ConnectorsDeps {
 export class Connectors {
   private settings!: ConnectorSettingsRecord;
   private readonly store: ConnectorSettingsStore;
-  private readonly mail: MailConnector;
+  private mail?: MailConnector;
+  private mailData!: MailData;
   private readonly agenda: AgendaConnector;
   private mailTest?: ConnectorsView['mailTest'];
+  private mailTestAttempt = 0;
+  private clearMailTest(): void { this.mailTestAttempt++; this.mailTest = undefined; }
   private readonly now: () => number;
-  private readonly modules: Readonly<{ mail: boolean; agenda: boolean }>;
+  private readonly modules: Readonly<{ agenda: boolean }>;
 
   constructor(private readonly deps: ConnectorsDeps) {
     this.now = deps.now ?? Date.now;
-    this.modules = Object.freeze({ mail: deps.modules?.mail ?? true, agenda: deps.modules?.agenda ?? true });
+    this.modules = Object.freeze({ agenda: deps.modules?.agenda ?? true });
     this.store = new ConnectorSettingsStore(new DshRecords(deps.ctx.credentials, 'nexus-connectors'));
-    this.mail = new MailConnector({ ctx: deps.ctx, registry: deps.registry, opener: deps.ctx.storageDomain, timeZone: deps.timeZone, now: deps.now, report: deps.report, sleep: deps.sleep,
-      client: settings => deps.client ? deps.client(settings) : new ImapSmtpMail(settings, deps.imap),
-      onAllowRecipients: async rules => { await this.saveAllowRecipients(rules); } });
     this.agenda = new AgendaConnector({ ctx: deps.ctx, opener: deps.ctx.storageDomain, notifier: deps.notifier, sessions: () => deps.registry.bound(), timeZone: deps.timeZone,
       now: deps.now, report: deps.report, sleep: deps.sleep });
   }
 
   async start(): Promise<void> {
     this.settings = await this.store.read();
-    await this.mail.start(this.mailSettings(), this.modules.mail);
+    this.mailData = await MailData.open(this.deps.ctx.storageDomain, this.now);
+    if (mailConfigured(this.settings.mail)) await this.mailData.bindLegacyCursor(this.settings.mail);
     await this.agenda.start(this.agendaSettings());
-    this.deps.ctx.effect(() => () => { void this.mail.close(); void this.agenda.close(); });
+    this.deps.ctx.effect(() => () => this.close());
+  }
+
+  async close(): Promise<void> {
+    await this.mail?.close();
+    await this.agenda.close();
+    await this.mailData.close();
+  }
+
+  /** DSH owns this activation; core settings and data survive its disposal. */
+  async enableMail(ctx: Context): Promise<void> {
+    if (this.mail) throw new Error('mail runtime already active');
+    const deps = this.deps;
+    const runtime = new MailConnector({ ctx, data: this.mailData, opener: deps.ctx.storageDomain,
+      registry: deps.registry, timeZone: deps.timeZone, now: deps.now, report: deps.report, sleep: deps.sleep,
+      client: settings => deps.client ? deps.client(settings) : new ImapSmtpMail(settings, deps.imap),
+      onAllowRecipients: (rules, assertCurrent) => this.saveAllowRecipients(rules, assertCurrent) });
+    this.mail = runtime;
+    ctx.effect(() => async () => {
+      if (this.mail === runtime) { this.mail = undefined; this.clearMailTest(); }
+      await runtime.close();
+    });
+    try { await runtime.start(this.settings.mail); }
+    catch (error) {
+      if (this.mail === runtime) this.mail = undefined;
+      await runtime.close();
+      throw error;
+    }
   }
 
   /** Today's and the coming days' occurrences and the open todos, for the briefing. */
@@ -75,19 +104,18 @@ export class Connectors {
 
   current(): ConnectorSettingsRecord { return this.settings; }
   agendaEnabled(): boolean { return this.modules.agenda && this.settings.agenda.enabled; }
-  private mailSettings() { return { ...this.settings.mail, enabled: this.modules.mail && this.settings.mail.enabled }; }
   private agendaSettings() { return { ...this.settings.agenda, enabled: this.agendaEnabled() }; }
 
   view(): ConnectorsView {
     const upcoming = this.agenda.agenda(this.now(), 7).slice(0, 30).map(item => ({ id: item.event.id, title: item.event.title, start: item.start, end: item.end,
       ...(item.event.location ? { location: item.event.location } : {}), ...(item.event.repeat ? { repeat: item.event.repeat } : {}) }));
-    return { modules: { ...this.modules }, settings: redactConnectors(this.settings), mail: this.mail.view(), ...(this.mailTest ? { mailTest: this.mailTest } : {}),
+    return { modules: { ...this.modules, mail: !!this.mail }, settings: redactConnectors(this.settings), mail: this.mail?.view() ?? { phase: 'disabled', toolsRegistered: false, watches: this.mailData.listWatches(), lastUid: this.mailData.cursor.get('inbox')?.lastUid }, ...(this.mailTest ? { mailTest: this.mailTest } : {}),
       agenda: { ...this.agenda.view(), upcoming, todos: this.agenda.listTodos().slice(0, 100) } };
   }
 
-  private async saveAllowRecipients(rules: string[]): Promise<void> {
-    this.settings = await this.store.save(this.settings.revision, { mail: { allowRecipients: rules } });
-    await this.mail.apply(this.mailSettings());
+  private async saveAllowRecipients(rules: string[], assertCurrent: () => void): Promise<void> {
+    this.settings = await this.store.save(this.settings.revision, { mail: { allowRecipients: rules } }, assertCurrent);
+    this.mail?.updateAllowRecipients(rules);
   }
 
   async handle(method: string, payload: unknown): Promise<ConnectorsView> {
@@ -96,21 +124,27 @@ export class Connectors {
     const input = payload as Record<string, unknown>;
     if (method === 'save') {
       this.settings = await this.store.save(input.revision as number, (input.config ?? {}) as Record<string, unknown>);
-      await this.mail.apply(this.mailSettings());
+      this.clearMailTest();
+      await this.mail?.apply(this.settings.mail);
       await this.agenda.apply(this.agendaSettings());
     } else if (method === 'clear-secret') {
       this.settings = await this.store.clearSecret(input.revision as number);
-      this.mailTest = undefined;
-      await this.mail.apply(this.mailSettings());
+      this.clearMailTest();
+      await this.mail?.apply(this.settings.mail);
     } else if (method === 'mail/test') {
-      if (!this.modules.mail) throw new ChannelError('module_disabled');
+      const runtime = this.mail;
+      const revision = this.settings.revision;
+      if (!runtime) throw new ChannelError('module_disabled');
+      this.clearMailTest();
+      const attempt = this.mailTestAttempt;
       // Test what the page shows, saved or not: the draft's password may be empty to mean "the saved one".
       const draft = input.config && typeof input.config === 'object' ? (input.config as { mail?: unknown }).mail : undefined;
       const candidate = draft === undefined ? this.settings.mail : mailInput(draft, this.settings.mail);
-      const info = await this.mail.test({ ...candidate, enabled: true });
+      const info = await runtime.test({ ...candidate, enabled: true });
+      if (this.mail !== runtime || revision !== this.settings.revision || attempt !== this.mailTestAttempt) throw new ChannelError('configuration_changed');
       this.mailTest = { at: this.now(), exists: info.exists, ...(info.unseen !== undefined ? { unseen: info.unseen } : {}) };
     } else if (method === 'mail/watch/remove') {
-      if (typeof input.id !== 'string' || !await this.mail.removeWatch(input.id)) throw new ChannelError('not_found');
+      if (typeof input.id !== 'string' || !await this.mailData.removeWatch(input.id)) throw new ChannelError('not_found');
     } else if (method === 'agenda/event/remove') {
       if (typeof input.id !== 'string' || !await this.agenda.removeEvent(input.id)) throw new ChannelError('not_found');
     } else if (method === 'agenda/todo/remove') {

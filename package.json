@@ -1,6 +1,6 @@
 {
   "name": "nexus-next",
-  "version": "0.2.17",
+  "version": "0.2.18",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,7 +12,9 @@
     "./documents": "./dist/src/documents/plugin.js",
     "./documents/locale/*.json": "./locale/documents/*.json",
     "./memory": "./dist/src/memory/plugin.js",
-    "./memory/locale/*.json": "./locale/memory/*.json"
+    "./memory/locale/*.json": "./locale/memory/*.json",
+    "./mail": "./dist/src/connectors/mail/plugin.js",
+    "./mail/locale/*.json": "./locale/mail/*.json"
   },
   "files": [
     "dist/src",
@@ -21,7 +23,8 @@
     "README.md",
     "locale/*.json",
     "locale/documents/*.json",
-    "locale/memory/*.json"
+    "locale/memory/*.json",
+    "locale/mail/*.json"
   ],
   "dsh": {
     "bundle": {

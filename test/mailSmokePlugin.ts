@@ -19,6 +19,7 @@ import { BridgeRegistry } from '../src/channels/notify.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 import { installBridge } from '../src/dsh/bridge.js';
 import { installAssistantPrompt } from '../src/assistant/prompt.js';
+import * as mailComponent from '../src/connectors/mail/plugin.js';
 import { installConnectors } from '../src/plugin.js';
 import { mailFixture, rfc822 } from './mailFixture.js';
 import { until } from './helpers.js';
@@ -74,6 +75,10 @@ class FixtureModel extends LlmAdapter {
       if (!answered('list')) { yield* this.toolCall('list', 'mail_list', {}); return; }
       yield* this.text(`收件箱：${result('list').split('\n')[0]}`); return;
     }
+    if (askedText === '测试停用后批准') {
+      if (!answered('stale-send')) { yield* this.toolCall('stale-send', 'mail_send', { to: ['stale@example.com'], subject: '旧请求', text: '不得发送' }); return; }
+      yield* this.text(result('stale-send').includes('已发送') ? '错误：旧请求发出了' : '旧请求没有发送'); return;
+    }
     if (askedText === '给房东回信说周二可以') {
       if (!answered('send')) { yield* this.toolCall('send', 'mail_send', { to: ['landlord@example.com'], subject: '回复：修水管', text: '周二上午可以。', reply_to_uid: 1 }); return; }
       yield* this.text(result('send').includes('已发送') ? '已回信给房东。' : `发送失败：${result('send')}`); return;
@@ -123,6 +128,8 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
   const fixture = await mailFixture();
   ctx.effect(() => () => { void fixture.close(); });
   const connectors = await installConnectors(ctx, registry, { notifier: registry, timeZone: () => 'Asia/Shanghai', report: message => failures.push(`mail: ${message}`), imap: { insecure: true, timeoutMs: 5000 } });
+  ctx.provide('nexusConnectors', connectors);
+  let mailFiber = ctx.plugin(mailComponent);
   let running = false;
   const timer = setInterval(() => {
     void access(config.triggerFile).then(() => {
@@ -137,6 +144,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
   ctx.effect(() => () => clearInterval(timer));
 
   async function run() {
+    await until(() => connectors.view().modules?.mail === true, 'native mail component did not activate');
     const origin = `http://127.0.0.1:${ctx.webServer.port}`;
     const exchange = await fetch(ctx.connection.authenticatedUrl(origin), { redirect: 'manual' });
     const cookie = exchange.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
@@ -229,6 +237,27 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.match(texts.at(-1)!, /^新邮件：\[3\] .*房东 <landlord@example.com>｜改到周三/);
     assert.ok(!texts.some(text => text.includes('不相关')));
     assert.equal((await rpc('list')).mail.lastUid, 3);
+    // DSH's native approval can outlive component disposal. Re-resolving the newly
+    // registered tool after approval must not send the old request.
+    setApprovalPolicy(agent.session, 'ask');
+    const askedBefore = texts.filter(text => text.includes('需要你确认后继续')).length;
+    void bridge.receive(inbound('mail-stale', '测试停用后批准')).catch(() => {});
+    await until(() => texts.filter(text => text.includes('需要你确认后继续')).length > askedBefore, 'stale send approval missing');
+    const sentBefore = fixture.sent.length;
+    const savedBefore = (await rpc('list')).settings;
+    await mailFiber.dispose();
+    assert.equal(connectors.view().modules?.mail, false);
+    assert.ok(!ctx.tools.get('mail_send'));
+    assert.deepEqual((await rpc('list')).settings, savedBefore);
+    assert.equal((await rpc('list')).mail.watches.length, 1);
+    mailFiber = ctx.plugin(mailComponent);
+    await until(() => !!ctx.tools.get('mail_send'), 'mail component did not reactivate');
+    await bridge.receive(inbound('mail-stale-approve', '允许'));
+    await agent.whenIdle();
+    await bridge.drain();
+    assert.equal(fixture.sent.length, sentBefore);
+    assert.match(texts.at(-1)!, /旧请求没有发送/);
+    assert.equal((await rpc('list')).mail.watches.length, 1);
     // Off: the tools leave the model's set on the next call.
     view = await rpc('clear-secret', { revision: (await rpc('list')).settings.revision });
     assert.deepEqual([view.settings.mail.enabled, view.mail.toolsRegistered], [false, false]);
@@ -271,7 +300,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls,
       checks: ['connector_settings_requires_login', 'mail_tools_absent_until_enabled', 'mail_test_and_save_through_routes', 'mail_list_reads_inbox',
         'mail_send_to_unlisted_recipient_asks_on_channel', 'approval_releases_smtp_send_in_thread', 'listed_recipient_sends_without_approval', 'full_access_send_asks_in_chat_and_sends_after_answer', 'attachment_named_in_confirmation_and_sent_from_workspace',
-        'watched_arrival_enters_session_as_event', 'unwatched_arrival_stays_silent', 'clearing_secret_removes_tools',
+        'watched_arrival_enters_session_as_event', 'unwatched_arrival_stays_silent', 'clearing_secret_removes_tools', 'native_mail_dispose_preserves_account_and_watches', 'old_native_approval_cannot_send_after_reenable',
         'agenda_tools_present_by_default', 'calendar_add_and_todo_add_through_model', 'agenda_view_through_routes', 'event_reminder_pushed_once', 'daily_point_reminder_filed_by_model_and_pushed_at_its_moment', 'calendar_list_today', 'disabling_agenda_removes_tools'] }, null, 2));
   }
 }

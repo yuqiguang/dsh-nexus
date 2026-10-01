@@ -7,6 +7,8 @@ import { simpleParser } from 'mailparser';
 import type { Context } from '@deepseek-ai/cordis';
 import { ImapSmtpMail, bodyText, parseMessage } from '../src/connectors/mail/imap.js';
 import { MailConnector, mailErrorCode, mailErrorDetail, recipientsOf, unlistedRecipients, type MailDomain } from '../src/connectors/mail/index.js';
+import { MailData } from '../src/connectors/mail/data.js';
+import type { ToolExecution } from '@deepseek-ai/dsh-tools';
 import { REDACTED_INSTRUCTION } from '../src/assistant/untrusted.js';
 import { arrivalText, htmlToText, renderList, renderMessage, snippet, watchMatches } from '../src/connectors/mail/render.js';
 import type { MailClient, MailMessage, MailSummary } from '../src/connectors/mail/types.js';
@@ -218,6 +220,7 @@ function fakeContext() {
   const tools = new Map<string, { execute(args: unknown, exec: unknown): Promise<{ text: string }> }>();
   const hooks: ((exec: unknown, next: () => Promise<unknown>) => Promise<unknown>)[] = [];
   const sections: string[] = [];
+  const effects: (() => unknown)[] = [];
   // The session's approval policy as DSH folds it, and the questions put to the user with the answer they give.
   const approval = { policy: 'ask' as 'ask' | 'never', overrideOf: () => approval.policy, config: { policy: 'ask' } };
   const questions = { asked: [] as { questions: { id: string; header?: string; question: string; detail?: string; options?: { label: string }[] }[] }[],
@@ -225,20 +228,33 @@ function fakeContext() {
   const ctx = {
     get: (name: string) => name === 'approval' ? approval : undefined,
     userQuestions: { async ask(request: never) { questions.asked.push(request); return questions.answer(); } },
-    effect(run: () => unknown) { const dispose = run(); return typeof dispose === 'function' ? dispose : () => {}; },
+    effect(run: () => unknown) { const dispose = run(); if (typeof dispose === 'function') effects.push(dispose as () => unknown); return typeof dispose === 'function' ? dispose : () => {}; },
     tools: { register(tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<{ text: string }> }) { tools.set(tool.name, tool); return () => { tools.delete(tool.name); }; } },
     systemPrompt: { section(section: { name: string }) { sections.push(section.name); return () => { sections.splice(sections.indexOf(section.name), 1); }; }, getSectionOrder() { return 10; } },
-    on(name: string, handler: (exec: unknown, next: () => Promise<unknown>) => Promise<unknown>) { if (name === 'tools/pre-execute') hooks.push(handler); return () => {}; },
+    on(name: string, handler: (exec: unknown, next: () => Promise<unknown>) => Promise<unknown>) { if (name === 'tools/pre-execute') hooks.push(handler); return () => { const index = hooks.indexOf(handler); if (index >= 0) hooks.splice(index, 1); }; },
   } as unknown as Context;
-  const run = (name: string, args: unknown) => { const tool = tools.get(name); if (!tool) throw new Error(`tool ${name} is not registered`); return tool.execute(args, { agent: { id: 's1', session: { id: 's1', header: {} } } }); };
   const signal = new AbortController().signal;
-  // `cwd` is the session's workspace, where attachments are read from.
-  const gate = async (name: string, args: unknown, inner: unknown = { kind: 'allow' }, cwd?: string) => { let decision: unknown = inner; for (const hook of hooks) decision = await hook({ name, arguments: args, agent: { session: { id: 's1', header: { cwd } } }, signal }, async () => inner); return decision as { kind: string; reason?: string }; };
-  return { ctx, tools, sections, run, gate, approval, questions };
+  const execution = (name: string, args: unknown, cwd?: string) => ({ name, arguments: args, agent: { session: { id: 's1', header: { cwd } } }, signal }) as ToolExecution;
+  const prepare = async (exec: ToolExecution, inner: unknown = { kind: 'allow' }) => {
+    let decision: unknown = inner;
+    for (const hook of [...hooks]) decision = await hook(exec, async () => inner);
+    return decision as { kind: string; reason?: string };
+  };
+  const gate = (name: string, args: unknown, inner: unknown = { kind: 'allow' }, cwd?: string) => prepare(execution(name, args, cwd), inner);
+  // Fixture approval is granted explicitly by the caller after running the real hook.
+  const run = async (name: string, args: unknown, cwd?: string) => {
+    const exec = execution(name, args, cwd);
+    const decision = await prepare(exec);
+    if (decision.kind === 'deny') throw new Error(decision.reason);
+    const tool = tools.get(name);
+    if (!tool) throw new Error(`tool ${name} is not registered`);
+    return tool.execute(args, exec);
+  };
+  return { ctx, tools, sections, run, gate, approval, questions, execution, prepare, hooks, async dispose() { for (const dispose of effects.splice(0).reverse()) await dispose(); } };
 }
 
 test('attachments come from the session\'s workspace, are named in the confirmation, and anything else is refused before sending', async () => {
-  const { ctx, tools, gate, approval, questions } = fakeContext();
+  const { ctx, tools, gate, approval, questions, run } = fakeContext();
   const box = fakeMailbox();
   const settings: MailAccountSettings = { ...defaultMailSettings(), enabled: true, address: 'me@example.com', imapHost: 'imap', smtpHost: 'smtp', password: 'x', pollSeconds: 30, allowRecipients: [] };
   const connector = new MailConnector({ ctx, registry: { bound: () => [], async inject() { return false; } }, opener: fakeDomain().opener, client: () => box.client,
@@ -251,7 +267,7 @@ test('attachments come from the session\'s workspace, are named in the confirmat
   await writeFile(join(workspace, 'outputs', '报价单.xlsx'), 'XLSX');
   await writeFile(join(elsewhere, 'secret.txt'), 'outside');
   await symlink(join(elsewhere, 'secret.txt'), join(workspace, 'outputs', 'link.txt'));
-  const send = (args: object, header: { cwd?: string } = { cwd: workspace }) => tools.get('mail_send')!.execute({ to: ['li@other.com'], subject: '简历', text: '请查收。', ...args }, { agent: { session: { header } } });
+  const send = (args: object, header: { cwd?: string } = { cwd: workspace }) => run('mail_send', { to: ['li@other.com'], subject: '简历', text: '请查收。', ...args }, header.cwd);
   const mail = { to: ['li@other.com'], subject: '简历', text: '请查收。', attachments: ['outputs/个人简历.pdf', 'outputs/报价单.xlsx'] };
   // The user agrees to what goes out: the native approval and the in-chat question both name the files and their sizes.
   assert.deepEqual(await gate('mail_send', mail, undefined, workspace), { kind: 'ask', reason: '发邮件给 li@other.com，主题「简历」，附件 个人简历.pdf（9 B）、报价单.xlsx（4 B）' });
@@ -321,7 +337,7 @@ test('under full access the send gate asks in the chat, because DSH would reject
   const unanswered = await gate('mail_send', { ...mail, to: ['wang@else.com'] });
   assert.equal(unanswered.kind, 'deny');
   assert.match(unanswered.reason!, /没能向用户确认，邮件没有发出/);
-  assert.ok(reports.includes('mail send confirmation failed: NO_PROVIDER'), JSON.stringify(reports));
+  assert.ok(reports.includes('mail send confirmation failed: mail_request_failed'), JSON.stringify(reports));
   // A long body is cut to what fits a chat message.
   questions.answer = () => ({ answers: [{ id: 'send', selected: [], custom: '发' }] });
   assert.deepEqual(await gate('mail_send', { ...mail, to: ['wang@else.com'], text: '长'.repeat(1000) }), { kind: 'allow' }, 'a typed yes counts');
@@ -466,6 +482,7 @@ test('the Connectors service saves settings, tests a draft account, and removes 
     const connectors = new Connectors({ ctx: ctxWithCreds, registry: { bound: () => [], async inject() { return false; } }, notifier: { async notify() { return false; } }, timeZone: () => 'Asia/Shanghai', now: () => T0, report: () => {},
       imap: { insecure: true, timeoutMs: 5000 }, sleep: (_ms, signal) => new Promise((_resolve, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }); }) });
     await connectors.start();
+    await connectors.enableMail(ctx);
     let view = await connectors.handle('list', {});
     assert.deepEqual([view.settings.revision, view.mail.phase, view.settings.mail.passwordConfigured], [0, 'disabled', false]);
     const draft = { mail: { address: 'user@example.com', imapHost: '127.0.0.1', imapPort: fixture.imapPort, imapSecure: false, smtpHost: '127.0.0.1', smtpPort: fixture.smtpPort, smtpSecure: false, password: 'app-password' } };
@@ -481,5 +498,266 @@ test('the Connectors service saves settings, tests a draft account, and removes 
     view = await connectors.handle('clear-secret', { revision: 1 });
     assert.deepEqual([view.settings.mail.enabled, view.settings.mail.passwordConfigured, view.mail.phase, view.mail.toolsRegistered, view.mailTest], [false, false, 'disabled', false, undefined]);
     await assert.rejects(connectors.handle('nope', {}), /unknown_action/);
+    await connectors.close();
   } finally { await fixture.close(); }
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+const runtimeSettings = (): MailAccountSettings => ({ ...defaultMailSettings(), enabled: true, address: 'me@example.com', imapHost: 'imap.example.com', smtpHost: 'smtp.example.com', password: 'fixture' });
+const outgoing = { to: ['friend@example.com'], subject: 'fixture', text: 'fixture' };
+const noSleep = () => new Promise<void>(() => {});
+
+test('old approvals and captured tools cannot dispatch through a replaced mailbox or a new component activation', async () => {
+  const fake = fakeContext();
+  const box = fakeMailbox();
+  const storage = fakeDomain();
+  const data = await MailData.open(storage.opener);
+  const deps = { ctx: fake.ctx, data, opener: storage.opener, registry: { bound: () => [], async inject() { return false; } }, client: () => box.client, timeZone: () => 'UTC', sleep: noSleep };
+  let connector = new MailConnector(deps);
+  await connector.start(runtimeSettings());
+  const exec = fake.execution('mail_send', outgoing);
+  assert.equal((await fake.prepare(exec)).kind, 'ask');
+  const oldTool = fake.tools.get('mail_send')!;
+  await connector.apply({ ...runtimeSettings(), address: 'new@example.com' });
+  await assert.rejects(async () => oldTool.execute(outgoing, exec), /module_disabled/);
+  await assert.rejects(async () => fake.tools.get('mail_send')!.execute(outgoing, exec), /module_disabled/, 'DSH resolves the tool again after approving');
+  const beforeClose = fake.execution('mail_send', outgoing);
+  await fake.prepare(beforeClose);
+  const watch = await connector.addWatch('fixture mail', ['fixture']);
+  await connector.close();
+  assert.equal(fake.hooks.length, 0);
+  assert.equal(fake.tools.size, 0);
+  assert.deepEqual(fake.sections, []);
+  assert.equal(data.listWatches()[0]?.id, watch.id);
+  connector = new MailConnector(deps);
+  await connector.start(runtimeSettings());
+  await assert.rejects(async () => fake.tools.get('mail_send')!.execute(outgoing, beforeClose), /module_disabled/);
+  assert.equal(box.state.sent.length, 0);
+  await fake.run('mail_send', outgoing);
+  assert.equal(box.state.sent.length, 1);
+  await connector.close();
+  await data.close();
+});
+
+test('a question answered after disable cannot send or remember a recipient even if the question ignores cancellation', async () => {
+  const fake = fakeContext();
+  const answer = deferred<unknown>();
+  fake.approval.policy = 'never';
+  fake.questions.answer = () => answer.promise;
+  const box = fakeMailbox();
+  let saved = 0;
+  const connector = new MailConnector({ ctx: fake.ctx, opener: fakeDomain().opener, registry: { bound: () => [], async inject() { return false; } },
+    client: () => box.client, timeZone: () => 'UTC', sleep: noSleep, async onAllowRecipients() { saved++; } });
+  await connector.start(runtimeSettings());
+  const decision = fake.gate('mail_send', outgoing);
+  await until(() => fake.questions.asked.length === 1, 'question missing');
+  await connector.close();
+  answer.resolve({ answers: [{ id: 'send', selected: ['允许并记住'] }] });
+  assert.equal((await decision).kind, 'deny');
+  assert.equal(saved, 0);
+  assert.equal(box.state.sent.length, 0);
+});
+
+test('a send awaiting the original message cannot cross an account change', async () => {
+  const fake = fakeContext();
+  const box = fakeMailbox();
+  const read = deferred<MailMessage | undefined>();
+  let reading = false;
+  box.client.read = () => { reading = true; return read.promise; };
+  const connector = new MailConnector({ ctx: fake.ctx, opener: fakeDomain().opener, registry: { bound: () => [], async inject() { return false; } }, client: () => box.client, timeZone: () => 'UTC', sleep: noSleep });
+  await connector.start(runtimeSettings());
+  const sending = assert.rejects(fake.run('mail_send', { ...outgoing, reply_to_uid: 1 }), /module_disabled/);
+  await until(() => reading, 'reply was not read');
+  const changing = connector.apply({ ...runtimeSettings(), address: 'new@example.com' });
+  read.resolve(undefined);
+  await sending;
+  await changing;
+  assert.equal(box.state.sent.length, 0);
+  await connector.close();
+});
+
+test('late inbox and connection-test responses cannot notify, advance the cursor or report connected after disable', async () => {
+  const fake = fakeContext();
+  const box = fakeMailbox();
+  const poll = deferred<Awaited<ReturnType<MailClient['newSince']>>>();
+  const testReply = deferred<Awaited<ReturnType<MailClient['check']>>>();
+  let closes = 0;
+  let injected = 0;
+  box.client.close = async () => { closes++; };
+  const connector = new MailConnector({ ctx: fake.ctx, opener: fakeDomain().opener, registry: { bound: () => ['s1'], async inject() { injected++; return true; } }, client: () => box.client, timeZone: () => 'UTC', sleep: noSleep });
+  await connector.start(runtimeSettings());
+  await until(() => connector.view().phase === 'connected', 'initial check missing');
+  await connector.addWatch('fixture', ['fixture']);
+  box.add('sender@example.com', 'fixture');
+  box.client.newSince = () => poll.promise;
+  let testStarted = false;
+  box.client.check = () => { testStarted = true; return testReply.promise; };
+  const checking = assert.rejects(connector.checkOnce(), /module_disabled/);
+  const testing = assert.rejects(connector.test(), /module_disabled/);
+  await until(() => testStarted, 'temporary test client not started');
+  const closing = connector.close();
+  await until(() => closes >= 2, 'runtime and temporary clients must close before waiting on them');
+  poll.resolve({ messages: box.state.messages, uidNext: 2, uidValidity: 1 });
+  testReply.resolve({ exists: 1, uidNext: 2, uidValidity: 1 });
+  await checking; await testing; await closing;
+  assert.equal(injected, 0);
+  assert.equal(connector.view().lastUid, 0);
+  assert.equal(connector.view().phase, 'disabled');
+  assert.equal(connector.view().mailbox, undefined);
+});
+
+test('unload drains a send that already entered SMTP exactly once and does not describe it as recalled', async () => {
+  const fake = fakeContext();
+  const box = fakeMailbox();
+  const sent = deferred<{ messageId: string }>();
+  let calls = 0;
+  box.client.send = () => { calls++; return sent.promise; };
+  const connector = new MailConnector({ ctx: fake.ctx, opener: fakeDomain().opener, registry: { bound: () => [], async inject() { return false; } }, client: () => box.client, timeZone: () => 'UTC', sleep: noSleep });
+  await connector.start(runtimeSettings());
+  const sending = fake.run('mail_send', outgoing);
+  await until(() => calls === 1, 'SMTP not entered');
+  let closed = false;
+  const closing = connector.close().then(() => { closed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closed, false);
+  assert.equal(connector.view().phase, 'disabled');
+  sent.resolve({ messageId: 'sent-once' });
+  assert.match((await sending).text, /已发送.*sent-once/);
+  await closing;
+  assert.equal(calls, 1);
+});
+
+test('a different mailbox with the same UIDVALIDITY starts from its own baseline and retains watch rules', async () => {
+  const fake = fakeContext();
+  const box = fakeMailbox();
+  const storage = fakeDomain();
+  let injected = 0;
+  const connector = new MailConnector({ ctx: fake.ctx, opener: storage.opener, registry: { bound: () => ['s1'], async inject() { injected++; return true; } }, client: () => box.client, timeZone: () => 'UTC', sleep: noSleep });
+  await connector.start(runtimeSettings());
+  await until(() => connector.view().phase === 'connected', 'initial check missing');
+  await connector.addWatch('fixture', ['fixture']);
+  box.add('sender@example.com', 'fixture existing in other account');
+  await connector.apply({ ...runtimeSettings(), address: 'other@example.com' });
+  await until(() => connector.view().phase === 'connected', 'replacement check missing');
+  assert.equal(connector.view().lastUid, 1);
+  assert.equal(connector.listWatches().length, 1);
+  assert.equal(injected, 0);
+  box.add('sender@example.com', 'fixture new arrival');
+  await connector.checkOnce();
+  assert.equal(injected, 1);
+  await connector.close();
+});
+
+test('IMAP close interrupts a stalled authentication command and refuses later operations', async () => {
+  const { createServer } = await import('node:net');
+  const sockets = new Set<import('node:net').Socket>();
+  let commandSeen = false;
+  const server = createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] fixture\r\n');
+    socket.on('data', () => { commandSeen = true; });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const client = new ImapSmtpMail({ ...runtimeSettings(), imapHost: '127.0.0.1', imapPort: port }, { insecure: true, timeoutMs: 1000 });
+  try {
+    const checking = assert.rejects(client.check());
+    await until(() => commandSeen, 'fixture did not receive authentication', 2000);
+    await client.close();
+    await checking;
+    await assert.rejects(client.check(), /closed/);
+    await assert.rejects(client.send(outgoing), /closed/);
+  } finally {
+    await client.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('core retains mailbox credentials and watches while disabled, and rejects superseded or late connection-test results', async () => {
+  const core = fakeContext();
+  const records = new MemoryRecords();
+  Object.assign(core.ctx, { credentials: {
+    async readRecord(key: string) { const value = await records.read(key); return value === undefined ? undefined : { kind: 'grant', payload: value }; },
+    async modifyRecord(key: string, update: (current: unknown) => Promise<unknown>) {
+      const value = await records.modify(key, async current => (await update(current === undefined ? undefined : { kind: 'grant', payload: current }) as { payload?: unknown } | undefined)?.payload);
+      return value === undefined ? undefined : { kind: 'grant', payload: value };
+    },
+  }, storageDomain: fakeDomain().opener });
+  const box = fakeMailbox();
+  let clients = 0;
+  const checks: ReturnType<typeof deferred<Awaited<ReturnType<MailClient['check']>>>>[] = [];
+  box.client.check = () => { const reply = deferred<Awaited<ReturnType<MailClient['check']>>>(); checks.push(reply); return reply.promise; };
+  const connectors = new Connectors({ ctx: core.ctx, client: () => { clients++; return box.client; }, modules: { agenda: false },
+    registry: { bound: () => [], async inject() { return false; } }, notifier: { async notify() { return false; } }, timeZone: () => 'UTC', sleep: noSleep });
+  await connectors.start();
+  await connectors.handle('save', { revision: 0, config: { mail: runtimeSettings() } });
+  assert.equal(clients, 0);
+  assert.equal(connectors.view().settings.mail.passwordConfigured, true);
+  await assert.rejects(connectors.handle('mail/test', {}), /module_disabled/);
+  let runtime = fakeContext();
+  await connectors.enableMail(runtime.ctx);
+  await runtime.run('mail_watch', { action: 'add', description: 'persistent fixture', keywords: ['fixture'] });
+  const older = assert.rejects(connectors.handle('mail/test', {}), /configuration_changed/);
+  await until(() => checks.length === 1, 'first test missing');
+  const newer = connectors.handle('mail/test', {});
+  await until(() => checks.length === 2, 'second test missing');
+  checks[1]!.resolve({ exists: 2, uidNext: 3, uidValidity: 1 });
+  assert.equal((await newer).mailTest?.exists, 2);
+  checks[0]!.resolve({ exists: 1, uidNext: 2, uidValidity: 1 });
+  await older;
+  assert.equal(connectors.view().mailTest?.exists, 2);
+  const late = assert.rejects(connectors.handle('mail/test', {}), /module_disabled|configuration_changed/);
+  await until(() => checks.length === 3, 'third test missing');
+  const saved = connectors.view().settings;
+  const closing = runtime.dispose();
+  checks[2]!.resolve({ exists: 99, uidNext: 100, uidValidity: 1 });
+  await late; await closing;
+  assert.equal(connectors.view().modules?.mail, false);
+  assert.equal(connectors.view().mailTest, undefined);
+  assert.deepEqual(connectors.view().settings, saved);
+  assert.equal(connectors.view().mail.watches.length, 1);
+  const id = connectors.view().mail.watches[0]!.id;
+  await connectors.handle('mail/watch/remove', { id });
+  runtime = fakeContext();
+  await connectors.enableMail(runtime.ctx);
+  assert.equal(connectors.view().mail.watches.length, 0);
+  assert.equal(connectors.view().settings.mail.passwordConfigured, true);
+  await runtime.dispose();
+  await connectors.close();
+});
+
+test('retiring a runtime before the credential update is admitted cannot change its recipient allow list', async () => {
+  const base = new MemoryRecords();
+  const release = deferred<void>();
+  let current = true;
+  const records = { read: base.read.bind(base),
+    async modify(key: string, change: (value: unknown) => Promise<unknown>) { await release.promise; return base.modify(key, change); } };
+  const store = new ConnectorSettingsStore(records);
+  const saving = assert.rejects(store.save(0, { mail: { allowRecipients: ['friend@example.com'] } }, () => {
+    if (!current) throw new Error('module_disabled');
+  }), /module_disabled/);
+  current = false;
+  release.resolve();
+  await saving;
+  assert.equal(base.values.size, 0);
+});
+
+test('legacy cursor attribution preserves existing progress before the saved mailbox can be changed', async () => {
+  const storage = fakeDomain();
+  const data = await MailData.open(storage.opener);
+  await data.cursor.put('inbox', { uidValidity: 1, lastUid: 10, checkedAt: 1 });
+  await data.bindLegacyCursor(runtimeSettings());
+  const bound = data.cursor.get('inbox')!;
+  assert.equal(bound.lastUid, 10);
+  assert.match(bound.accountKey!, /^[a-f0-9]{64}$/);
+  await data.bindLegacyCursor({ ...runtimeSettings(), address: 'other@example.com' });
+  assert.deepEqual(data.cursor.get('inbox'), bound);
+  await data.close();
 });

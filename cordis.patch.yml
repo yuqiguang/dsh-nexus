@@ -7,3 +7,6 @@
     - id: nexus-memory
       name: nexus-next/memory
       disabled: true
+    - id: nexus-mail
+      name: nexus-next/mail
+      disabled: true

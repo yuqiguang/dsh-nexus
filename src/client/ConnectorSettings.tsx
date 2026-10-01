@@ -110,12 +110,12 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">
         <header><h3>邮箱</h3><span className={`nexus-channel-state ${mail.phase}`}>{phases[mail.phase] ?? mail.phase}{mail.error ? `：${explain(mail.error)}` : ''}</span></header>
-        {view.modules?.mail === false && <p role="status">邮箱模块当前关闭，不运行邮件工具、轮询或连接测试。已有账号配置保留；请在“Nexus 扩展”启用并重启后使用。</p>}
+        {view.modules?.mail === false && <p role="status">邮箱组件当前关闭，不运行邮件工具、轮询或连接测试。已有账号配置和提醒规则保留；请在 DSH 插件详情的组件列表中启用“邮箱”。宿主提示需要重启时，请等任务结束后重启。</p>}
         {mail.phase !== 'disabled' && <p className="nexus-channel-account">
           {mail.toolsRegistered ? '邮件工具已加入模型的工具集。' : '邮件工具未加入模型的工具集。'}
           {mail.checkedAt !== undefined && ` 上次检查收件箱：${when(mail.checkedAt)}。`}{mail.mailbox && ` 收件箱 ${mail.mailbox.exists} 封${mail.mailbox.unseen !== undefined ? `，未读 ${mail.mailbox.unseen}` : ''}。`}</p>}
         <label htmlFor="mail-enabled"><input id="mail-enabled" type="checkbox" checked={draft.enabled} disabled={busy} style={{ width: 'auto', marginRight: 8 }}
-          onChange={event => edit({ enabled: event.target.checked })} />启用邮箱账号（邮箱模块开启后提供邮件工具）</label>
+          onChange={event => edit({ enabled: event.target.checked })} />启用邮箱账号（邮箱组件开启后提供邮件工具）</label>
         <label htmlFor="mail-preset">服务商</label>
         <select id="mail-preset" value="" disabled={busy} onChange={event => applyPreset(event.target.value)}>
           <option value="">选一个服务商自动填入服务器…</option>

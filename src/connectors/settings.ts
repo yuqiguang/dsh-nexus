@@ -185,8 +185,11 @@ export class ConnectorSettingsStore {
     return decode(result)!;
   }
 
-  save(expectedRevision: number, input: Record<string, unknown>): Promise<ConnectorSettingsRecord> {
-    return this.modify(expectedRevision, previous => ({ version: 1, revision: previous.revision + 1, mail: mailInput(input.mail, previous.mail), agenda: agendaInput(input.agenda, previous.agenda) }));
+  save(expectedRevision: number, input: Record<string, unknown>, assertCurrent: () => void = () => {}): Promise<ConnectorSettingsRecord> {
+    return this.modify(expectedRevision, previous => {
+      assertCurrent();
+      return { version: 1, revision: previous.revision + 1, mail: mailInput(input.mail, previous.mail), agenda: agendaInput(input.agenda, previous.agenda) };
+    });
   }
 
   /** Forget the password and stop using the account: the tools go away with it. */

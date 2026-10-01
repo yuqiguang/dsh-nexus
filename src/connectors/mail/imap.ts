@@ -68,12 +68,16 @@ function matchesDecoded(message: MailMessage, query: MailSearch): boolean {
 /** IMAP for reading and SMTP for sending, one connection per operation so a dropped socket never lingers. */
 export class ImapSmtpMail implements MailClient {
   private transporter?: Transporter;
+  private closed = false;
+  private readonly inboxes = new Set<ImapFlow>();
+  private readonly sending = new Set<Promise<unknown>>();
 
   constructor(private readonly settings: MailAccountSettings, private readonly options: ImapOptions = {}) {}
 
   private get user(): string { return this.settings.user || this.settings.address; }
 
   private async withInbox<T>(run: (client: ImapFlow) => Promise<T>): Promise<T> {
+    if (this.closed) throw new Error('mail client closed');
     const client = new ImapFlow({ host: this.settings.imapHost, port: this.settings.imapPort, secure: this.settings.imapSecure && !this.options.insecure,
       ...(this.options.insecure ? { doSTARTTLS: false } : {}), auth: { user: this.user, pass: this.settings.password }, logger: false, tls: SOCKET_OPTIONS,
       clientInfo: { name: 'nexus-next', version: '0.1.0' }, disableCompression: true, disableAutoEnable: true,
@@ -81,10 +85,12 @@ export class ImapSmtpMail implements MailClient {
     // Once connected, imapflow reports a dying socket (reset, timeout) as an 'error' event. Unheard, Node throws it out of the event
     // loop: five dropped connections exited the service that way on 2026-09-23. The event names the cause; one after the call settled
     // (a LOGOUT on a dead socket, a session start that outlived a failed connect) has nothing left to report.
+    this.inboxes.add(client);
     let dropped: unknown;
     client.on('error', error => { dropped ??= error; });
     try {
       await client.connect();
+      if (this.closed) throw new Error('mail client closed');
       await client.mailboxOpen('INBOX');
       const result = await run(client);
       // search answers a lost connection with `false`, and a command sent after the close returns nothing; either would read as
@@ -94,7 +100,9 @@ export class ImapSmtpMail implements MailClient {
     } catch (error) {
       throw dropped ?? error;
     } finally {
-      await client.logout().catch(() => {});
+      if (this.closed) client.close();
+      else await client.logout().catch(() => {});
+      this.inboxes.delete(client);
     }
   }
 
@@ -187,7 +195,15 @@ export class ImapSmtpMail implements MailClient {
     });
   }
 
-  async send(mail: OutgoingMail): Promise<{ messageId: string }> {
+  send(mail: OutgoingMail): Promise<{ messageId: string }> {
+    if (this.closed) return Promise.reject(new Error('mail client closed'));
+    const pending = this.sendOnce(mail);
+    this.sending.add(pending);
+    void pending.then(() => this.sending.delete(pending), () => this.sending.delete(pending));
+    return pending;
+  }
+
+  private async sendOnce(mail: OutgoingMail): Promise<{ messageId: string }> {
     this.transporter ??= createTransport({ host: this.settings.smtpHost, port: this.settings.smtpPort, secure: this.settings.smtpSecure && !this.options.insecure,
       ...(this.options.insecure ? { ignoreTLS: true } : {}), auth: { user: this.user, pass: this.settings.password }, tls: SOCKET_OPTIONS,
       connectionTimeout: this.options.timeoutMs ?? 20_000, greetingTimeout: this.options.timeoutMs ?? 20_000, socketTimeout: 60_000 });
@@ -199,5 +215,13 @@ export class ImapSmtpMail implements MailClient {
     return { messageId: info.messageId ?? '' };
   }
 
-  async close(): Promise<void> { this.transporter?.close(); this.transporter = undefined; }
+  async close(): Promise<void> {
+    this.closed = true;
+    for (const client of this.inboxes) client.close();
+    // SMTP may already have accepted the mail. Let admitted sends settle once;
+    // disabling is neither a recall nor a reason to retry an uncertain delivery.
+    await Promise.allSettled([...this.sending]);
+    this.transporter?.close();
+    this.transporter = undefined;
+  }
 }

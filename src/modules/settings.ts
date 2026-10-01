@@ -1,10 +1,10 @@
 import type { Records } from '../channels/records.js';
 import { ChannelError } from '../channels/types.js';
 
-export const MODULE_KEYS = ['mail', 'agenda'] as const;
+export const MODULE_KEYS = ['agenda'] as const;
 export type ModuleKey = typeof MODULE_KEYS[number];
 export type ModuleFlags = Record<ModuleKey, boolean>;
-export interface ModuleRecord { version: 3; revision: number; enabled: ModuleFlags }
+export interface ModuleRecord { version: 4; revision: number; enabled: ModuleFlags }
 export interface ModulesView {
   revision: number;
   active: ModuleFlags;
@@ -16,7 +16,7 @@ export interface ModulesView {
 // Older releases have no installation marker. Absence of settings cannot safely
 // distinguish a fresh install from an existing profile with unsaved defaults.
 // Preserve their behavior until the user explicitly chooses a module set.
-export function compatibleModules(): ModuleFlags { return { mail: true, agenda: true }; }
+export function compatibleModules(): ModuleFlags { return { agenda: true }; }
 
 function flags(raw: unknown, code: string): ModuleFlags {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ChannelError(code);
@@ -26,10 +26,10 @@ function flags(raw: unknown, code: string): ModuleFlags {
 }
 
 function decode(raw: unknown): ModuleRecord {
-  if (raw === undefined) return { version: 3, revision: 0, enabled: compatibleModules() };
+  if (raw === undefined) return { version: 4, revision: 0, enabled: compatibleModules() };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ChannelError('invalid_saved_record');
   const record = raw as { version: unknown; revision: number; enabled: unknown };
-  if (![1, 2, 3].includes(record.version as number) || !Number.isSafeInteger(record.revision) || record.revision < 1) throw new ChannelError('invalid_saved_record');
+  if (![1, 2, 3, 4].includes(record.version as number) || !Number.isSafeInteger(record.revision) || record.revision < 1) throw new ChannelError('invalid_saved_record');
   let enabled = record.enabled;
   if (record.version === 1) {
     if (!enabled || typeof enabled !== 'object' || Array.isArray(enabled)) throw new ChannelError('invalid_saved_record');
@@ -45,7 +45,13 @@ function decode(raw: unknown): ModuleRecord {
     if (typeof memory !== 'boolean') throw new ChannelError('invalid_saved_record');
     enabled = remaining;
   }
-  return { version: 3, revision: record.revision, enabled: flags(enabled, 'invalid_saved_record') };
+  if ([1, 2, 3].includes(record.version as number)) {
+    if (!enabled || typeof enabled !== 'object' || Array.isArray(enabled)) throw new ChannelError('invalid_saved_record');
+    const { mail, ...remaining } = enabled as Record<string, unknown>;
+    if (typeof mail !== 'boolean') throw new ChannelError('invalid_saved_record');
+    enabled = remaining;
+  }
+  return { version: 4, revision: record.revision, enabled: flags(enabled, 'invalid_saved_record') };
 }
 
 /** The immutable startup snapshot gates runtime installation; writes only affect the next start. */
@@ -72,7 +78,7 @@ export class ModuleSettings {
     const result = await this.records.modify('settings', async current => {
       const previous = decode(current);
       if (previous.revision !== input.revision) throw new ChannelError('configuration_changed');
-      return { version: 3, revision: previous.revision + 1, enabled };
+      return { version: 4, revision: previous.revision + 1, enabled };
     });
     return this.view(decode(result));
   }
