@@ -1,19 +1,21 @@
 {
   "name": "nexus-next",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./dist/src/plugin.js",
     "./client": "./dist/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "dist/src",
     "dist/client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "locale/*.json"
   ],
   "dsh": {
     "bundle": {
@@ -26,7 +28,7 @@
       ]
     }
   },
-  "description": "Nexus for DSH: a personal coding assistant for supervising, verifying, and continuing local coding tasks from desktop and messaging channels.",
+  "description": "Nexus 个人编码助理：在桌面端和消息渠道中安排、跟进与验收本机编码任务。Personal coding assistant for DSH.",
   "engines": {
     "node": ">=22.20.0"
   },
