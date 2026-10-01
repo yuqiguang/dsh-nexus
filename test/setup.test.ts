@@ -35,7 +35,7 @@ const rewritten = (): PatchRow[] => [
 test('back-filling adds coder roots and moves owned reminder rows to the official bundle', () => {
   const patch = backfillProfilePatch(original(), ['/nexus']);
   const inserted = patch[0]!.insert!;
-  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels']);
+  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels', 'nexus-documents']);
   assert.deepEqual(inserted[0]!.config?.coderRoots, ['/nexus']);
   assert.deepEqual(inserted[0]!.config?.workspaceRoot, '/nexus/workspace', 'an existing workspace path is kept');
 });
@@ -52,6 +52,15 @@ test('back-filling a patch DSH rewrote as YAML keeps DSH\'s own rows, and a seco
 test('a patch without a nexus-channels row is left alone', () => {
   const patch = backfillProfilePatch([{ insert: [{ id: 'schedule', name: '@deepseek-ai/dsh-schedule' }] }], ['/nexus']);
   assert.deepEqual(patch, [{ insert: [{ id: 'schedule', name: '@deepseek-ai/dsh-schedule' }] }]);
+});
+
+test('document component is default-off and later native overrides survive setup', () => {
+  const patch = backfillProfilePatch(original(), ['/nexus']);
+  const documents = patch[0]!.insert!.find(row => row.id === 'nexus-documents');
+  assert.deepEqual(documents, { id: 'nexus-documents', name: 'file:///nexus/dist/src/documents/plugin.js', disabled: true });
+  patch.push({ id: 'nexus-documents', disabled: false });
+  const before = JSON.stringify(patch);
+  assert.equal(JSON.stringify(backfillProfilePatch(patch, ['/nexus'])), before);
 });
 
 test('the login address DSH prints is kept out of the service log and saved where only this user can read it', async () => {
@@ -79,7 +88,7 @@ test('moving reminder services into the official bundle preserves their explicit
     { id: 'nexus-channels', name: 'file:///nexus/dist/src/plugin.js', config: {} },
   ] }, { id: 'schedule', config: { deliveryHistoryDays: 10 } }];
   const patch = backfillProfilePatch(source, ['/nexus']);
-  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels']);
+  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels', 'nexus-documents']);
   assert.deepEqual(patch.slice(1).map(row => [row.id, row.config]), [
     ['schedule', { deliveryHistoryDays: 7 }], ['time-context', {}], ['schedule', { deliveryHistoryDays: 10 }],
   ]);

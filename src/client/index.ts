@@ -10,7 +10,7 @@ import { MemorySettings } from './MemorySettings.js';
 import { ConnectorSettings } from './ConnectorSettings.js';
 import { DocumentSettings } from './DocumentSettings.js';
 import { DataSettings } from './DataSettings.js';
-import { ModuleBoundary, ModuleSettings } from './ModuleSettings.js';
+import { ModuleSettings } from './ModuleSettings.js';
 import styles from './styles.css';
 import { applyChatFold, readChatFold } from './chatFold.js';
 import { TASK_RESOURCE, TASK_TAB_ID, TASK_TAB_KIND, coderTaskPanel, coderTaskRow, taskIdOf, taskAddress } from './CoderTasks.js';
@@ -63,8 +63,8 @@ export function apply(ctx: Context): void {
     name: 'settings.section', id: 'nexus-connectors', order: 16, label: '邮箱与日程',
   }, ConnectorSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-documents', order: 17, label: '文档工具',
-  }, () => createElement(ModuleBoundary, { module: 'documents', children: createElement(DocumentSettings) })));
+    name: 'settings.section', id: 'nexus-documents', order: 17, label: '文档兼容工具',
+  }, DocumentSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-data', order: 18, label: '数据',
   }, DataSettings));

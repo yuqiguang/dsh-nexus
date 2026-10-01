@@ -7,6 +7,7 @@ import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ChannelError } from '../channels/types.js';
+import { documentGuidance } from '../assistant/prompt.js';
 import { type Converter, type ConvertRequest, type Format, type Runner, convertWithCom, convertWithPandoc, convertWithSoffice, defaultRunner, detectConverters, formatOf, pdfText, routesFor } from './converters.js';
 import { type DocxEdit, createDocx, editDocx, readDocx } from './docx.js';
 import { parseMarkdown, plain } from './markdown.js';
@@ -66,6 +67,8 @@ export class DocumentService {
   private readonly now: () => number;
   private readonly report: (message: string) => void;
   private disposers: (() => void)[] = [];
+  private readonly lifetime = new AbortController();
+  private installing?: Promise<void>;
 
   constructor(private readonly deps: DocumentServiceDeps) {
     this.runner = deps.runner ?? defaultRunner;
@@ -75,12 +78,19 @@ export class DocumentService {
   }
 
   async start(): Promise<void> {
+    this.deps.ctx.effect(() => async () => {
+      this.lifetime.abort();
+      for (const dispose of this.disposers.splice(0)) dispose();
+      await this.installing;
+      await this.queue.catch(() => {});
+    });
     await this.detect();
+    this.lifetime.signal.throwIfAborted();
     this.registerTools();
-    this.deps.ctx.effect(() => () => { for (const dispose of this.disposers.splice(0)) dispose(); });
   }
 
   async detect(): Promise<Converter[]> {
+    this.lifetime.signal.throwIfAborted();
     try {
       this.converters = this.deps.detect ? await this.deps.detect() : await detectConverters({ managedRoot: this.deps.managedRoot, runner: this.runner, ...(this.deps.platform ? { platform: this.deps.platform } : {}) });
     } catch (error) { this.report(`converter detection failed: ${(error as Error)?.message ?? error}`); this.converters = []; }
@@ -107,11 +117,14 @@ export class DocumentService {
   }
 
   async handle(method: string, _payload: unknown): Promise<DocumentsView> {
+    this.lifetime.signal.throwIfAborted();
     if (method === 'list') return this.view();
     if (method === 'detect') { await this.detect(); return this.view(); }
     if (method === 'pandoc/install') {
       if (this.installer.status()?.phase === 'installing') throw new ChannelError('install_in_progress');
-      void this.installer.install().then(() => this.detect());
+      this.installing = this.installer.install(this.lifetime.signal).then(async () => {
+        if (!this.lifetime.signal.aborted) await this.detect();
+      }).catch(() => { if (!this.lifetime.signal.aborted) this.report('pandoc_install_failed'); });
       return this.view();
     }
     throw new ChannelError('unknown_action');
@@ -199,7 +212,7 @@ export class DocumentService {
   // ---- converting ----
 
   private serial<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.queue.catch(() => {}).then(task);
+    const next = this.queue.catch(() => {}).then(() => { this.lifetime.signal.throwIfAborted(); return task(); });
     this.queue = next;
     return next;
   }
@@ -384,7 +397,7 @@ export class DocumentService {
     this.disposers.push(ctx.systemPrompt.section({
       name: 'nexus:documents',
       order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 6,
-      text: () => `办公文档：用户发来的 docx、xlsx、pptx、pdf 用 doc_read 读（不要用 read，它只会看到乱码）；要生成报告、表格、演示文稿用 doc_create 写到 outputs/ 再 present；要改用户发来的文件用 doc_edit，结果是新文件，原件不动；换格式用 doc_convert。本机当前能力：${this.capabilities().join('；')}。做不到的事直接告诉用户原因，不要说“稍后再试”。`,
+      text: context => !ctx.tools.get('doc_read', context.scope) ? '' : `文档兼容工具：${documentGuidance({ documents: true, skills: !!ctx.tools.get('skill', context.scope) })}结果写到 outputs/ 再 present，inbox/ 原件不动。以下仅是 Nexus 兼容流程的本机能力，不代表官方能力：${this.capabilities().join('；')}。`,
     }));
   }
 }

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Document compatibility tools",
+    "description": "Optional legacy formats, Pandoc and local converters. Prefer native DSH Office skills for routine work. Disabled by default."
+  }
+}

@@ -16,12 +16,11 @@ export const modulesApi: ModulesApi = async (method, payload = {}, signal) => {
   return message.result.value as ModulesView;
 };
 
-const labels: Record<ModuleKey, string> = { memory: '长期记忆', mail: '邮箱', agenda: '日历与待办', documents: '办公文档' };
+const labels: Record<ModuleKey, string> = { memory: '长期记忆', mail: '邮箱', agenda: '日历与待办' };
 const hints: Record<ModuleKey, string> = {
   memory: '关闭后停止模型记忆工具、自动注入和渠道摘要写入；设置页仍可管理数据。新记忆按会话项目和身份隔离，旧记忆需明确归类。',
   mail: '开启模块后，还需在邮箱与日程中配置并启用邮箱账号。关闭后停止邮件工具、轮询和连接测试，保留凭据与提醒规则。',
   agenda: '关闭后停止日历、待办工具和自动提醒，也不再加入每日简报；原有日程与待办保留。',
-  documents: '关闭后不注册文档工具，也不探测本机转换软件；已有文件和已安装软件保留。',
 };
 
 export function ModuleSettings({ api = modulesApi }: { api?: ModulesApi }) {
@@ -52,10 +51,11 @@ export function ModuleSettings({ api = modulesApi }: { api?: ModulesApi }) {
   return <section className="nexus-channel-settings" aria-label="Nexus 扩展">
     <h2>Nexus 扩展</h2>
     <p>编码任务、验证、验收和数据管理始终保留。渠道在“渠道连接”中逐个绑定和启用。</p>
+    <p>常规文档任务优先使用 DSH 官方 Office 技能。“文档兼容工具”已移至 DSH 插件详情的组件列表，默认关闭；旧版文档开关不再生效，需要继续使用时请在那里启用。文件和已安装软件保留。</p>
     <p>下方开关保存后，下次启动 DSH 时生效。请等任务结束后手动重启；保存不会自动重启或中断当前任务。</p>
     {error && <p role="alert" className="nexus-channel-error">{error}</p>}
     {!view || !draft ? <>{!error && <p role="status">正在读取扩展配置…</p>}<button disabled={busy} onClick={() => void action('list')}>重新载入</button></> : <>
-      {view.revision === 0 && <p className="nexus-channel-hint">尚未保存模块配置，当前沿用旧版兼容默认值。仅做编码时，可用下方快捷配置关闭四项扩展；账号连接仍由各自设置决定。</p>}
+      {view.revision === 0 && <p className="nexus-channel-hint">尚未保存模块配置，当前沿用旧版兼容默认值。下方快捷配置关闭这三项扩展；账号连接仍由各自设置决定。</p>}
       <p role="status">{view.pendingRestart ? '已保存的配置与当前运行状态不同，等待重启生效。' : '已保存的配置与当前运行状态一致。'}</p>
       <form onSubmit={event => { event.preventDefault(); void action('save'); }}>
         {MODULE_KEYS.map(key => <article className="nexus-channel-card" key={key}>
@@ -65,7 +65,7 @@ export function ModuleSettings({ api = modulesApi }: { api?: ModulesApi }) {
           <p className="nexus-channel-hint">{hints[key]}</p>
         </article>)}
         <div className="nexus-channel-actions">
-          <button type="button" disabled={busy} onClick={() => setDraft({ memory: false, mail: false, agenda: false, documents: false })}>仅保留编码核心</button>
+          <button type="button" disabled={busy} onClick={() => setDraft({ memory: false, mail: false, agenda: false })}>关闭以上三项扩展</button>
           <button type="submit" disabled={busy}>{busy ? '处理中…' : '保存扩展开关'}</button>
           <button type="button" disabled={busy} onClick={() => void action('list')}>重新载入</button>
         </div>

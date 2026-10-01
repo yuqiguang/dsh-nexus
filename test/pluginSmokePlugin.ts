@@ -4,6 +4,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-modules';
 import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-tools';
+import type {} from '@deepseek-ai/dsh-plugin-manager';
 import { credentialKey } from '@deepseek-ai/dsh-credentials';
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
@@ -12,7 +13,7 @@ import { sep } from 'node:path';
 import { until } from './helpers.js';
 
 export const name = 'nexus-plugin-package-smoke';
-export const inject = ['connection', 'clientModules', 'credentials', 'tools'];
+export const inject = ['connection', 'clientModules', 'credentials', 'tools', 'pluginManager'];
 
 export function apply(ctx: Context, config: { phase: number; triggerFile: string; reportFile: string; packageDir: string }): void {
   let running = false;
@@ -42,8 +43,10 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal(response.status, 200);
       return (await response.json()).result;
     };
-    const off = { memory: false, mail: false, agenda: false, documents: false };
-    const optionalTools = ['memory_recall', 'memory_remember', 'memory_forget', 'calendar', 'todo', 'doc_read', 'doc_create', 'doc_edit', 'doc_convert'];
+    const off = { memory: false, mail: false, agenda: false };
+    const optionalTools = ['memory_recall', 'memory_remember', 'memory_forget', 'calendar', 'todo'];
+    const documentTools = ['doc_read', 'doc_create', 'doc_edit', 'doc_convert'];
+    const documentStatus = () => carrier.fetch(new Request('dsh-app://dsh/api/nexus-documents/list', { method: 'POST' }));
     const coderRequest = (method: string, payload: unknown = {}) => carrier.fetch(new Request(`dsh-app://dsh/api/nexus-coders/${method}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'client-request', rpcId: 'coders-smoke', method, payload }) }));
@@ -52,6 +55,9 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal((await coderRequest('list')).status, 404);
       assert.equal((await carrier.fetch(new Request('dsh-app://dsh/api/nexus-modules/list', { method: 'POST' }))).status, 404);
       assert.equal(ctx.clientModules.clientPath('nexus-next'), undefined);
+      assert.equal((await documentStatus()).status, 404);
+      assert.ok(documentTools.every(name => !ctx.tools.get(name)));
+      assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName.startsWith('nexus-next')));
       const saved = await ctx.credentials.readRecord(credentialKey('nexus-channels', 'feishu'));
       assert.ok(saved?.kind === 'grant' && (saved.payload as { enabled?: boolean }).enabled === false);
       checks.push('uninstall_removes_api', 'uninstall_removes_client', 'uninstall_preserves_credentials');
@@ -80,12 +86,26 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: 'fixture' }));
       assert.equal(upload.status, 409, 'installed plugins cannot stage an import without a launcher');
       checks.push('installed_import_refused_without_launcher');
+      const rows = (await ctx.pluginManager.listPlugins()).filter(row => row.moduleName === 'nexus-next' || row.moduleName === 'nexus-next/documents');
+      assert.equal(rows.length, 2, 'bundle exposes two native components');
+      const bundleInfo = (await ctx.pluginManager.listBundles()).find(item => item.name === 'nexus-next');
+      assert.deepEqual(bundleInfo?.rows.map(row => row.moduleName), ['nexus-next', 'nexus-next/documents']);
+      const docRow = rows.find(row => row.moduleName === 'nexus-next/documents')!;
+      assert.equal((docRow.meta?.title as { zh?: string })?.zh, '文档兼容工具');
       const modules = await rpc('modules', 'list');
       assert.equal(modules.ok, true);
       assert.ok(ctx.tools.get('coder_task'), 'coding core stays available');
       assert.ok(ctx.get('schedule'), 'native reminder service stays available');
       if (config.phase === 7) {
         assert.equal(modules.value.revision, 0);
+        assert.equal(docRow.enabled, false);
+        assert.ok(documentTools.every(name => !ctx.tools.get(name)));
+        assert.equal((await documentStatus()).status, 404);
+        const enabledDocs = await ctx.pluginManager.setPluginEnabled(docRow.entryId, true);
+        assert.equal(enabledDocs.application, 'applied');
+        await until(() => documentTools.every(name => !!ctx.tools.get(name)), 'document component did not activate');
+        assert.equal((await rpc('documents', 'list')).ok, true);
+        checks.push('two_localized_native_components', 'documents_default_off', 'native_live_enable');
         assert.ok(optionalTools.every(name => ctx.tools.get(name)), 'compatibility defaults retain existing tools');
         const memory = await rpc('memory', 'event/add', { text: 'module restart fixture' });
         assert.equal(memory.ok, true);
@@ -100,8 +120,15 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.deepEqual(modules.value.active, off);
         assert.equal(modules.value.pendingRestart, false);
         assert.ok(optionalTools.every(name => !ctx.tools.get(name)), 'disabled modules register no tools');
-        const docs = await rpc('documents', 'detect');
-        assert.equal(docs.error.code, 'module_disabled');
+        assert.equal(docRow.enabled, true);
+        assert.equal(docRow.fiberPhase, 'active');
+        assert.ok(documentTools.every(name => ctx.tools.get(name)), 'native document enablement survives legacy modules off');
+        assert.equal((await rpc('documents', 'list')).ok, true);
+        const disabledDocs = await ctx.pluginManager.setPluginEnabled(docRow.entryId, false);
+        assert.equal(disabledDocs.application, 'applied');
+        await until(() => documentTools.every(name => !ctx.tools.get(name)), 'document component did not unload');
+        assert.equal((await documentStatus()).status, 404);
+        checks.push('native_live_disable_removes_tools_and_rpc');
         const memory = await rpc('memory', 'export');
         assert.equal(memory.ok, true);
         assert.equal(memory.value.moduleEnabled, false);
@@ -116,12 +143,20 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.ok(!ctx.tools.get('mail_send'));
         const tested = await rpc('connectors', 'mail/test');
         assert.equal(tested.error.code, 'module_disabled');
-        const enabled = await rpc('modules', 'save', { revision: 1, enabled: { ...off, memory: true, agenda: true, documents: true } });
+        const enabled = await rpc('modules', 'save', { revision: 1, enabled: { ...off, memory: true, agenda: true } });
         assert.equal(enabled.ok, true);
         assert.ok(optionalTools.every(name => !ctx.tools.get(name)));
-        checks.push('disabled_modules_no_tools', 'disabled_document_detection_refused', 'disabled_mail_cannot_connect', 'disabled_memory_export_preserved', 'coding_and_native_reminders_unchanged');
+        checks.push('disabled_modules_no_tools', 'native_document_enable_restored', 'disabled_mail_cannot_connect', 'disabled_memory_export_preserved', 'coding_and_native_reminders_unchanged');
       } else if (config.phase === 9) {
         assert.equal(modules.value.revision, 2);
+        assert.equal(docRow.enabled, false);
+        assert.ok(documentTools.every(name => !ctx.tools.get(name)));
+        assert.equal((await documentStatus()).status, 404);
+        checks.push('native_document_disable_restored');
+        const pendingDocs = await ctx.pluginManager.setPluginEnabled(docRow.entryId, true);
+        assert.equal(pendingDocs.application, 'restart-required');
+        assert.ok(documentTools.every(name => !ctx.tools.get(name)));
+        checks.push('native_enable_without_hmr_waits_for_restart');
         assert.equal(modules.value.pendingRestart, false);
         assert.ok(optionalTools.every(name => ctx.tools.get(name)));
         assert.ok(!ctx.tools.get('mail_send'), 'mail remains independently disabled');

@@ -46,7 +46,7 @@ class FixtureModel extends LlmAdapter {
     options.signal?.throwIfAborted();
     this.calls++;
     this.sawTools ||= ['doc_read', 'doc_create', 'doc_edit', 'doc_convert', 'present'].every(tool => options.tools?.some(item => item.name === tool));
-    this.sawSection ||= options.messages.some(message => message.role === 'system' && message.content.some(block => block.type === 'text' && block.text.includes('doc_read') && block.text.includes('本机当前能力')));
+    this.sawSection ||= options.messages.some(message => message.role === 'system' && message.content.some(block => block.type === 'text' && block.text.includes('doc_read') && block.text.includes('以下仅是 Nexus 兼容流程的本机能力')));
     for (const message of options.messages) if (message.role === 'tool') {
       this.results.set(message.toolCallId, message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n'));
     }

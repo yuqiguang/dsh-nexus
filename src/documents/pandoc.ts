@@ -108,13 +108,15 @@ export class PandocInstaller {
       await download(this.deps.fetch ?? dualStackFetch, this.deps.assetUrl ? this.deps.assetUrl(asset) : asset.url, archive, bytes => { if (this.current) this.current.bytes = bytes; }, signal);
       const unpacked = join(work, 'unpacked');
       await mkdir(unpacked, { recursive: true });
-      if (asset.archive === 'tar.gz') await execFile('tar', ['-xzf', archive, '-C', unpacked], { timeout: 120_000 });
+      signal.throwIfAborted();
+      if (asset.archive === 'tar.gz') await execFile('tar', ['-xzf', archive, '-C', unpacked], { timeout: 120_000, signal });
       else await unzip(archive, unpacked);
       const name = platform === 'win32' ? 'pandoc.exe' : 'pandoc';
       const binary = await findBinary(unpacked, name);
       if (!binary) throw new Error('发行包里没有 pandoc 可执行文件。');
       const dir = join(this.deps.managedRoot, 'pandoc', 'bin');
       await mkdir(dir, { recursive: true });
+      signal.throwIfAborted();
       const target = join(dir, name);
       await rm(target, { force: true });
       try { await rename(binary, target); }

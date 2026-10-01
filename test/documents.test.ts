@@ -11,7 +11,7 @@ import { createDocx, editDocx, readDocx } from '../src/documents/docx.js';
 import { DocumentService, markdownToHtml, parseCsv, plainText } from '../src/documents/index.js';
 import { parseInlines, parseMarkdown, renderInlines, renderTable } from '../src/documents/markdown.js';
 import { replaceInParagraph } from '../src/documents/ooxml-text.js';
-import { pandocAsset } from '../src/documents/pandoc.js';
+import { pandocAsset, PandocInstaller } from '../src/documents/pandoc.js';
 import { createPptx, editPptx, readPptx } from '../src/documents/pptx.js';
 import { columnName, createXlsx, editXlsx, parseRef, readXlsx } from '../src/documents/xlsx.js';
 import { elementAt, elements } from '../src/documents/xml.js';
@@ -189,17 +189,44 @@ test('text helpers: csv parsing, plain text, and html', () => {
 
 function fakeContext(mode: 'read-only' | 'workspace-write' | 'danger-full-access', workspace: string) {
   const tools = new Map<string, { execute(args: unknown, exec: unknown): Promise<{ text: string }> }>();
-  const sections: { name: string; text: () => string }[] = [];
+  const sections: { name: string; text: (context: {}) => string }[] = [];
+  const disposers: (() => unknown)[] = [];
   const ctx = {
-    tools: { register(tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<{ text: string }> }) { tools.set(tool.name, tool); return () => { tools.delete(tool.name); }; } },
+    tools: { get: (name: string) => tools.get(name), register(tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<{ text: string }> }) { tools.set(tool.name, tool); return () => { tools.delete(tool.name); }; } },
     systemPrompt: { section(section: { name: string; text: () => string }) { sections.push(section); return () => { sections.splice(sections.indexOf(section), 1); }; }, getSectionOrder() { return 10; } },
     sandboxPolicy: { resolve() { return { mode, workspaceRoot: workspace }; } },
-    effect(fn: () => () => void) { fn(); },
+    effect(fn: () => () => unknown) { disposers.push(fn()); },
   } as unknown as Context;
   // The third argument names the session's working directory, which is what a channel's session has.
   const run = (name: string, args: unknown, cwd = workspace) => { const tool = tools.get(name); if (!tool) throw new Error(`tool ${name} is not registered`); return tool.execute(args, { agent: { session: { id: 's1', header: { cwd } } } }); };
-  return { ctx, tools, sections, run };
+  return { ctx, tools, sections, run, close: async () => { for (const dispose of disposers.splice(0).reverse()) await dispose(); } };
 }
+
+test('component disposal aborts an in-flight download, removes tools and prevents converter redetection', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-docs-dispose-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const own = fakeContext('workspace-write', workspace);
+  let detected = 0;
+  let downloadStarted!: () => void;
+  const started = new Promise<void>(resolve => { downloadStarted = resolve; });
+  let aborted = false;
+  const installer = new PandocInstaller({ managedRoot: join(workspace, 'managed'), platform: 'linux', arch: 'x64',
+    fetch: async (_input, init) => new Promise((_resolve, reject) => {
+      init!.signal!.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+      downloadStarted();
+    }) });
+  const service = new DocumentService({ ctx: own.ctx, workspace, managedRoot: join(workspace, 'managed'), installer,
+    detect: async () => { detected++; return []; } });
+  await service.start();
+  await service.handle('pandoc/install', {});
+  await started;
+  await own.close();
+  assert.equal(aborted, true);
+  assert.equal(detected, 1);
+  assert.equal(own.tools.size, 0);
+  assert.equal(own.sections.length, 0);
+  await assert.rejects(service.handle('detect', {}), /abort/i);
+});
 
 test('a long document is cut to what DSH still shows the model whole, with a note saying how to get the rest', async t => {
   const workspace = await mkdtemp(join(tmpdir(), 'nexus-docs-clip-'));
@@ -239,8 +266,8 @@ test('the document tools read, create, edit and convert inside the workspace, an
     detect: async () => [{ kind: 'soffice', path: '/fake/soffice' }, { kind: 'ghostscript', path: '/fake/gs' }] });
   await svc.start();
   assert.ok(['doc_read', 'doc_create', 'doc_edit', 'doc_convert'].every(name => own.tools.has(name)));
-  assert.match(own.sections[0]!.text(), /LibreOffice/);
-  assert.match(own.sections[0]!.text(), /ghostscript/);
+  assert.match(own.sections[0]!.text({}), /LibreOffice/);
+  assert.match(own.sections[0]!.text({}), /ghostscript/);
   const created = await own.run('doc_create', { path: 'outputs/报告.docx', format: 'docx', content: MARKDOWN });
   assert.match(created.text, /已生成 outputs\/报告\.docx/);
   assert.match((await own.run('doc_read', { path: 'outputs/报告.docx' })).text, /^# 季度报告/);
@@ -282,8 +309,8 @@ test('the document tools read, create, edit and convert inside the workspace, an
   const bare = fakeContext('read-only', workspace);
   const none = new DocumentService({ ctx: bare.ctx, workspace, managedRoot: join(workspace, 'managed'), platform: 'linux', detect: async () => [], report: () => {} });
   await none.start();
-  assert.match(bare.sections[0]!.text(), /不能读 PDF/);
-  assert.match(bare.sections[0]!.text(), /不能转 PDF/);
+  assert.match(bare.sections[0]!.text({}), /不能读 PDF/);
+  assert.match(bare.sections[0]!.text({}), /不能转 PDF/);
   await assert.rejects(bare.run('doc_read', { path: 'outputs/报告.pdf' }), /没有 pdftotext 或 ghostscript/);
   await assert.rejects(bare.run('doc_create', { path: 'outputs/x.md', format: 'md', content: 'x' }), /只读模式/);
   await assert.rejects(bare.run('doc_convert', { path: 'outputs/报告.docx', to: 'pdf' }), /只读模式/);

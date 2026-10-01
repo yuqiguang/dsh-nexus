@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { act, createElement } from 'react';
 import { JSDOM } from 'jsdom';
-import { DocumentSettings, type DocumentApi } from '../src/client/DocumentSettings.js';
+import { DocumentSettings, documentApi, type DocumentApi } from '../src/client/DocumentSettings.js';
 import type { DocumentsView } from '../src/documents/index.js';
 
 async function page(t: TestContext, api: DocumentApi) {
@@ -39,6 +39,7 @@ test('the document page lists capabilities, offers the pandoc download, and show
     return view;
   };
   const ui = await page(t, api);
+  assert.match(ui.text(), /不代表 DSH 官方预览/);
   assert.match(ui.text(), /不能转 PDF：本机没有/);
   assert.match(ui.text(), /Ghostscript（\/usr\/bin\/gs）/);
   assert.match(ui.text(), /sudo apt install libreoffice-writer-nogui/);
@@ -54,4 +55,27 @@ test('the document page lists capabilities, offers the pandoc download, and show
   assert.match(ui.text(), /安装失败：HTTP 403/);
   assert.match(ui.text(), /重新下载 pandoc/);
   assert.deepEqual(calls.slice(0, 4), ['list', 'pandoc/install', 'detect', 'detect']);
+});
+
+test('missing native component shows enablement guidance and can reload after activation', async t => {
+  let calls = 0;
+  const ui = await page(t, async () => {
+    if (++calls === 1) throw new Error('document_component_unavailable');
+    return { platform: 'linux', converters: [], capabilities: ['兼容能力已加载'] };
+  });
+  assert.match(ui.text(), /DSH 插件详情的组件列表/);
+  assert.doesNotMatch(ui.text(), /下载 pandoc/);
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 2100)); });
+  assert.equal(calls, 1, 'an absent component does not keep polling');
+  await ui.click('重新载入');
+  assert.match(ui.text(), /兼容能力已加载/);
+});
+
+test('document RPC distinguishes an absent component from an expired login', async t => {
+  const previous = globalThis.fetch;
+  t.after(() => { globalThis.fetch = previous; });
+  globalThis.fetch = async () => new Response('', { status: 404 });
+  await assert.rejects(documentApi('list'), /document_component_unavailable/);
+  globalThis.fetch = async () => new Response('', { status: 401 });
+  await assert.rejects(documentApi('list'), /session_expired/);
 });

@@ -33,7 +33,7 @@ test('module UI distinguishes draft, saved and active states and reloads after a
   const api: ModulesApi = async (method, payload) => { calls.push(method); return settings.handle(method, payload); };
   const ui = await page(t, createElement(ModuleSettings, { api }));
   assert.match(ui.text(), /兼容默认值/);
-  await ui.click('仅保留编码核心');
+  await ui.click('关闭以上三项扩展');
   assert.deepEqual(calls, ['list'], 'preset only changes the draft');
   assert.equal(ui.dom.window.document.querySelectorAll('input:checked').length, 0);
   assert.match(ui.text(), /当前：开启 · 已保存：开启/);
@@ -41,7 +41,7 @@ test('module UI distinguishes draft, saved and active states and reloads after a
   assert.match(ui.text(), /等待重启生效/);
   assert.match(ui.text(), /当前：开启 · 已保存：关闭/);
   assert.match(ui.text(), /不会自动重启或中断/);
-  await settings.handle('save', { revision: 1, enabled: { memory: true, mail: false, agenda: false, documents: false } });
+  await settings.handle('save', { revision: 1, enabled: { memory: true, mail: false, agenda: false } });
   await ui.submit();
   assert.match(ui.text(), /配置已在其他窗口修改/);
   assert.equal(ui.dom.window.document.querySelectorAll('input:checked').length, 0, 'conflicts retain draft');
@@ -50,15 +50,15 @@ test('module UI distinguishes draft, saved and active states and reloads after a
   assert.match(ui.text(), /原生定时提醒：宿主服务可用/);
 });
 
-test('disabled module settings never mount the document poller, including pending enable', async t => {
+test('disabled module settings never mount the child, including pending enable', async t => {
   const records = new MemoryRecords();
   const before = await Settings.open(records);
-  await before.handle('save', { revision: 0, enabled: { memory: false, mail: false, agenda: false, documents: false } });
+  await before.handle('save', { revision: 0, enabled: { memory: false, mail: false, agenda: false } });
   const settings = await Settings.open(records);
-  await settings.handle('save', { revision: 1, enabled: { memory: false, mail: false, agenda: false, documents: true } });
+  await settings.handle('save', { revision: 1, enabled: { memory: true, mail: false, agenda: false } });
   let mounted = 0;
   function Child() { useEffect(() => { mounted++; }, []); return createElement('p', null, 'document poller'); }
-  const ui = await page(t, createElement(ModuleBoundary, { module: 'documents', api: (m, p) => settings.handle(m, p), children: createElement(Child) }));
+  const ui = await page(t, createElement(ModuleBoundary, { module: 'memory', api: (m, p) => settings.handle(m, p), children: createElement(Child) }));
   assert.equal(mounted, 0);
   assert.match(ui.text(), /已保存开启配置，重启 DSH 后生效/);
   assert.doesNotMatch(ui.text(), /document poller/);
@@ -66,7 +66,7 @@ test('disabled module settings never mount the document poller, including pendin
 
 test('an active module remains mounted while its disable is pending restart', async t => {
   const settings = await Settings.open(new MemoryRecords());
-  await settings.handle('save', { revision: 0, enabled: { memory: false, mail: false, agenda: false, documents: false } });
-  const ui = await page(t, createElement(ModuleBoundary, { module: 'documents', api: (m, p) => settings.handle(m, p), children: createElement('p', null, 'document settings active') }));
+  await settings.handle('save', { revision: 0, enabled: { memory: false, mail: false, agenda: false } });
+  const ui = await page(t, createElement(ModuleBoundary, { module: 'memory', api: (m, p) => settings.handle(m, p), children: createElement('p', null, 'document settings active') }));
   assert.match(ui.text(), /document settings active/);
 });

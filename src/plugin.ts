@@ -2,7 +2,10 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import type { ResearchWeb } from './coders/research.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-credentials';
-import { clientRequestSchema, type ConnectionRpcResult } from '@deepseek-ai/dsh-client-connection';
+import { registerRpc } from './dsh/rpc.js';
+import type {} from './dsh/nexus.js';
+export { registerRpc } from './dsh/rpc.js';
+export { installDocuments } from './documents/plugin.js';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import { mkdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -13,7 +16,6 @@ import { BridgeRegistry } from './channels/notify.js';
 import { ConnectionStore } from './channels/store.js';
 import { installCoders } from './coders/index.js';
 import { Connectors, type ConnectorsDeps } from './connectors/index.js';
-import { DocumentService, type DocumentServiceDeps } from './documents/index.js';
 import { FileLedger, installFileFind } from './files/index.js';
 import { DEFAULT_ROTATION, SessionRoster } from './sessions/index.js';
 import { CoderInstaller, managedLayout, type NpmRunner } from './coders/install.js';
@@ -98,31 +100,6 @@ export async function installChannels(ctx: Context, workspace: string, legacyFei
   return manager;
 }
 
-/** Register one RPC family under the shared authenticated /api carrier. */
-export function registerRpc(ctx: Context, family: string, methods: readonly string[], handle: (method: string, payload: unknown) => Promise<unknown>): void {
-  for (const method of methods) {
-    ctx.connection.fetch.register({
-      path: `/api/${family}/${method}`, methods: ['POST'], requestBody: 'buffered',
-      async fetch(request) {
-        if (request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
-          return new Response('content type must be application/json', { status: 415 });
-        }
-        const message = clientRequestSchema.safeParse(await request.json().catch(() => undefined));
-        if (!message.success || message.data.method !== method) return new Response('invalid request', { status: 400 });
-        let result: ConnectionRpcResult<unknown>;
-        try { result = { ok: true, value: await handle(method, message.data.payload) }; }
-        catch (error) {
-          const code = error instanceof ChannelError ? error.code : 'configuration_failed';
-          result = { ok: false, error: { code, message: code, details: {} } };
-        }
-        return Response.json({ type: 'server-response', rpcId: message.data.rpcId, result }, {
-          headers: { 'Cache-Control': 'no-store' },
-        });
-      },
-    });
-  }
-}
-
 /** Coder settings, managed installs, and their `/api/nexus-coders/*` routes; the settings live in native credentials under their own scope. */
 export async function installCoderSettings(ctx: Context, profileRoots: string[], managedRoot = dshHomePath('nexus-coders'),
   seams: Pick<ManagerDeps, 'env' | 'detect' | 'loginStatus'> & { npm?: NpmRunner } = {}): Promise<CodersManager> {
@@ -190,8 +167,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
   const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone, modules: modules.active });
   assistant.attachAgenda((now, days) => connectors.agendaFor(now, days));
-  if (modules.active.documents) await installDocuments(ctx, workspace);
-  else registerRpc(ctx, 'nexus-documents', ['list', 'detect', 'pandoc/install'], async () => { throw new ChannelError('module_disabled'); });
+  ctx.provide('nexusWorkspace', { root: workspace });
   installAssistantPrompt(ctx);
   installFileFind({ ctx, workspace, ledger: files, timeZone });
   // The updater restarts only a quiet service: no open turn, and nothing happened in any session for a while.
@@ -232,14 +208,6 @@ export async function installConnectors(ctx: Context, registry: BridgeRegistry, 
   registerRpc(ctx, 'nexus-connectors', ['list', 'save', 'clear-secret', 'mail/test', 'mail/watch/remove', 'agenda/event/remove', 'agenda/todo/remove', 'agenda/todo/done'],
     (method, payload) => connectors.handle(method, payload));
   return connectors;
-}
-
-/** Office documents: doc_read/doc_create/doc_edit/doc_convert, converter detection, and the `/api/nexus-documents/*` routes. */
-export async function installDocuments(ctx: Context, workspace: string, seams: Partial<Omit<DocumentServiceDeps, 'ctx' | 'workspace'>> = {}): Promise<DocumentService> {
-  const service = new DocumentService({ ctx, workspace, managedRoot: dshHomePath('nexus-tools'), ...seams });
-  await service.start();
-  registerRpc(ctx, 'nexus-documents', ['list', 'detect', 'pandoc/install'], (method, payload) => service.handle(method, payload));
-  return service;
 }
 
 /** Long-term memory: tools, injection, and the `/api/nexus-memory/*` routes for the settings page. */

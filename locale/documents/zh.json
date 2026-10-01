@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "文档兼容工具",
+    "description": "按需启用旧格式、Pandoc 和本机转换工具；常规 Office 任务优先使用 DSH 官方技能。默认关闭。"
+  }
+}

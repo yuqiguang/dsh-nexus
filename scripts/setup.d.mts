@@ -8,6 +8,7 @@
 export interface PatchRow {
   id?: string;
   name?: string;
+  disabled?: boolean;
   insert?: PatchRow[];
   config?: Record<string, unknown>;
 }

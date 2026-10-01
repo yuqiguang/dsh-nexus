@@ -6,7 +6,7 @@ import { compatibleModules, ModuleSettings, type ModuleFlags } from '../src/modu
 import { installAssistantPrompt, renderAssistantPrompt } from '../src/assistant/prompt.js';
 import { MemoryRecords } from './helpers.js';
 
-const off: ModuleFlags = { memory: false, mail: false, agenda: false, documents: false };
+const off: ModuleFlags = { memory: false, mail: false, agenda: false };
 
 test('prompt availability queries the current agent scope rather than the global tool registry', () => {
   let render!: (context: AssembleContext) => string;
@@ -56,7 +56,7 @@ test('invalid flags, revisions and corrupt saved records cannot silently enable 
   for (const revision of [-1, 0.5, '0', undefined]) await assert.rejects(modules.handle('save', { revision, enabled: off }), /invalid_revision/);
   assert.equal(records.values.size, 0);
   await assert.rejects(modules.handle('restart'), /unknown_action/);
-  for (const raw of [{ version: 2, revision: 1, enabled: off }, { version: 1, revision: 1, enabled: { ...off, memory: 'yes' } }]) {
+  for (const raw of [{ version: 3, revision: 1, enabled: off }, { version: 1, revision: 1, enabled: { ...off, memory: 'yes' } }]) {
     records.values.set('settings', raw);
     await assert.rejects(ModuleSettings.open(records), /invalid_saved_record/);
   }
@@ -70,8 +70,41 @@ test('reverting a pending change cancels restart need without modifying active f
   assert.equal(view.nativeRemindersAvailable, false);
 });
 
+test('legacy document choices are retired without changing the other flags or writing on read', async () => {
+  for (const documents of [true, false]) {
+    const records = new MemoryRecords();
+    const legacy = { version: 1, revision: 5, enabled: { memory: false, mail: true, agenda: false, documents } };
+    records.values.set('settings', legacy);
+    const settings = await ModuleSettings.open(records);
+    assert.deepEqual(settings.active, { memory: false, mail: true, agenda: false });
+    assert.deepEqual(records.values.get('settings'), legacy);
+    assert.equal((await settings.handle('list')).pendingRestart, false);
+    await assert.rejects(settings.handle('save', { revision: 5, enabled: legacy.enabled }), /invalid_configuration/,
+      'an old client cannot write a competing document switch');
+    await settings.handle('save', { revision: 5, enabled: off });
+    assert.deepEqual(records.values.get('settings'), { version: 2, revision: 6, enabled: off });
+  }
+});
+
+test('native Office guidance uses the visible skill loader and never equates compatibility off with unavailable Office', () => {
+  let render!: (context: AssembleContext) => string;
+  const scope = {} as AssembleContext['scope'];
+  const ctx = {
+    effect: (run: () => unknown) => run(),
+    tools: { get: (name: string, selected: unknown) => selected === scope && name === 'skill' ? {} : undefined },
+    systemPrompt: { getSectionOrder: () => 0, section: (section: { text: typeof render }) => { render = section.text; return () => {}; } },
+  } as unknown as Context;
+  installAssistantPrompt(ctx);
+  assert.match(render({ scope }), /先用 skill 加载/);
+  assert.match(render({ scope }), /列有对应的 office-docx/);
+  assert.match(render({ scope }), /不自动改用其他转换软件/);
+  assert.doesNotMatch(render({}), /先用 skill 加载/);
+  assert.match(render({ scope }), /不代表 DSH 官方文档能力不可用/);
+  assert.doesNotMatch(render({ scope }), /doc_read|Office\/PDF 专用读取未启用/);
+});
+
 test('assistant prompt follows live capabilities and keeps file delivery and untrusted content boundaries', () => {
-  const enabled = renderAssistantPrompt({ ...compatibleModules(), reminders: true });
+  const enabled = renderAssistantPrompt({ ...compatibleModules(), documents: true, reminders: true });
   const disabled = renderAssistantPrompt({ ...off, reminders: false });
   for (const name of ['memory_recall', 'doc_read', 'schedule_create', 'schedule_list', 'schedule_delete']) {
     assert.ok(enabled.includes(name));

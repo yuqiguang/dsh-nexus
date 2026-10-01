@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { parse } from 'yaml';
 import { assistantPlugins, projectRoot, scheduleBundle } from './setup.mjs';
 
 const exec = promisify(execFile);
@@ -86,7 +87,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     await writeFile(join(activeProfile, 'pnpm-workspace.yaml'), 'autoInstallPeers: false\nnodeLinker: hoisted\n');
     await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', join(runRoot, packed.filename),
       // The first run after a dependency change must fetch it into pnpm's store through a slow mirror; later runs reuse the store.
-      '--ignore-scripts', '--network-concurrency=1', '--child-concurrency=1'], { cwd: projectRoot, env, timeout: 900_000 });
+      '--ignore-scripts', '--network-concurrency=1', '--child-concurrency=1', ...(process.env.NEXUS_SMOKE_OFFLINE === '1' ? ['--offline'] : [])], { cwd: projectRoot, env, timeout: 900_000 });
     const installed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
     assert.ok(installed.dsh.profile.bundles.includes('nexus-next'), 'official plugin add must activate the bundle');
   }
@@ -96,7 +97,10 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     const removed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
     assert.ok(!removed.dsh.profile.bundles.includes('nexus-next'));
   }
+  const previousPatch = installedPlugin ? parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8').catch(() => '[]')) ?? [] : [];
+  const documentOverrides = previousPatch.filter(row => row.id === 'nexus-documents' && !row.insert);
   await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([
+    ...documentOverrides,
     { id: 'session-title-llm', disabled: true },
     ...(phase === 12 ? [{ id: 'web', config: { searchProvider: 'nexus-research-fixture', fetchProvider: 'nexus-research-fixture' } }] : []),
     { id: 'agent-default-model', config: { provider: 'nexus-fixture', model: 'fixture' } },
@@ -108,7 +112,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
           : phase < 5 ? 'dist/test/settingsSmokePlugin.js' : 'dist/test/wechatSmokePlugin.js')).href,
       config: { phase, workspace, triggerFile, reportFile, packageDir: join(activeProfile, 'node_modules/nexus-next') } }] },
     // Supplemental shared-Fetch-only host. Current Desktop uses an HTTP Host; this is not an Electron test.
-    ...(phase === 9 ? ['web-startup', 'webserver', 'web-runtime', 'client-hmr', 'open-in-app', 'ui-open-in-app', 'directory-picker']
+    ...(phase === 9 ? ['web-startup', 'webserver', 'web-runtime', 'client-hmr', 'open-in-app', 'ui-open-in-app', 'directory-picker', 'hmr']
       .map(id => ({ id, disabled: true })).concat([{ id: 'connection', inject: ['credentials'], config: {} }]) : []),
   ]));
   const child = spawn(process.execPath, ['--max-old-space-size=384', entry, '--profile', 'nexus', ...(phase === 9 ? [] : ['--no-open', '--port', '0'])], {
