@@ -170,7 +170,7 @@ export class MailConnector {
   }
 
   private client(): MailClient {
-    if (!this.active) throw new Error('邮箱连接器未启用。请在设置页“连接器”里启用邮箱。');
+    if (!this.active) throw new Error('邮箱尚未启用。请在设置页“邮箱与日程”中启用邮箱账号。');
     return this.active;
   }
 

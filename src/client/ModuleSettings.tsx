@@ -19,7 +19,7 @@ export const modulesApi: ModulesApi = async (method, payload = {}, signal) => {
 const labels: Record<ModuleKey, string> = { memory: '长期记忆', mail: '邮箱', agenda: '日历与待办', documents: '办公文档' };
 const hints: Record<ModuleKey, string> = {
   memory: '关闭后停止模型记忆工具、自动注入和渠道摘要写入；设置页仍可管理数据。新记忆按会话项目和身份隔离，旧记忆需明确归类。',
-  mail: '开启模块后，还需在连接器中配置并启用邮箱账号。关闭后停止邮件工具、轮询和连接测试，保留凭据与提醒规则。',
+  mail: '开启模块后，还需在邮箱与日程中配置并启用邮箱账号。关闭后停止邮件工具、轮询和连接测试，保留凭据与提醒规则。',
   agenda: '关闭后停止日历、待办工具和自动提醒，也不再加入每日简报；原有日程与待办保留。',
   documents: '关闭后不注册文档工具，也不探测本机转换软件；已有文件和已安装软件保留。',
 };

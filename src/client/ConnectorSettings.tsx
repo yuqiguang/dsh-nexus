@@ -83,8 +83,8 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
     finally { writing.current = false; setBusy(false); }
   };
   if (!view || !draft) {
-    return <section className="nexus-channel-settings" aria-label="连接器"><h2>连接器</h2>
-      {readError ? <p role="alert" className="nexus-channel-error">{readError}</p> : <p role="status">正在读取连接器设置…</p>}</section>;
+    return <section className="nexus-channel-settings" aria-label="邮箱与日程"><h2>邮箱与日程</h2>
+      {readError ? <p role="alert" className="nexus-channel-error">{readError}</p> : <p role="status">正在读取邮箱与日程设置…</p>}</section>;
   }
   const stale = dirty && draft.revision !== view.settings.revision;
   const edit = (change: Partial<Draft>) => { setDirty(true); setDraft(previous => previous && { ...previous, ...change }); };
@@ -103,9 +103,9 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
     setHint(preset.hint);
   };
   const { mail, agenda } = view;
-  return <section className="nexus-channel-settings" aria-label="连接器">
-    <h2>连接器</h2>
-    <p>把助理接到你自己的服务上。目前有邮箱（IMAP 收、SMTP 发，密码是服务商给的授权码，保存在本机凭据里，不会回填到页面）和助理自己保管的日历与待办。</p>
+  return <section className="nexus-channel-settings" aria-label="邮箱与日程">
+    <h2>邮箱与日程</h2>
+    <p>配置邮箱收发与邮件提醒，管理日历和待办。邮箱授权码保存在本机凭据中，不会回填到页面；日历和待办由助理保管，无需连接外部服务。</p>
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">

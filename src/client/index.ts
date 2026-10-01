@@ -60,7 +60,7 @@ export function apply(ctx: Context): void {
     name: 'settings.section', id: 'nexus-memory', order: 15, label: '记忆',
   }, MemorySettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-connectors', order: 16, label: '连接器',
+    name: 'settings.section', id: 'nexus-connectors', order: 16, label: '邮箱与日程',
   }, ConnectorSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-documents', order: 17, label: '文档工具',
