@@ -6,7 +6,7 @@ import { compatibleModules, ModuleSettings, type ModuleFlags } from '../src/modu
 import { installAssistantPrompt, renderAssistantPrompt } from '../src/assistant/prompt.js';
 import { MemoryRecords } from './helpers.js';
 
-const off: ModuleFlags = { memory: false, mail: false, agenda: false };
+const off: ModuleFlags = { mail: false, agenda: false };
 
 test('prompt availability queries the current agent scope rather than the global tool registry', () => {
   let render!: (context: AssembleContext) => string;
@@ -30,10 +30,10 @@ test('module saves are atomic, preserve the active runtime, and take effect only
   assert.deepEqual(view.active, compatibleModules());
   assert.deepEqual(view.saved, off);
   assert.equal(view.pendingRestart, true);
-  view.active.memory = false;
-  view.saved.memory = true;
-  assert.equal(first.active.memory, true, 'returned views cannot change runtime flags');
-  assert.equal((await first.handle('list')).saved.memory, false);
+  view.active.mail = false;
+  view.saved.mail = true;
+  assert.equal(first.active.mail, true, 'returned views cannot change runtime flags');
+  assert.equal((await first.handle('list')).saved.mail, false);
   const restarted = await ModuleSettings.open(records, true);
   assert.deepEqual(restarted.active, off);
   assert.equal((await restarted.handle('list')).pendingRestart, false);
@@ -56,7 +56,7 @@ test('invalid flags, revisions and corrupt saved records cannot silently enable 
   for (const revision of [-1, 0.5, '0', undefined]) await assert.rejects(modules.handle('save', { revision, enabled: off }), /invalid_revision/);
   assert.equal(records.values.size, 0);
   await assert.rejects(modules.handle('restart'), /unknown_action/);
-  for (const raw of [{ version: 3, revision: 1, enabled: off }, { version: 1, revision: 1, enabled: { ...off, memory: 'yes' } }]) {
+  for (const raw of [{ version: 4, revision: 1, enabled: off }, { version: 1, revision: 1, enabled: { ...off, memory: 'yes' } }]) {
     records.values.set('settings', raw);
     await assert.rejects(ModuleSettings.open(records), /invalid_saved_record/);
   }
@@ -76,13 +76,27 @@ test('legacy document choices are retired without changing the other flags or wr
     const legacy = { version: 1, revision: 5, enabled: { memory: false, mail: true, agenda: false, documents } };
     records.values.set('settings', legacy);
     const settings = await ModuleSettings.open(records);
-    assert.deepEqual(settings.active, { memory: false, mail: true, agenda: false });
+    assert.deepEqual(settings.active, { mail: true, agenda: false });
     assert.deepEqual(records.values.get('settings'), legacy);
     assert.equal((await settings.handle('list')).pendingRestart, false);
     await assert.rejects(settings.handle('save', { revision: 5, enabled: legacy.enabled }), /invalid_configuration/,
       'an old client cannot write a competing document switch');
     await settings.handle('save', { revision: 5, enabled: off });
-    assert.deepEqual(records.values.get('settings'), { version: 2, revision: 6, enabled: off });
+    assert.deepEqual(records.values.get('settings'), { version: 3, revision: 6, enabled: off });
+  }
+});
+
+test('v2 memory choices cannot override the native component or change remaining flags', async () => {
+  for (const memory of [true, false]) {
+    const records = new MemoryRecords();
+    const previous = { version: 2, revision: 8, enabled: { memory, mail: false, agenda: true } };
+    records.values.set('settings', previous);
+    const settings = await ModuleSettings.open(records);
+    assert.deepEqual(settings.active, { mail: false, agenda: true });
+    assert.deepEqual(records.values.get('settings'), previous);
+    await assert.rejects(settings.handle('save', { revision: 8, enabled: previous.enabled }), /invalid_configuration/);
+    await settings.handle('save', { revision: 8, enabled: off });
+    assert.deepEqual(records.values.get('settings'), { version: 3, revision: 9, enabled: off });
   }
 });
 
@@ -104,7 +118,7 @@ test('native Office guidance uses the visible skill loader and never equates com
 });
 
 test('assistant prompt follows live capabilities and keeps file delivery and untrusted content boundaries', () => {
-  const enabled = renderAssistantPrompt({ ...compatibleModules(), documents: true, reminders: true });
+  const enabled = renderAssistantPrompt({ ...compatibleModules(), memory: true, documents: true, reminders: true });
   const disabled = renderAssistantPrompt({ ...off, reminders: false });
   for (const name of ['memory_recall', 'doc_read', 'schedule_create', 'schedule_list', 'schedule_delete']) {
     assert.ok(enabled.includes(name));

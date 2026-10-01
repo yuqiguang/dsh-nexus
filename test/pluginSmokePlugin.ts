@@ -43,8 +43,9 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal(response.status, 200);
       return (await response.json()).result;
     };
-    const off = { memory: false, mail: false, agenda: false };
-    const optionalTools = ['memory_recall', 'memory_remember', 'memory_forget', 'calendar', 'todo'];
+    const off = { mail: false, agenda: false };
+    const optionalTools = ['calendar', 'todo'];
+    const memoryTools = ['memory_recall', 'memory_remember', 'memory_forget'];
     const documentTools = ['doc_read', 'doc_create', 'doc_edit', 'doc_convert'];
     const documentStatus = () => carrier.fetch(new Request('dsh-app://dsh/api/nexus-documents/list', { method: 'POST' }));
     const coderRequest = (method: string, payload: unknown = {}) => carrier.fetch(new Request(`dsh-app://dsh/api/nexus-coders/${method}`, {
@@ -57,6 +58,7 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal(ctx.clientModules.clientPath('nexus-next'), undefined);
       assert.equal((await documentStatus()).status, 404);
       assert.ok(documentTools.every(name => !ctx.tools.get(name)));
+      assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
       assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName.startsWith('nexus-next')));
       const saved = await ctx.credentials.readRecord(credentialKey('nexus-channels', 'feishu'));
       assert.ok(saved?.kind === 'grant' && (saved.payload as { enabled?: boolean }).enabled === false);
@@ -86,10 +88,12 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: 'fixture' }));
       assert.equal(upload.status, 409, 'installed plugins cannot stage an import without a launcher');
       checks.push('installed_import_refused_without_launcher');
-      const rows = (await ctx.pluginManager.listPlugins()).filter(row => row.moduleName === 'nexus-next' || row.moduleName === 'nexus-next/documents');
-      assert.equal(rows.length, 2, 'bundle exposes two native components');
+      const rows = (await ctx.pluginManager.listPlugins()).filter(row => row.moduleName === 'nexus-next' || ['nexus-next/documents', 'nexus-next/memory'].includes(row.moduleName));
+      assert.equal(rows.length, 3, 'bundle exposes three native components');
       const bundleInfo = (await ctx.pluginManager.listBundles()).find(item => item.name === 'nexus-next');
-      assert.deepEqual(bundleInfo?.rows.map(row => row.moduleName), ['nexus-next', 'nexus-next/documents']);
+      assert.deepEqual(bundleInfo?.rows.map(row => row.moduleName), ['nexus-next', 'nexus-next/documents', 'nexus-next/memory']);
+      const memoryRow = rows.find(row => row.moduleName === 'nexus-next/memory')!;
+      assert.equal((memoryRow.meta?.title as { zh?: string })?.zh, '长期记忆');
       const docRow = rows.find(row => row.moduleName === 'nexus-next/documents')!;
       assert.equal((docRow.meta?.title as { zh?: string })?.zh, '文档兼容工具');
       const modules = await rpc('modules', 'list');
@@ -105,10 +109,28 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.equal(enabledDocs.application, 'applied');
         await until(() => documentTools.every(name => !!ctx.tools.get(name)), 'document component did not activate');
         assert.equal((await rpc('documents', 'list')).ok, true);
-        checks.push('two_localized_native_components', 'documents_default_off', 'native_live_enable');
+        checks.push('three_localized_native_components', 'documents_default_off', 'native_live_enable');
         assert.ok(optionalTools.every(name => ctx.tools.get(name)), 'compatibility defaults retain existing tools');
+        assert.equal(memoryRow.enabled, false);
+        assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
         const memory = await rpc('memory', 'event/add', { text: 'module restart fixture' });
         assert.equal(memory.ok, true);
+        assert.equal(memory.value.moduleEnabled, false);
+        assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, true)).application, 'applied');
+        await until(() => memoryTools.every(name => !!ctx.tools.get(name)), 'memory did not activate');
+        assert.equal((await rpc('memory', 'list')).value.moduleEnabled, true);
+        assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, false)).application, 'applied');
+        assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
+        const policy = await rpc('memory', 'policy', { remember: 'off', inject: false });
+        assert.equal(policy.ok, true, 'data remains writable while memory runtime is absent');
+        assert.equal(policy.value.moduleEnabled, false);
+        assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, true)).application, 'applied');
+        assert.ok(memoryTools.every(name => !!ctx.tools.get(name)));
+        const restoredMemory = await rpc('memory', 'export');
+        assert.equal(restoredMemory.value.policy.remember, 'off');
+        assert.equal(restoredMemory.value.policy.inject, false);
+        assert.match(restoredMemory.value.exportJson, /module restart fixture/);
+        checks.push('memory_default_off_with_data_management', 'memory_live_toggle_preserves_store_and_policy');
         const disabled = await rpc('modules', 'save', { revision: 0, enabled: off });
         assert.equal(disabled.ok, true);
         assert.equal(disabled.value.pendingRestart, true);
@@ -129,9 +151,17 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         await until(() => documentTools.every(name => !ctx.tools.get(name)), 'document component did not unload');
         assert.equal((await documentStatus()).status, 404);
         checks.push('native_live_disable_removes_tools_and_rpc');
+        assert.equal(memoryRow.enabled, true);
+        assert.ok(memoryTools.every(name => !!ctx.tools.get(name)));
+        assert.equal((await rpc('memory', 'list')).value.moduleEnabled, true);
+        assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, false)).application, 'applied');
+        assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
         const memory = await rpc('memory', 'export');
         assert.equal(memory.ok, true);
         assert.equal(memory.value.moduleEnabled, false);
+        assert.equal(memory.value.policy.remember, 'off');
+        assert.equal(memory.value.policy.inject, false);
+        checks.push('memory_enable_survives_restart', 'memory_disable_keeps_management_available');
         assert.match(memory.value.exportJson, /module restart fixture/);
         const saved = await rpc('connectors', 'save', { revision: 0, config: { mail: {
           enabled: true, address: 'fixture@example.com', imapHost: '127.0.0.1', smtpHost: '127.0.0.1', password: 'fixture-secret',
@@ -143,7 +173,7 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.ok(!ctx.tools.get('mail_send'));
         const tested = await rpc('connectors', 'mail/test');
         assert.equal(tested.error.code, 'module_disabled');
-        const enabled = await rpc('modules', 'save', { revision: 1, enabled: { ...off, memory: true, agenda: true } });
+        const enabled = await rpc('modules', 'save', { revision: 1, enabled: { ...off, agenda: true } });
         assert.equal(enabled.ok, true);
         assert.ok(optionalTools.every(name => !ctx.tools.get(name)));
         checks.push('disabled_modules_no_tools', 'native_document_enable_restored', 'disabled_mail_cannot_connect', 'disabled_memory_export_preserved', 'coding_and_native_reminders_unchanged');
@@ -161,7 +191,13 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.ok(optionalTools.every(name => ctx.tools.get(name)));
         assert.ok(!ctx.tools.get('mail_send'), 'mail remains independently disabled');
         const memory = await rpc('memory', 'list');
-        assert.equal(memory.value.moduleEnabled, true);
+        assert.equal(memoryRow.enabled, false);
+        assert.equal(memory.value.moduleEnabled, false);
+        assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
+        assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, true)).application, 'restart-required');
+        assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
+        assert.equal((await rpc('memory', 'list')).value.moduleEnabled, false);
+        checks.push('memory_disable_survives_restart', 'memory_enable_without_hmr_waits_for_restart');
         assert.ok(memory.value.events.some((event: { text: string }) => event.text === 'module restart fixture'));
         const deleted = await rpc('memory', 'event/delete', { id: memory.value.events.find((event: { text: string }) => event.text === 'module restart fixture').id });
         assert.equal(deleted.ok, true);

@@ -142,15 +142,16 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   // Which generation of each chat's session is active; a new day or an oversized context opens the next one.
   const sessions = await SessionRoster.open(ctx.storageDomain);
   ctx.effect(() => () => { void sessions.close(); });
-  let memory: MemoryService | undefined;
   const channels = await installChannels(ctx, workspace, legacy, undefined, registry, { ledger, timeZone, files, sessions,
     rotation: () => assistant?.rotation() ?? DEFAULT_ROTATION,
-    memory: { remember: (text, sessionId) => memory ? memory.summarize(text, sessionId) : Promise.resolve(undefined) },
+    memory: { remember: (text, sessionId) => ctx.get('nexusMemoryRuntime')?.summarize(text, sessionId) ?? Promise.resolve(undefined) },
     transcribe: (wav, signal) => assistant ? assistant.transcribe(wav, signal) : Promise.reject(new ChannelError('speech_not_configured')) });
   installUntrustedResults(ctx);
   assistant = await installAssistant(ctx, registry);
-  const memorySettings = await installMemorySettings(ctx, { enabled: modules.active.memory });
-  if (modules.active.memory) memory = memorySettings;
+  const memorySettings = await installMemorySettings(ctx, {
+    enabled: false, moduleEnabled: () => ctx.get('nexusMemoryRuntime')?.enabled === true,
+  });
+  ctx.provide('nexusMemoryData', memorySettings);
   // Coding tasks default to the channel workspace; the development profile widens this to the projects directory.
   // Every channel directory is a root too, so a task the chat asks for can run where the chat works.
   const profileRoots = [...new Set([...(config.coderRoots?.length ? config.coderRoots : [workspace]), ...await channels.workspaces()])].map(root => resolve(root));
@@ -211,7 +212,7 @@ export async function installConnectors(ctx: Context, registry: BridgeRegistry, 
 }
 
 /** Long-term memory: tools, injection, and the `/api/nexus-memory/*` routes for the settings page. */
-export async function installMemorySettings(ctx: Context, seams: { now?: () => number; enabled?: boolean } = {}): Promise<MemoryService> {
+export async function installMemorySettings(ctx: Context, seams: { now?: () => number; enabled?: boolean; moduleEnabled?: () => boolean } = {}): Promise<MemoryService> {
   const service = await MemoryService.open(ctx.storageDomain, seams.now, {
     resolveSession: async id => sessionMemoryScope(ctx.sessions.get(SessionId(id))?.header),
     projects: async () => {
@@ -222,7 +223,7 @@ export async function installMemorySettings(ctx: Context, seams: { now?: () => n
   if (seams.enabled !== false) installMemory(ctx, service);
   else ctx.effect(() => () => service.close());
   registerRpc(ctx, 'nexus-memory', ['list', 'export', 'policy', 'profile/set', 'profile/delete', 'event/add', 'event/delete', 'proposal/settle', 'legacy/copy'],
-    async (method, payload) => ({ ...await service.handle(method, payload), moduleEnabled: seams.enabled !== false }));
+    async (method, payload) => ({ ...await service.handle(method, payload), moduleEnabled: seams.moduleEnabled?.() ?? seams.enabled !== false }));
   return service;
 }
 

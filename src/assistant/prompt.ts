@@ -15,7 +15,7 @@ export function installAssistantPrompt(ctx: Context, current: (context: Assemble
   }));
 }
 
-export interface AssistantCapabilities { memory: boolean; documents?: boolean; skills?: boolean; agenda: boolean; reminders: boolean }
+export interface AssistantCapabilities { memory?: boolean; documents?: boolean; skills?: boolean; agenda: boolean; reminders: boolean }
 
 /** The native skill catalog already reflects workspace, scope and invocation policy.
  * Do not infer Office availability from installed packages or a global registry. */

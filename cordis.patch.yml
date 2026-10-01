@@ -4,3 +4,6 @@
     - id: nexus-documents
       name: nexus-next/documents
       disabled: true
+    - id: nexus-memory
+      name: nexus-next/memory
+      disabled: true

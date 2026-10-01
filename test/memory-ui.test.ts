@@ -16,6 +16,20 @@ const initial = (): MemoryView => ({ policy: { remember: 'auto', inject: true },
   injections: [{ id: 'mi-1', at: T0, sessionId: 's1', query: '王总那边怎么说', eventIds: ['me-1'], profile: true }],
   counts: { profile: 1, events: 2, proposals: 1 } });
 
+test('disabled native memory component leaves data controls available and refreshes live state', async t => {
+  let enabled = false;
+  const ui = await page(t, async method => ({ ...initial(), moduleEnabled: enabled,
+    ...(method === 'export' ? { exportJson: 'retained-memory' } : {}) }));
+  assert.match(ui.text(), /组件当前未运行/);
+  assert.match(ui.text(), /DSH 插件详情的组件列表/);
+  assert.doesNotMatch(ui.text(), /“Nexus 扩展”重新启用/);
+  assert.equal(ui.field('memory-remember').disabled, false);
+  enabled = true;
+  await ui.click('导出 JSON');
+  assert.match(ui.text(), /组件正在运行/);
+  assert.match(ui.text(), /retained-memory/);
+});
+
 async function page(t: TestContext, api: MemoryApi) {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost/' });
   const globals = { window: dom.window, document: dom.window.document, navigator: dom.window.navigator, HTMLElement: dom.window.HTMLElement,

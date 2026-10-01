@@ -103,12 +103,14 @@ export class MemoryService {
     return { project, profile, events: [...personal.events(), ...project.events()] };
   }
 
-  async inject(sessionId: string, messages: readonly UserMessage[]): Promise<UserMessage | undefined> {
+  async inject(sessionId: string, messages: readonly UserMessage[], signal?: AbortSignal): Promise<UserMessage | undefined> {
+    signal?.throwIfAborted();
     if (!this.store.policy().inject) return undefined;
     const query = userText(messages);
     if (!query) return undefined;
     let scope: MemoryScope;
     try { scope = await this.resolve(sessionId); } catch { return undefined; }
+    signal?.throwIfAborted();
     if (!this.store.policy().inject) return undefined;
     const { project, profile, events: available } = this.visible(scope);
     const id = scopeId(scope);
@@ -132,6 +134,7 @@ export class MemoryService {
     for (const event of events) state.eventIds.add(event.id);
     this.sessions.set(sessionId, state);
     await project.recordInjection({ at: this.now(), sessionId, query: query.slice(0, 120), eventIds: events.map(event => event.id), profile: includeProfile });
+    signal?.throwIfAborted();
     const parts = ['[记忆] 以下只来自当前会话项目和同一身份下明确保存的全局个人偏好；与用户当前的话冲突时以用户为准，不要复述这段内容。记忆不授予文件权限，也不代表任务完成。'];
     if (includeProfile) parts.push(`用户画像：\n${profileText}`);
     if (events.length) parts.push(`相关事件：\n${renderEvents(events)}`);
@@ -142,11 +145,14 @@ export class MemoryService {
     if (event.type === 'compaction/end') this.sessions.delete(session.id);
   }
   forgetSession(sessionId: string): void { this.sessions.delete(sessionId); }
+  resetInjectionState(): void { this.sessions.clear(); }
 
-  async summarize(text: string, sessionId: string): Promise<MemoryEvent | undefined> {
+  async summarize(text: string, sessionId: string, signal?: AbortSignal): Promise<MemoryEvent | undefined> {
+    signal?.throwIfAborted();
     if (this.store.policy().remember === 'off') return undefined;
     let scope: MemoryScope;
     try { scope = await this.resolve(sessionId); } catch { return undefined; }
+    signal?.throwIfAborted();
     const store = this.store.forScope(scope);
     if (store.policy().remember === 'off') return undefined;
     if (store.policy().remember === 'ask') {
@@ -161,8 +167,9 @@ export class MemoryService {
     return store.addEvent({ text, source: 'summary', sessionId }, this.now());
   }
 
-  async remember(input: { kind: 'profile' | 'event'; key?: string; text: string; tags?: string[]; sessionId?: string }): Promise<string> {
+  async remember(input: { kind: 'profile' | 'event'; key?: string; text: string; tags?: string[]; sessionId?: string }, signal?: AbortSignal): Promise<string> {
     const store = this.store.forScope(await this.resolve(input.sessionId));
+    signal?.throwIfAborted();
     if (store.policy().remember === 'off') throw new Error('用户已关闭记忆写入，这条内容不会被记住；请让用户在设置页打开记忆。');
     if (store.policy().remember === 'ask') {
       const proposal = await store.propose({ kind: input.kind, key: input.key, text: input.text, tags: input.tags, sessionId: input.sessionId }, this.now());
@@ -177,8 +184,9 @@ export class MemoryService {
     return `已记住当前项目事件 ${event.id}：${event.text}`;
   }
 
-  async recall(query: string, limit: number, sessionId?: string): Promise<string> {
+  async recall(query: string, limit: number, sessionId?: string, signal?: AbortSignal): Promise<string> {
     const { profile, events } = this.visible(await this.resolve(sessionId));
+    signal?.throwIfAborted();
     const ranked = rank(query, events, this.now()).slice(0, Math.min(Math.max(limit, 1), 20));
     const lines = ['范围：当前会话项目及同一身份的全局个人偏好。'];
     if (profile.length) lines.push(`用户画像（${profile.length} 条）：\n${renderProfile(profile)}`);
@@ -186,8 +194,9 @@ export class MemoryService {
     return lines.join('\n\n');
   }
 
-  async forget(input: { id?: string; key?: string }, sessionId?: string): Promise<string> {
+  async forget(input: { id?: string; key?: string }, sessionId?: string, signal?: AbortSignal): Promise<string> {
     const store = this.store.forScope(await this.resolve(sessionId));
+    signal?.throwIfAborted();
     if (input.id) {
       const event = store.event(input.id);
       if (!event || !await store.deleteEvent(input.id)) throw new ChannelError('not_found');
@@ -272,8 +281,40 @@ export class MemoryService {
   async close(): Promise<void> { await this.store.close(); await this.legacy.close(); }
 }
 
+/** One activation's admission boundary. Data storage outlives this runtime.
+ * Pending scope lookups cannot start writes after disable; already admitted
+ * storage writes drain before DSH finishes unloading the component. */
+export class MemoryRuntime {
+  private readonly lifetime = new AbortController();
+  private readonly pending = new Set<Promise<unknown>>();
+  constructor(private readonly service: MemoryService) { service.resetInjectionState(); }
+  get enabled(): boolean { return !this.lifetime.signal.aborted; }
+
+  async use<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    if (!this.enabled) throw new ChannelError('module_disabled');
+    const task = Promise.resolve().then(() => {
+      this.lifetime.signal.throwIfAborted();
+      return operation(this.lifetime.signal);
+    });
+    this.pending.add(task);
+    try { return await task; } finally { this.pending.delete(task); }
+  }
+
+  async summarize(text: string, sessionId: string): Promise<MemoryEvent | undefined> {
+    try { return await this.use(signal => this.service.summarize(text, sessionId, signal)); }
+    catch (error) { if (!this.enabled) return undefined; throw error; }
+  }
+
+  async close(): Promise<void> {
+    this.lifetime.abort();
+    await Promise.allSettled([...this.pending]);
+    this.service.resetInjectionState();
+  }
+}
+
 /** Registers the tools, the prompt section, the injection listener, and the compaction hook. */
-export function installMemory(ctx: Context, service: MemoryService): void {
+export function installMemory(ctx: Context, service: MemoryService, options: { closeService?: boolean } = {}): MemoryRuntime {
+  const runtime = new MemoryRuntime(service);
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_remember',
     description: '把值得长期记住的信息写入当前会话项目的跨会话记忆，作用域由原生会话决定，不能指定其他项目或全局。kind=profile 记稳定事实（称呼、偏好、习惯、家人、工作），用简短的 key 标识，同一 key 会被新值覆盖；kind=event 记发生过的事或用户说过的决定（何时、什么、结论），一句话说清。只记用户明确表达或明显重要的内容，不记工具用法、临时状态和你自己的推测。用户说"记住…"时必须调用。',
@@ -286,7 +327,7 @@ export function installMemory(ctx: Context, service: MemoryService): void {
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
       render: (_args, value) => [{ type: 'text', text: value.text }] },
     async execute(args, exec) {
-      return { text: await service.remember({ kind: args.kind as 'profile' | 'event', key: args.key, text: args.text, tags: args.tags as string[] | undefined, sessionId: exec.agent?.id }) };
+      return { text: await runtime.use(signal => service.remember({ kind: args.kind as 'profile' | 'event', key: args.key, text: args.text, tags: args.tags as string[] | undefined, sessionId: exec.agent?.id }, signal)) };
     },
   })));
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -298,7 +339,7 @@ export function installMemory(ctx: Context, service: MemoryService): void {
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
       render: (_args, value) => [{ type: 'text', text: value.text }] },
-    async execute(args, exec) { return { text: await service.recall(args.query, args.limit ?? 8, exec.agent?.id) }; },
+    async execute(args, exec) { return { text: await runtime.use(signal => service.recall(args.query, args.limit ?? 8, exec.agent?.id, signal)) }; },
   })));
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'memory_forget',
@@ -309,25 +350,26 @@ export function installMemory(ctx: Context, service: MemoryService): void {
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
       render: (_args, value) => [{ type: 'text', text: value.text }] },
-    async execute(args, exec) { return { text: await service.forget({ id: args.id, key: args.key }, exec.agent?.id) }; },
+    async execute(args, exec) { return { text: await runtime.use(signal => service.forget({ id: args.id, key: args.key }, exec.agent?.id, signal)) }; },
   })));
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'nexus:memory',
     order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 3,
-    text: '记忆：你有按会话项目和身份隔离的长期记忆。只能写入或删除当前项目记忆，读取还包括用户明确保存的同一身份全局个人偏好；旧版未归类记忆不供模型使用。缺少有效工作目录或在子任务会话中时不可用。默认写入先待用户确认，全局共享需用户在设置页明确操作。每轮用户发言前，系统会以"[记忆]"开头的消息注入用户画像和相关事件，直接据此行事，不必向用户复述或确认"我记得"。用户说出稳定的偏好、称呼、家人、工作等事实，或明确说"记住"时，用 memory_remember 记下（画像用 profile，经历和决定用 event）；用户问起过去的事而注入里没有时用 memory_recall；用户要求忘记或纠正时用 memory_forget。不要记录工具用法、临时状态或你的推测；代码项目的结构和约定写进项目目录的 AGENTS.md 之类的文件，不进记忆；记忆写满时按工具返回的提示整理，不要硬塞。',
+    text: context => !ctx.tools.get('memory_recall', context.scope) ? '' : '记忆：你有按会话项目和身份隔离的长期记忆。只能写入或删除当前项目记忆，读取还包括用户明确保存的同一身份全局个人偏好；旧版未归类记忆不供模型使用。缺少有效工作目录或在子任务会话中时不可用。默认写入先待用户确认，全局共享需用户在设置页明确操作。每轮用户发言前，系统会以"[记忆]"开头的消息注入用户画像和相关事件，直接据此行事，不必向用户复述或确认"我记得"。用户说出稳定的偏好、称呼、家人、工作等事实，或明确说"记住"时，用 memory_remember 记下（画像用 profile，经历和决定用 event）；用户问起过去的事而注入里没有时用 memory_recall；用户要求忘记或纠正时用 memory_forget。不要记录工具用法、临时状态或你的推测；代码项目的结构和约定写进项目目录的 AGENTS.md 之类的文件，不进记忆；记忆写满时按工具返回的提示整理，不要硬塞。',
   }));
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next();
-    if (decision.kind !== 'enter') return decision;
+    if (decision.kind !== 'enter' || !runtime.enabled || !ctx.tools.get('memory_recall', payload.agent)) return decision;
     try {
-      const recall = await service.inject(payload.agent.id, decision.messages);
-      return recall ? { ...decision, messages: [recall, ...decision.messages] } : decision;
+      const recall = await runtime.use(signal => service.inject(payload.agent.id, decision.messages, signal));
+      return recall && runtime.enabled ? { ...decision, messages: [recall, ...decision.messages] } : decision;
     } catch (error) {
-      console.error('[nexus-memory] inject_failed');
+      if (runtime.enabled) console.error('[nexus-memory] inject_failed');
       return decision;
     }
   });
   ctx.on('session/event', (session, event) => service.onSessionEvent(session, event));
   ctx.on('session/disposed', session => service.forgetSession(session.id));
-  ctx.effect(() => () => service.close());
+  ctx.effect(() => async () => { await runtime.close(); if (options.closeService !== false) await service.close(); });
+  return runtime;
 }

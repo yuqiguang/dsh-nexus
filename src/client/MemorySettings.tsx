@@ -101,7 +101,8 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
         {copied && <p role="status">已复制到所选范围，旧记录仍保留。</p>}
       </>}
     </div>}
-    {view.moduleEnabled === false && <p role="status">记忆模块当前关闭，不运行模型记忆工具、自动注入或渠道摘要写入。仍可查看、导出、修改和删除；下方策略在“Nexus 扩展”重新启用并重启后才会用于模型。</p>}
+    {view.moduleEnabled === false && <p role="status">长期记忆组件当前未运行，不使用模型记忆工具、自动注入或渠道摘要写入。仍可查看、导出、修改和删除数据。需要模型使用记忆时，请在 DSH 插件详情的组件列表中启用“长期记忆”，按宿主提示操作后刷新本页；旧版记忆开关不再生效。</p>}
+    {view.moduleEnabled === true && <p role="status">长期记忆组件正在运行，模型读写与自动注入受下方策略和项目范围约束。组件开关在 DSH 插件详情中管理。</p>}
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
     <div className="nexus-channel-card">
       <header><h3>写入策略</h3><span className="nexus-channel-state">画像 {view.counts.profile}/{view.limits.profileEntries}，事件 {view.counts.events}/{view.limits.events}</span></header>

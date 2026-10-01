@@ -1,6 +1,6 @@
 {
   "name": "nexus-next",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "private": true,
   "type": "module",
   "exports": {
@@ -10,7 +10,9 @@
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./documents": "./dist/src/documents/plugin.js",
-    "./documents/locale/*.json": "./locale/documents/*.json"
+    "./documents/locale/*.json": "./locale/documents/*.json",
+    "./memory": "./dist/src/memory/plugin.js",
+    "./memory/locale/*.json": "./locale/memory/*.json"
   },
   "files": [
     "dist/src",
@@ -18,7 +20,8 @@
     "cordis.patch.yml",
     "README.md",
     "locale/*.json",
-    "locale/documents/*.json"
+    "locale/documents/*.json",
+    "locale/memory/*.json"
   ],
   "dsh": {
     "bundle": {

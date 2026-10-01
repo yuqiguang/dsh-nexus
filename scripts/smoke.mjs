@@ -98,9 +98,9 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     assert.ok(!removed.dsh.profile.bundles.includes('nexus-next'));
   }
   const previousPatch = installedPlugin ? parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8').catch(() => '[]')) ?? [] : [];
-  const documentOverrides = previousPatch.filter(row => row.id === 'nexus-documents' && !row.insert);
+  const componentOverrides = previousPatch.filter(row => ['nexus-documents', 'nexus-memory'].includes(row.id) && !row.insert);
   await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([
-    ...documentOverrides,
+    ...componentOverrides,
     { id: 'session-title-llm', disabled: true },
     ...(phase === 12 ? [{ id: 'web', config: { searchProvider: 'nexus-research-fixture', fetchProvider: 'nexus-research-fixture' } }] : []),
     { id: 'agent-default-model', config: { provider: 'nexus-fixture', model: 'fixture' } },
