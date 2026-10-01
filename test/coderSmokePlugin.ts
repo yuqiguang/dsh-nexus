@@ -210,6 +210,9 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.doesNotMatch(prompt, /允许并记住/);
     assert.equal(store.get(task.id)!.status, 'waiting-user');
     assert.equal(store.get(task.id)!.pending?.summary, 'Claude wants to run git push');
+    assert.ok(readTask);
+    const waitingDetail = await readTask('get', { id: task.id }) as TaskDetailView;
+    assert.match(waitingDetail.recovery!.nextStep, /旧消息中的审批回复不能用于新的请求/);
     assert.deepEqual(claude.decisions, ['deny', 'allow']);
     // The second step fell inside the throttle window; it is written when the window closes.
     await until(() => (store.get(task.id)!.trace?.length ?? 0) >= 6, 'steps not recorded while waiting', 5_000);
@@ -246,6 +249,9 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.equal(detail.goal?.revision, done.brief?.revision);
     assert.match(detail.goal!.report, /业务验收待确认/);
     assert.match(detail.goal!.report, /尚未完成全部验收/);
+    assert.equal(detail.recovery?.title, '指定检查已通过');
+    assert.match(detail.goal!.recovery!, /保留已通过的结果/);
+    assert.ok(detail.result!.verifyChecks?.every(check => check.ok && check.executed));
     assert.equal((await readTask('get', { id: done.id, brief: true }) as TaskDetailView).goal, undefined);
     assert.equal(done.pending, undefined);
     assert.ok(texts.includes('Claude Code 已完成：目录里有 1 个文件，验证通过。它想读取 SSH 私钥被监工拒绝，ls 自动放行，git push 由你批准。'));
@@ -274,7 +280,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

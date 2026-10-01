@@ -1159,6 +1159,10 @@ test('the task panel route returns the record and, unless brief, the coder\'s pr
   assert.deepEqual([view.status, view.statusLabel, view.coderName, view.autoAllowed, view.trace.length, view.transcript.entries.length], ['interrupted', '已中断', 'Codex', 3, 1, 0]);
   const full = await get('get', { id: 'ct-00000001' }) as TaskDetailView;
   assert.match(full.transcript.problem!, /还没有报告会话/);
+  assert.equal(view.recovery, undefined, 'brief card reads do not generate recovery guidance');
+  assert.equal(full.recovery?.title, '任务已中断');
+  assert.match(full.recovery!.context!, /没有可续接/);
+  assert.equal(full.pending, undefined, 'restart guidance never replays the old approval');
   await assert.rejects(get('get', { id: 'ct-missing' }), /task_not_found/);
 });
 

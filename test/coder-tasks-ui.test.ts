@@ -29,7 +29,9 @@ async function render(t: TestContext, component: ComponentType<never>, props: Re
   });
   await act(async () => root.render(createElement(component, props as never)));
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
-  return dom.window.document;
+  return Object.assign(dom.window.document, { rerender: async (next: Record<string, unknown>) => {
+    await act(async () => root.render(createElement(component, next as never)));
+  } });
 }
 
 test('task addresses and the dispatched id round-trip', () => {
@@ -82,7 +84,7 @@ test('the task panel shows the standing and the coder\'s own process, folding ou
     asked.push([id, brief]);
     return detail({ status: 'completed', statusLabel: '已完成', active: false, runningFor: undefined, activity: undefined,
       decisions: ['[硬规则·拒绝] Bash: cat ~/.ssh/id_rsa — 命令涉及凭据或密钥文件'],
-      result: { summary: '做好了动画版。', changedFiles: ['/home/dev/workspace/pelican.html'], outsideRoots: [], verifyOk: true },
+      result: { summary: '做好了动画版。', changedFiles: ['/home/dev/workspace/pelican.html'], outsideRoots: [], verifyOk: true, execution: 'completed', verification: 'passed' },
       transcript: { source: '/x.jsonl', entries: [
         { at: 1, kind: 'user', title: '发给 Codex', body: '画一只骑自行车的鹈鹕' },
         { at: 2, kind: 'message', title: 'Codex 说', body: '先看看工作区里有什么。' },
@@ -111,4 +113,54 @@ test('without the coder\'s log the panel falls back to the supervisor\'s steps',
   assert.match(document.body.textContent!, /没有找到 Codex 的会话记录（t）。下面是监工记下的步骤。/);
   assert.match(document.body.textContent!, /执行：npm test/);
   assert.match(document.body.textContent!, /已运行 12 秒；最近一步在 3 秒前/);
+});
+
+test('failed verification shows executed and unexecuted checks separately from the coder report', async t => {
+  const api: TaskApi = async () => detail({ active: false, status: 'failed', statusLabel: '执行结束，验证失败',
+    recovery: { title: '独立验证未通过', nextStep: '回到所属会话核对失败检查。', context: '可尝试在原上下文续接。', blockers: [], followingTasks: [] },
+    result: { summary: '编码工具说已完成', detail: '已留下实现', execution: 'completed', verification: 'failed', verifyOk: false, changedFiles: [], outsideRoots: [],
+      verifyChecks: [{ command: 'node unit.cjs', ok: true, executed: true, output: 'unit passed' },
+        { command: 'node integration.cjs', ok: false, executed: true, output: 'assertion failed' },
+        { command: 'node release.cjs', ok: false, executed: false, output: 'previous check failed' }], verifyOutput: '尚未完成所有检查' } });
+  const doc = await render(t, coderTaskPanel(api) as ComponentType<never>, { useTabInfo: () => ({ tab: { contentId: taskAddress('ct-0000abcd'), visible: true } }) });
+  for (const text of ['编码工具报告', '独立验证未通过', '执行说明：已留下实现', '通过：node unit.cjs', '失败：node integration.cjs', '未执行：node release.cjs', 'assertion failed', '尚未完成所有检查']) assert.ok(doc.body.textContent!.includes(text), text);
+  assert.doesNotMatch(doc.body.textContent!, /失败：node release.cjs/);
+});
+
+test('legacy verification flags alone do not claim independently verified results', async t => {
+  const api: TaskApi = async () => detail({ active: false, status: 'completed', result: { summary: 'done', verifyOk: true, changedFiles: [], outsideRoots: [] } });
+  const doc = await render(t, coderTaskPanel(api) as ComponentType<never>, { useTabInfo: () => ({ tab: { contentId: taskAddress('ct-0000abcd'), visible: true } }) });
+  assert.match(doc.body.textContent!, /尚未独立验证/);
+  assert.doesNotMatch(doc.body.textContent!, /验证通过/);
+});
+
+test('following-task navigation reads a new record and clears the old recovery view while loading', async t => {
+  const opened: string[] = [];
+  let finish!: (view: TaskDetailView) => void;
+  const api: TaskApi = async id => id === 'ct-0000abcd' ? detail({ active: false, status: 'interrupted', ownerSession: 'old-owner',
+    recovery: { title: '旧任务已有后续', nextStep: '查看后续', blockers: [], followingTasks: ['ct-0000dcba'] } }) : new Promise(resolve => { finish = resolve; });
+  const props = (id: string) => ({ useTabInfo: () => ({ tab: { contentId: taskAddress(id), visible: true } }) });
+  const doc = await render(t, coderTaskPanel(api, id => opened.push(id), id => opened.push(id)) as ComponentType<never>, props('ct-0000abcd'));
+  await act(async () => [...doc.querySelectorAll('button')].find(button => button.textContent === '查看后续任务 ct-0000dcba')!.click());
+  assert.deepEqual(opened, ['ct-0000dcba']);
+  await doc.rerender(props('ct-0000dcba'));
+  assert.match(doc.body.textContent!, /正在读取任务/);
+  assert.doesNotMatch(doc.body.textContent!, /旧任务已有后续|回到所属会话|ct-0000abcd/);
+  await act(async () => finish(detail({ id: 'ct-0000dcba', ownerSession: 'new-owner', active: false, status: 'completed' })));
+  await act(async () => [...doc.querySelectorAll('button')].find(button => button.textContent === '回到所属会话')!.click());
+  assert.deepEqual(opened, ['ct-0000dcba', 'new-owner']);
+});
+
+test('an unread task card does not invent running state and ignores a late response for the previous id', async t => {
+  let finish!: (view: TaskDetailView) => void;
+  const api: TaskApi = async id => id === 'ct-0000abcd' ? new Promise(resolve => { finish = resolve; })
+    : detail({ id, status: 'queued', statusLabel: '排队中', active: false });
+  const props = (id: string) => ({ phase: 'result', block: { content: [{ type: 'text', text: `已派发编码任务 ${id}，后台 job coder-1。` }] } });
+  const doc = await render(t, coderTaskRow(() => {}, api) as ComponentType<never>, props('ct-0000abcd'));
+  assert.match(doc.body.textContent!, /正在读取状态/);
+  assert.doesNotMatch(doc.body.textContent!, /运行中/);
+  await doc.rerender(props('ct-0000dcba'));
+  await act(async () => finish(detail()));
+  assert.match(doc.body.textContent!, /ct-0000dcba.*排队中/);
+  assert.doesNotMatch(doc.body.textContent!, /ct-0000abcd|运行中/);
 });

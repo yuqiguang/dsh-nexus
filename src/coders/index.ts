@@ -6,9 +6,9 @@ import { loadCoderRuntime, verificationEnvironment, verificationReviewCommand } 
 import { coderConcurrency } from './settings.js';
 import { taskProcessArgv } from './process.js';
 import { ActiveBudget } from './budget.js';
-import { assertRetry } from './recovery.js';
+import { assertRetry, recoveryReport, taskRecovery, type TaskRecoveryView } from './recovery.js';
 import { resolvePlanStep, VERIFY_SHELL_SYNTAX } from './plan.js';
-import { installBriefs } from './brief.js';
+import { installBriefs, type CoderBrief } from './brief.js';
 import { deliveryReport } from './delivery.js';
 import { DependencyError, dependencyIds, waitForDependencies } from './dependencies.js';
 import { taskStatusLabel } from './status.js';
@@ -82,7 +82,8 @@ export interface CodersConfig {
 export interface TaskDetailView {
   id: string;
   ownerSession?: string;
-  goal?: { id: string; revision: number; report: string };
+  goal?: { id: string; revision: number; report: string; recovery?: string };
+  recovery?: TaskRecoveryView;
   coder: CoderKind;
   coderName: string;
   status: TaskRecord['status'];
@@ -898,18 +899,21 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const task = typeof id === 'string' ? store.get(id) : undefined;
     if (!task) throw new ChannelError('task_not_found');
     let goal: TaskDetailView['goal'];
+    let currentBrief: CoderBrief | undefined;
     if (brief !== true && task.brief) {
       // Read the current brief through its owner, including version-bound user reviews.
       // An old task remains visible even if its goal record is no longer available.
       try {
         const current = briefs.get(task.brief.id, task.ownerSession);
-        goal = { id: current.id, revision: current.revision, report: deliveryReport(current, store.list()) };
+        currentBrief = current;
+        goal = { id: current.id, revision: current.revision, report: deliveryReport(current, store.list()), recovery: recoveryReport(current, store.list(), true) };
       } catch { /* No goal evidence to present. */ }
     }
     const effective = brief === true ? undefined : await runtime();
     const homes = !effective ? { codex: [], claude: [] } : coderHomes({ ...('error' in effective.codex ? {} : { codex: effective.codex.env }), ...('error' in effective.claude ? {} : { claude: effective.claude.env }) });
     return {
       id: task.id, ownerSession: task.ownerSession, ...(goal ? { goal } : {}), coder: task.coder, coderName: CODER_NAMES[task.coder], status: task.status, statusLabel: taskStatusLabel(task), active: isActive(task),
+      ...(brief === true ? {} : { recovery: taskRecovery(task, store.list(), currentBrief) }),
       description: task.description, ...(task.brief ? { brief: task.brief } : {}), ...(task.planStep ? { planStep: task.planStep } : {}), cwd: task.cwd, ...(task.permissions ? { permissionDescription: permissionSummary(task.permissions) } : {}), ...(task.stopReason ? { stopReason: task.stopReason } : {}), createdAt: task.createdAt, updatedAt: task.updatedAt,
       ...(task.dependsOn?.length ? { dependsOn: task.dependsOn } : {}),
       ...(task.resumedFrom ? { resumedFrom: task.resumedFrom } : {}), ...(isActive(task) ? { runningFor: runningFor(task) } : {}),

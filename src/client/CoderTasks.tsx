@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { TaskDetailView } from '../coders/index.js';
 import type { TranscriptEntry } from '../coders/transcript.js';
 
@@ -37,31 +37,32 @@ export function dispatchedTaskId(content: readonly unknown[]): string | undefine
 
 /** Read one task, then again every `interval` while it is active and `live` holds; never two reads at once. */
 function useTask(id: string | undefined, brief: boolean, interval: number, live: boolean, api: TaskApi, refresh = 0) {
-  const [view, setView] = useState<TaskDetailView | undefined>();
-  const [problem, setProblem] = useState<string | undefined>();
-  const active = useRef(true);
+  const [loaded, setLoaded] = useState<{ id: string; brief: boolean; value: TaskDetailView }>();
+  const [failure, setFailure] = useState<{ id: string; brief: boolean; message: string }>();
   useEffect(() => {
     if (!id || !live) return;
     const controller = new AbortController();
+    let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = async () => {
       try {
         const next = await api(id, brief, controller.signal);
         if (controller.signal.aborted) return;
-        setView(next);
-        setProblem(undefined);
-        active.current = next.active;
+        setLoaded({ id, brief, value: next });
+        setFailure(undefined);
+        active = next.active;
       } catch (error) {
         if (controller.signal.aborted) return;
-        setProblem(explainFailure(error));
-        if ((error as Error)?.message === 'task_not_found') active.current = false;
+        setFailure({ id, brief, message: explainFailure(error) });
+        if ((error as Error)?.message === 'task_not_found') { active = false; setLoaded(undefined); }
       }
-      if (active.current) timer = setTimeout(() => { void load(); }, interval);
+      if (active) timer = setTimeout(() => { void load(); }, interval);
     };
     void load();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
   }, [id, brief, interval, live, api, refresh]);
-  return { view, problem };
+  return { view: loaded && loaded.id === id && loaded.brief === brief ? loaded.value : undefined,
+    problem: failure && failure.id === id && failure.brief === brief ? failure.message : undefined };
 }
 
 const clock = (at: number) => new Date(at).toLocaleTimeString('zh-CN', { hour12: false });
@@ -75,16 +76,17 @@ interface RowProps {
 export function coderTaskRow(open: (address: string) => void, api: TaskApi = taskApi) {
   return function CoderTaskRow(props: RowProps) {
     const id = props.phase === 'result' && !props.block.isError ? dispatchedTaskId(props.block.content ?? []) : undefined;
-    const { view } = useTask(id, true, 3000, true, api);
+    const { view, problem } = useTask(id, true, 3000, true, api);
     if (props.phase !== 'result') return <div className="nexus-coder-row" data-state="dispatching"><span className="nexus-coder-row-title">正在派发编码任务…</span></div>;
     if (!id) {
       const reason = (props.block.content ?? []).map(block => String((block as { text?: unknown } | null)?.text ?? '')).join(' ').trim();
       return <div className="nexus-coder-row" data-state="error"><span className="nexus-coder-row-title">编码任务没有派发</span>{reason && <span className="nexus-coder-row-detail">{reason}</span>}</div>;
     }
     return (
-      <div className="nexus-coder-row" data-state={view?.status ?? 'running'}>
+      <div className="nexus-coder-row" data-state={view?.status ?? 'loading'}>
         <span className="nexus-coder-row-title">{view ? `${view.coderName} 任务` : '编码任务'} {id}</span>
-        <span className="nexus-coder-row-status">{view?.statusLabel ?? '运行中'}</span>
+        <span className="nexus-coder-row-status">{view?.statusLabel ?? '正在读取状态'}</span>
+        {problem && <span className="nexus-coder-row-detail">{problem}</span>}
         {view?.activity && <span className="nexus-coder-row-detail">当前：{view.activity}</span>}
         {view?.pending && <span className="nexus-coder-row-detail">等你回答：{view.pending.summary}</span>}
         <button type="button" className="nexus-coder-row-open" onClick={() => open(taskAddress(id))}>查看过程</button>
@@ -117,13 +119,14 @@ function Entry({ entry }: { entry: TranscriptEntry }) {
 interface PanelProps { useTabInfo: () => { tab: { contentId: string; visible: boolean } } }
 
 /** The right-sidebar body for one coding task: its standing, then its process as the coder logged it. */
-export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string) => void) {
+export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string) => void, openTask?: (id: string) => void) {
   return function CoderTaskPanel({ useTabInfo }: PanelProps) {
     const { tab } = useTabInfo();
     const id = taskIdOf(tab.contentId);
     const [refresh, setRefresh] = useState(0);
     const { view, problem } = useTask(id, false, 2000, tab.visible, api, refresh);
-    if (!view) return <div className="nexus-coder-panel"><p className="nexus-channel-hint">{problem ?? '正在读取任务…'}</p></div>;
+    if (!view) return <div className="nexus-coder-panel"><p className="nexus-channel-hint">{problem ?? '正在读取任务…'}</p>
+      {problem && <button type="button" onClick={() => setRefresh(value => value + 1)}>重新读取</button>}</div>;
     const entries = view.transcript.entries;
     return (
       <div className="nexus-coder-panel">
@@ -142,17 +145,36 @@ export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string
         {view.permissionDescription && <p className="nexus-channel-hint">{view.permissionDescription}</p>}
         {view.stopReason && <p className="nexus-coder-panel-pending">{view.stopReason}</p>}
         {view.pending && <p className="nexus-coder-panel-pending">等你回答：{view.pending.summary}（{clock(view.pending.at)} 提出，在聊天里回复）</p>}
+        {view.recovery && <section className="nexus-coder-panel-result" aria-label="恢复建议">
+          <strong>{view.recovery.title}</strong>
+          <p>{view.recovery.nextStep}</p>
+          {view.recovery.context && <p>{view.recovery.context}</p>}
+          {view.recovery.blockers.length > 0 && <ul>{view.recovery.blockers.map((line, index) => <li key={index}>{line}</li>)}</ul>}
+          {view.recovery.followingTasks.map(task => <p key={task}>{openTask
+            ? <button type="button" className="nexus-coder-row-open" onClick={() => openTask(task)}>查看后续任务 {task}</button>
+            : `后续任务：${task}`}</p>)}
+          <p className="nexus-channel-hint">此处仅展示记录，不启动任务。恢复时仍需检查当前工作区、依赖与审批；一次性授权不会沿用。</p>
+        </section>}
         <p className="nexus-channel-hint">升级给你 {view.escalations} 次，常规操作自动放行 {view.autoAllowed} 次{view.decisions.length ? `，决定 ${view.decisions.length} 条` : ''}。</p>
         {view.result && <div className="nexus-coder-panel-result">
-          <strong>结果</strong>
+          <strong>编码工具报告</strong>
           <p>{view.result.summary || view.result.detail || '（没有文本结果）'}</p>
-          <p className="nexus-channel-hint">改动文件 {view.result.changedFiles.length} 个{view.result.verifyOk === undefined || view.result.verification === 'not-run' ? '，尚未独立验证' : view.result.verifyOk ? '，验证通过' : '，验证失败'}</p>
+          {view.result.summary && view.result.detail && <p>执行说明：{view.result.detail}</p>}
+          <p className="nexus-channel-hint">改动文件 {view.result.changedFiles.length} 个{view.result.verification === 'passed' && view.result.verifyOk === true ? '，验证通过' : view.result.verification === 'failed' ? '，验证失败' : '，尚未独立验证'}</p>
           {view.result.changedFiles.length > 0 && <ul>{view.result.changedFiles.slice(0, 40).map(file => <li key={file}>{file}</li>)}</ul>}
+          {!!view.result.outsideRoots.length && <p role="alert">发现 {view.result.outsideRoots.length} 项工作区外改动，请先检查改动范围。</p>}
+          <h4>独立验证</h4>
+          <p className="nexus-channel-hint">仅表示以下检查的结果，业务验收见“目标与验收”。没有记录的检查不能视为通过。</p>
+          {view.result.verifyChecks?.length ? <ol>{view.result.verifyChecks.map((check, index) => <li key={index}>
+            <details><summary>{check.executed ? check.ok ? '通过' : '失败' : '未执行'}：{check.command}</summary><pre>{check.output || '（无输出）'}</pre></details>
+          </li>)}</ol> : <p>没有逐条检查记录。</p>}
+          {view.result.verifyOutput && <details><summary>验证汇总与原因</summary><pre>{view.result.verifyOutput}</pre></details>}
         </div>}
         {view.goal && <div className="nexus-coder-panel-result">
           <strong>目标与验收</strong>
           {view.brief && view.brief.revision !== view.goal.revision && <p>此任务属于旧目标版本 v{view.brief.revision}；以下显示当前版本 v{view.goal.revision} 的验收进度。</p>}
           <p>{view.goal.report}</p>
+          {view.goal.recovery && <details><summary>按当前目标查看恢复清单</summary><pre>{view.goal.recovery}</pre></details>}
         </div>}
         {view.decisions.length > 0 && <details className="nexus-coder-panel-decisions"><summary>监工的决定</summary><ul>{view.decisions.map((line, index) => <li key={index}>{line}</li>)}</ul></details>}
         <h4>过程</h4>

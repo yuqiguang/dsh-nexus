@@ -204,7 +204,16 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
     </div>}
     {qr?.phase === 'expired' && <p role="alert">二维码已过期，请重新获取。</p>}
     {(qr?.error || connection.error) && <p role="alert">{explain(qr?.error ?? connection.error)}</p>}
-    {!!connection.pendingDeliveries && <p role="status">有 {connection.pendingDeliveries} 条回复待发送，可在连接后重试发送。</p>}
+    {!!connection.pendingDeliveries && <section aria-label="消息投递恢复">
+      <p role="status">有 {connection.pendingDeliveries} 条回复待发送。消息尚未送达不代表编码任务失败，请在 DSH 的所属会话中查看任务结果。</p>
+      <p className="nexus-channel-hint">重试发送只补发已保存的未发送部分，不会重新执行任务，也不会重放审批提示。恢复连接或重启后也按此规则处理。</p>
+      <p>{connection.error === 'authentication_failed' ? '请用原绑定账号重新扫码；其他账号不能接收这些回复。'
+        : !connection.enabled ? '请先连接原绑定账号，再查看待发状态。'
+        : connection.phase === 'error' ? '请先处理连接错误并重新连接，再查看待发状态。'
+        : connection.phase !== 'connected' ? '正在等待连接通过认证，恢复连接后再查看待发状态。'
+        : connection.deliveryError === 'wechat_context_stale' ? '请用原绑定微信账号发送一条新消息，恢复回复窗口后再查看待发状态。'
+        : '连接已通过认证，可点击“重试发送”重新尝试补发。'}</p>
+    </section>}
     {connection.deliveryError && <p role="alert">{explain(connection.deliveryError)}</p>}
     <p className="nexus-channel-hint">支持文字、图片、文件、审批和提问回复。请用一个专门给助理的微信号扫码：同一个号只能有一个程序接收消息，别的桥接同时在线会互相抢消息。</p>
     <footer>
@@ -215,7 +224,7 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
         <button disabled={busy || waiting} onClick={() => void action('connect', { channel: 'wechat', revision: connection.revision })}>重新连接</button>}
       {connection.configured && <button disabled={busy} onClick={() => void action(connection.enabled ? 'disconnect' : 'connect', { channel: 'wechat', revision: connection.revision })}>
         {connection.enabled ? '断开' : '连接'}</button>}
-      {!!connection.pendingDeliveries && <button disabled={busy || !connection.enabled}
+      {!!connection.pendingDeliveries && <button disabled={busy || waiting || !connection.enabled || connection.phase !== 'connected' || connection.deliveryError === 'wechat_context_stale'}
         onClick={() => void action('retry-delivery', { channel: 'wechat', revision: connection.revision })}>重试发送</button>}
     </footer>
     <WorkspaceField connection={connection} action={action} busy={busy} />

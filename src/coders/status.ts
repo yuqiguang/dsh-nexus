@@ -1,6 +1,7 @@
 import type { TaskRecord } from './types.js';
 
 export function taskStatusLabel(task: Pick<TaskRecord, 'status' | 'result'>): string {
+  if (task.result?.verification === 'failed' && (task.status === 'completed' || task.status === 'failed')) return '执行结束，验证失败';
   if (task.status === 'completed') return task.result?.verification === 'passed' && task.result.verifyOk === true
     ? '执行结束，验证通过' : '执行结束，尚未独立验证';
   return { queued: '排队中', running: '运行中', 'waiting-user': '等待用户回答', verifying: '验证中',

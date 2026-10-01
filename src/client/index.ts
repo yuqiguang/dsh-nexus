@@ -77,7 +77,8 @@ export function apply(ctx: Context): void {
       const ui = inner.get('uiWorkspace') as { openSession(id: string): void } | undefined;
       ui?.openSession(id);
     };
-    seats.slots.inject('sidebar.right.pane.tab', () => seats.slots.register({ name: 'sidebar.right.pane.tab', key: TASK_TAB_ID }, coderTaskPanel(undefined, openSession)));
+    seats.slots.inject('sidebar.right.pane.tab', () => seats.slots.register({ name: 'sidebar.right.pane.tab', key: TASK_TAB_ID },
+      coderTaskPanel(undefined, openSession, id => seats.sidebarRight.openResource(taskAddress(id)))));
     seats.slots.inject('tool.call.toolview', () => seats.slots.register({ name: 'tool.call.toolview', key: 'coder_task' },
       coderTaskRow(address => seats.sidebarRight.openResource(address))));
   });

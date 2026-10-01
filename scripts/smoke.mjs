@@ -46,6 +46,7 @@ async function availableMemory() {
 }
 
 const codersOnly = process.argv.includes('--coders-only');
+const wechatOnly = process.argv.includes('--wechat-only');
 const remindersOnly = process.argv.includes('--reminders-only');
 const mediaOnly = process.argv.includes('--media-only');
 const memoryOnly = process.argv.includes('--memory-only');
@@ -55,7 +56,7 @@ const documentsOnly = process.argv.includes('--documents-only');
 const nativeOnly = process.argv.includes('--native-only');
 const rebindOnly = process.argv.includes('--rebind-only');
 const dataOnly = process.argv.includes('--data-only');
-for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : codersOnly ? [12] : remindersOnly ? [13, 14] : mediaOnly ? [15, 16] : memoryOnly ? [17, 18] : serviceOnly ? [19, 20] : mailOnly ? [21] : documentsOnly ? [22] : nativeOnly ? [1, 2] : rebindOnly ? [23, 24] : dataOnly ? [25, 26]
+for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : codersOnly ? [12] : wechatOnly ? [5, 6] : remindersOnly ? [13, 14] : mediaOnly ? [15, 16] : memoryOnly ? [17, 18] : serviceOnly ? [19, 20] : mailOnly ? [21] : documentsOnly ? [22] : nativeOnly ? [1, 2] : rebindOnly ? [23, 24] : dataOnly ? [25, 26]
   : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) {
   if (await availableMemory() < 800) throw new Error('Not enough available RAM to start the smoke check (800 MiB required).');
   // What scripts/start.mjs does before DSH starts, and before this runner writes the phase's profile patch: swap in the import phase 25 staged.
@@ -182,17 +183,21 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     if (phase === 20) console.log('Native DSH phase 20: clean stop recorded on SIGTERM.');
   }
 }
-if (!pluginOnly && !interactionOnly && !codersOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !rebindOnly && !dataOnly) {
+if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !rebindOnly && !dataOnly) {
   assert.equal(summaries[0].sessionId, summaries[1].sessionId);
   assert.equal(summaries[1].completedTurns, 2);
 }
-if (!pluginOnly && !interactionOnly && !codersOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !nativeOnly && !rebindOnly && !dataOnly) {
+if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !nativeOnly && !rebindOnly && !dataOnly) {
   assert.equal(summaries[4].sessionId, summaries[5].sessionId);
   assert.equal(summaries[5].recoveryModelCalls, 0);
+}
+if (wechatOnly) {
+  assert.equal(summaries[0].sessionId, summaries[1].sessionId);
+  assert.equal(summaries[1].recoveryModelCalls, 0);
 }
 const summary = { passed: true, dshVersion: manifest.version, model: 'local scripted fixture',
   channels: 'local channel fixtures and fault-injected loopback WeChat HTTP', checks: summaries.flatMap(item => item.checks),
   peakRssMiB: Math.round(peakRssMiB), minimumAvailableMiB: Math.round(minimumAvailableMiB),
   phases: summaries, evidence: runRoot };
-await writeFile(join(root, pluginOnly ? 'latest-plugin.json' : interactionOnly ? 'latest-interaction.json' : codersOnly ? 'latest-coders.json' : remindersOnly ? 'latest-reminders.json' : mediaOnly ? 'latest-media.json' : memoryOnly ? 'latest-memory.json' : serviceOnly ? 'latest-service.json' : mailOnly ? 'latest-mail.json' : documentsOnly ? 'latest-documents.json' : nativeOnly ? 'latest-native.json' : rebindOnly ? 'latest-rebind.json' : dataOnly ? 'latest-data.json' : 'latest.json'), JSON.stringify(summary, null, 2) + '\n');
+await writeFile(join(root, pluginOnly ? 'latest-plugin.json' : interactionOnly ? 'latest-interaction.json' : codersOnly ? 'latest-coders.json' : wechatOnly ? 'latest-wechat.json' : remindersOnly ? 'latest-reminders.json' : mediaOnly ? 'latest-media.json' : memoryOnly ? 'latest-memory.json' : serviceOnly ? 'latest-service.json' : mailOnly ? 'latest-mail.json' : documentsOnly ? 'latest-documents.json' : nativeOnly ? 'latest-native.json' : rebindOnly ? 'latest-rebind.json' : dataOnly ? 'latest-data.json' : 'latest.json'), JSON.stringify(summary, null, 2) + '\n');
 console.log(`${pluginOnly ? 'Installed plugin lifecycle' : 'Native session restart'} verified. Peak DSH RSS: ${summary.peakRssMiB} MiB.`);

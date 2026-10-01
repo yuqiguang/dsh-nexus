@@ -115,11 +115,35 @@ test('WeChat pending replies expose a revision-scoped retry and clear after deli
   const card = ui.dom.window.document.querySelector('article')!;
   assert.match(card.textContent!, /有 2 条回复待发送/);
   assert.match(card.textContent!, /微信服务暂时不可用/);
+  assert.match(card.textContent!, /消息尚未送达不代表编码任务失败/);
+  assert.match(card.textContent!, /只补发已保存的未发送部分.*不会重新执行任务.*不会重放审批提示/);
   const retry = [...card.querySelectorAll('button')].find(button => button.textContent === '重试发送')!;
   assert.equal(retry.disabled, false);
   await act(async () => retry.click());
   assert.deepEqual(calls.find(call => call.method === 'retry-delivery')?.payload, { channel: 'wechat', revision: 7 });
   assert.doesNotMatch(card.textContent!, /回复待发送|微信服务暂时不可用|重试发送/);
+});
+
+test('pending delivery cannot retry before authentication or with an expired reply window', async t => {
+  for (const state of [
+    { phase: 'reconnecting' as const, error: 'connection_failed', deliveryError: 'server_unavailable', expected: /等待连接通过认证/ },
+    { phase: 'error' as const, error: 'authentication_failed', deliveryError: 'server_unavailable', expected: /原绑定账号重新扫码/ },
+    { phase: 'connected' as const, error: undefined, deliveryError: 'wechat_context_stale', expected: /原绑定微信账号发送一条新消息/ },
+  ]) {
+    await t.test(`${state.phase}: ${state.deliveryError}`, async t => {
+    const view = initial();
+    view.connections[0] = { ...view.connections[0]!, revision: 7, enabled: true, configured: true, secretConfigured: true,
+      pendingDeliveries: 1, phase: state.phase, error: state.error, deliveryError: state.deliveryError };
+    const calls: string[] = [];
+    const ui = await page(t, async method => { calls.push(method); return structuredClone(view); });
+    const card = ui.dom.window.document.querySelector('article')!;
+    const retry = [...card.querySelectorAll('button')].find(button => button.textContent === '重试发送')!;
+    assert.equal(retry.disabled, true);
+    assert.match(card.textContent!, state.expected);
+    await act(async () => retry.click());
+    assert.deepEqual(calls, ['list']);
+    });
+  }
 });
 
 test('a channel workspace is edited in its own form, with the directory in effect as the current value', async t => {
