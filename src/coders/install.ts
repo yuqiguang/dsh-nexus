@@ -8,7 +8,7 @@ import type { CoderKind } from './types.js';
 import type { CodexSettings } from './settings.js';
 import { redact } from './normalize.js';
 import type { DownloadProgress } from './install-download.js';
-import { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
+import { MANAGED_PACKAGES, isManagedVersion, safeDownloadUrl } from './install-shared.js';
 export { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
 
 /** Environment variable the generated Codex provider reads its key from. */
@@ -53,8 +53,9 @@ export function hostPlatform(): HostPlatform {
  * these as optional dependencies, which npm skips silently when a download
  * fails; Nexus lists the right one explicitly so a missing binary fails the install.
  */
-export function platformPackage(coder: CoderKind, host: HostPlatform = hostPlatform()): { name: string; spec: string; binary: string } {
-  const { name, version } = MANAGED_PACKAGES[coder];
+export function platformPackage(coder: CoderKind, host: HostPlatform = hostPlatform(), version = MANAGED_PACKAGES[coder].version): { name: string; spec: string; binary: string } {
+  if (!isManagedVersion(version)) throw new Error('invalid_managed_version');
+  const { name } = MANAGED_PACKAGES[coder];
   const suffix = `${host.platform}-${host.arch}`;
   if (coder === 'codex') {
     return { name: `${name}-${suffix}`, spec: `npm:${name}@${version}-${suffix}`, binary: '' };
@@ -286,6 +287,7 @@ export async function ensureClaudeHome(layout: ManagedLayout): Promise<void> {
 export interface InstallProgress {
   coder: CoderKind;
   phase: 'installing' | 'installed' | 'failed';
+  version?: string;
   stage?: 'preparing' | 'downloading' | 'packages' | 'verifying' | 'configuring';
   startedAt: number;
   lastOutputAt?: number;
@@ -426,10 +428,11 @@ export class CoderInstaller {
   installing(): CoderKind | undefined { return this.current?.phase === 'installing' ? this.current.coder : undefined; }
 
   /** Starts an install; rejects when one is already running. The returned promise settles when npm finishes. */
-  start(coder: CoderKind): Promise<void> {
+  start(coder: CoderKind, version = MANAGED_PACKAGES[coder].version): Promise<void> {
+    if (!isManagedVersion(version)) throw new Error('invalid_managed_version');
     if (this.current?.phase === 'installing') throw new Error('install_in_progress');
-    this.current = { coder, phase: 'installing', stage: 'preparing', startedAt: this.now(), timeoutMs: this.timeoutMs, log: '' };
-    this.running = this.run(coder).catch(error => {
+    this.current = { coder, version, phase: 'installing', stage: 'preparing', startedAt: this.now(), timeoutMs: this.timeoutMs, log: '' };
+    this.running = this.run(coder, version).catch(error => {
       if (this.current) Object.assign(this.current, { phase: 'failed', finishedAt: this.now(), error: safeInstallText((error as Error)?.message ?? String(error)).slice(-LOG_LIMIT) });
     });
     return this.running;
@@ -437,9 +440,9 @@ export class CoderInstaller {
 
   whenDone(): Promise<void> { return this.running ?? Promise.resolve(); }
 
-  private async run(coder: CoderKind): Promise<void> {
-    const pkg = MANAGED_PACKAGES[coder];
-    const native = platformPackage(coder, this.host);
+  private async run(coder: CoderKind, version: string): Promise<void> {
+    const pkg = { ...MANAGED_PACKAGES[coder], version };
+    const native = platformPackage(coder, this.host, version);
     await mkdir(this.layout.root, { recursive: true, mode: 0o700 });
     await mkdir(this.layout.markers, { recursive: true, mode: 0o700 });
     // A reinstall is "not installed" until it completes; nothing may pick up a half-written binary.
@@ -478,6 +481,10 @@ export class CoderInstaller {
     progress.stage = 'verifying';
     const binary = coder === 'codex' ? managedCodexBinary(this.layout, this.host) : join(this.layout.nodeModules, native.name, native.binary);
     if (!await exists(binary, constants.X_OK)) throw new Error(`platform_package_missing: ${native.name}`);
+    const nativeVersion = coder === 'codex' ? `${version}-${this.host.platform}-${this.host.arch}` : version;
+    if (await packageVersion(join(this.layout.nodeModules, pkg.name)) !== version
+      || await packageVersion(join(this.layout.nodeModules, native.name)) !== nativeVersion) throw new Error('installed_version_mismatch');
+    if (coder === 'claude' && !await exists(join(this.layout.nodeModules, pkg.name, 'sdk.mjs'))) throw new Error('installed_sdk_missing');
     progress.stage = 'configuring';
     const marker: InstallMarker = { coder, version: pkg.version, platformPackage: native.name, at: this.now() };
     await writeFile(join(this.layout.markers, `${coder}.json`), JSON.stringify(marker, null, 2) + '\n', { mode: 0o600 });

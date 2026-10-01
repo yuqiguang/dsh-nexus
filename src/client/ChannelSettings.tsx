@@ -56,6 +56,8 @@ export const errors: Record<string, string> = {
   mail_connection_failed: '连不上邮件服务器，请检查端口、TLS 选项和网络。',
   mail_tls_failed: '邮件服务器的证书校验失败，请检查服务器地址和 TLS 选项。',
   mail_request_failed: '邮件服务器返回了错误，稍后再试。',
+  invalid_managed_version: '请输入完整版本号，例如 0.155.1；不支持 latest、版本范围或下载地址。',
+  install_tasks_active: '编码任务或沙箱配置正在进行，请结束后再安装托管版本。',
   install_in_progress: '已有安装在进行，请等它结束。',
   rule_not_found: '这条规则已不存在，请重新载入。',
   unknown_action: '不支持的操作。',

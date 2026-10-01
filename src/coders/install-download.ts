@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import type { Readable } from 'node:stream';
-import { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
+import { MANAGED_PACKAGES, isManagedVersion, safeDownloadUrl } from './install-shared.js';
 
 export interface DownloadProgress {
   package: string;
@@ -40,7 +40,7 @@ export function downloadTargets(dependencies: Record<string, string>): { name: s
     if (!Object.values(MANAGED_PACKAGES).some(pkg => name === pkg.name || name.startsWith(pkg.name + '-'))) continue;
     const alias = /^npm:(@[^/]+\/[^@]+)@(.+)$/.exec(spec);
     const source = alias?.[1] ?? name, version = alias?.[2] ?? spec;
-    if (!/^@[a-z0-9._-]+\/[a-z0-9._-]+$/.test(source) || !/^\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?$/.test(version)) continue;
+    if (!/^@[a-z0-9._-]+\/[a-z0-9._-]+$/.test(source) || !isManagedVersion(version, 128)) continue;
     targets.push({ name: source, version });
   }
   return targets;

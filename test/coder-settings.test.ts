@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { isManagedVersion } from '../src/coders/install-shared.js';
 import { test } from 'node:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import { CODEX_KEY_ENV, CoderInstaller, MANAGED_PACKAGES, codexConfigToml, creat
   parseCodexVersion, platformPackage, readMarker, type HostPlatform, type NpmRunner } from '../src/coders/install.js';
 import { CodersManager } from '../src/coders/manager.js';
 import { CoderSettingsStore, defaultSettings, redact, rootsInput, endpointUrl, coderConcurrency } from '../src/coders/settings.js';
+import type { CoderStore } from '../src/coders/store.js';
 import { MemoryRecords } from './helpers.js';
 
 test('coder settings validate input, keep secrets on empty fields, redact them in views, and check revisions', async () => {
@@ -143,6 +145,9 @@ async function fakeManaged(root: string, coder: 'codex' | 'claude', options: { v
     }
   }
   if (complete) {
+    const native = platformPackage(coder, host, version);
+    await mkdir(join(root, 'node_modules', native.name), { recursive: true });
+    await writeFile(join(root, 'node_modules', native.name, 'package.json'), JSON.stringify({ version: coder === 'codex' ? `${version}-linux-x64` : version }));
     await mkdir(join(root, 'installed'), { recursive: true });
     await writeFile(join(root, 'installed', `${coder}.json`), JSON.stringify({ coder, version, platformPackage: platformPackage(coder, host).name, at: 1 }));
   }
@@ -215,7 +220,7 @@ test('the installer pins the package and its platform package, marks success onl
   assert.equal(installer.installing(), 'codex');
   assert.throws(() => installer.start('claude'), /install_in_progress/);
   await started;
-  assert.deepEqual(installer.progress(), { coder: 'codex', phase: 'installed', stage: 'configuring', startedAt: 1000, timeoutMs: 60 * 60_000, lastOutputAt: 1001, finishedAt: 1003, log: 'added 1 package\n' });
+  assert.deepEqual(installer.progress(), { coder: 'codex', version: MANAGED_PACKAGES.codex.version, phase: 'installed', stage: 'configuring', startedAt: 1000, timeoutMs: 60 * 60_000, lastOutputAt: 1001, finishedAt: 1003, log: 'added 1 package\n' });
   assert.equal(installer.installing(), undefined);
   assert.deepEqual(runs, [{ args: ['install', '--no-audit', '--no-fund', '--loglevel=http', '--omit=dev', '--omit=optional'], cwd: root }]);
   assert.deepEqual(after, ['codex']);
@@ -387,7 +392,7 @@ async function manager(options: { codexOnPath?: boolean; claudeOnPath?: boolean;
   if (options.codexOnPath) { await writeFile(join(bin, 'codex'), '#!/bin/sh\necho "codex-cli 0.154.0"\n'); await chmod(join(bin, 'codex'), 0o755); }
   if (options.claudeOnPath) { await writeFile(join(bin, 'claude'), '#!/bin/sh\necho "2.1.258 (Claude Code)"\n'); await chmod(join(bin, 'claude'), 0o755); }
   const npmCalls: string[] = [];
-  const npm: NpmRunner = async args => { npmCalls.push(args.join(' ')); await fakeManaged(root, 'codex', { complete: false }); await fakeManaged(root, 'codex'); await rm(join(root, 'installed', 'codex.json')); return { code: 0 }; };
+  const npm: NpmRunner = async args => { npmCalls.push(args.join(' ')); const version = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies['@openai/codex']; await fakeManaged(root, 'codex', { version }); await rm(join(root, 'installed', 'codex.json')); return { code: 0 }; };
   let instance!: CodersManager;
   const installer = new CoderInstaller(layout, npm, coder => instance.afterInstall(coder), Date.now, host);
   const env = { PATH: bin, HOME: '/home/fixture' };
@@ -485,7 +490,7 @@ test('a managed Codex needs an API key, gets a generated home with the key only 
   await assert.rejects(m.manager.handle('rules/remove', { id: 'cr-x' }), /invalid_configuration/);
   const fresh = await manager();
   assert.equal((await fresh.manager.view()).codex.active, 'none');
-  await fresh.manager.handle('install', { coder: 'codex' });
+  await fresh.manager.handle('install', { coder: 'codex', revision: 0 });
   assert.equal((await fresh.manager.view()).codex.active, 'none', 'a running install is not a usable source');
   await fresh.installer.whenDone();
   assert.deepEqual(fresh.npmCalls, ['install --no-audit --no-fund --loglevel=http --omit=dev --omit=optional']);
@@ -516,4 +521,91 @@ test('security mode defaults to standard for new tasks, persists and rejects unk
   assert.equal((await store.save(0, { securityMode: 'strict' })).securityMode, 'strict');
   assert.equal((await store.save(1, {})).securityMode, 'strict');
   await assert.rejects(store.save(2, { securityMode: 'unrestricted' }), /invalid_configuration/);
+});
+
+test('managed version preferences validate exact releases, survive older clients, and reset without changing secrets', async () => {
+  for (const value of ['0.155.1', '1.2.3-rc.1', '0.3.273', '1.2.3-RC.2']) assert.equal(isManagedVersion(value), true);
+  const invalid = ['latest', '^1.2.3', '1.2', '01.2.3', '1.2.3-01', '1.2.3+', '1.2.3+meta', 'file:/tmp/x', 'https://example.com/pkg', '1.2.3;echo hi', '1.2.3\n', '1.2.3-' + 'x'.repeat(97), null, 123];
+  const records = new MemoryRecords(), store = new CoderSettingsStore(records);
+  for (const value of invalid) {
+    assert.equal(isManagedVersion(value), false);
+    await assert.rejects(store.save(0, { codex: { managedVersion: value } }), /invalid_managed_version/);
+    await assert.rejects(store.save(0, { claude: { managedVersion: value } }), /invalid_managed_version/);
+  }
+  const saved = await store.save(0, { codex: { managedVersion: '1.2.3-rc.1', apiKey: 'private-key' }, claude: { managedVersion: '0.3.200', token: 'private-token' } });
+  assert.equal(redact(saved).codex.managedVersion, '1.2.3-rc.1');
+  const oldClient = await new CoderSettingsStore(records).save(1, { codex: { model: 'some-model' } });
+  assert.equal(oldClient.codex.managedVersion, '1.2.3-rc.1'); assert.equal(oldClient.claude.managedVersion, '0.3.200');
+  const reset = await store.save(2, { codex: { managedVersion: '' }, claude: { managedVersion: '' } });
+  assert.equal(reset.codex.managedVersion, undefined); assert.equal(reset.claude.managedVersion, undefined);
+  assert.equal(reset.codex.apiKey, 'private-key'); assert.equal(reset.claude.token, 'private-token');
+});
+
+for (const coder of ['codex', 'claude'] as const) {
+  test(`${coder} custom version reaches both packages and progress; stale packages never complete an install`, async t => {
+    const root = await mkdtemp(join(tmpdir(), 'nexus-version-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const layout = managedLayout(root), version = '1.2.3-rc.1';
+    let bad: 'main' | 'native' | undefined;
+    let configured = 0;
+    const installer = new CoderInstaller(layout, async () => {
+      const native = platformPackage(coder, host, version);
+      const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+      assert.equal(manifest.dependencies[MANAGED_PACKAGES[coder].name], version);
+      assert.equal(manifest.dependencies[native.name], native.spec);
+      await fakeManaged(root, coder, { version });
+      await rm(join(layout.markers, `${coder}.json`));
+      if (bad) await writeFile(join(layout.nodeModules, bad === 'main' ? MANAGED_PACKAGES[coder].name : native.name, 'package.json'), JSON.stringify({ version: '0.0.1' }));
+      return { code: 0 };
+    }, async () => { configured++; }, Date.now, host);
+    assert.throws(() => installer.start(coder, 'latest'), /invalid_managed_version/);
+    assert.equal(installer.progress(), undefined);
+    await installer.start(coder, version);
+    assert.equal(installer.progress()?.version, version);
+    assert.equal(installer.progress()?.phase, 'installed');
+    assert.equal((await readMarker(layout, coder))?.version, version);
+    for (bad of ['main', 'native'] as const) {
+      await installer.start(coder, version);
+      assert.equal(installer.progress()?.error, 'installed_version_mismatch');
+      assert.equal(await readMarker(layout, coder), undefined);
+    }
+    assert.equal(configured, 1);
+  });
+}
+
+test('install RPC uses the saved exact version and rejects stale or missing revisions before starting npm', async t => {
+  const m = await manager();
+  t.after(() => rm(m.root, { recursive: true, force: true }));
+  await m.manager.handle('save', { revision: 0, config: { codex: { managedVersion: '1.2.3' } } });
+  assert.equal(m.npmCalls.length, 0, 'saving a preference must not install anything');
+  await assert.rejects(m.manager.handle('install', { coder: 'codex' }), /invalid_revision/);
+  await assert.rejects(m.manager.handle('install', { coder: 'codex', revision: 0 }), /configuration_changed/);
+  assert.equal(m.npmCalls.length, 0);
+  await m.manager.handle('install', { coder: 'codex', revision: 1 });
+  await m.installer.whenDone();
+  assert.equal((await m.manager.view()).codex.managed.version, '1.2.3');
+  assert.equal(m.installer.progress()?.version, '1.2.3');
+});
+
+test('active coder tasks block version replacement and an install excludes both shared managed sources', async t => {
+  const m = await manager({ managedCodex: true, managedClaude: true });
+  t.after(() => rm(m.root, { recursive: true, force: true }));
+  m.manager.attach({ active: () => [{ coder: 'claude', status: 'running' }] } as unknown as CoderStore);
+  await assert.rejects(m.manager.handle('install', { coder: 'codex', revision: 0 }), /install_tasks_active/);
+  assert.equal(m.npmCalls.length, 0);
+  assert.equal((await readMarker(m.layout, 'codex'))?.version, MANAGED_PACKAGES.codex.version);
+  // Hold the selected installation while resolving runtime availability.
+  let finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const installer = new CoderInstaller(m.layout, async () => { await pending; return { code: 1 }; }, undefined, Date.now, host);
+  const instance = new CodersManager({ store: new CoderSettingsStore(new MemoryRecords()), layout: m.layout,
+    profileRoots: [m.root], installer, env: { PATH: '', HOME: m.root }, detect: { host, pluginSdk: async () => undefined } });
+  await instance.load();
+  const running = installer.start('codex');
+  try {
+    const view = await instance.view();
+    assert.equal(view.codex.active, 'none'); assert.equal(view.claude.active, 'none');
+    assert.match(view.codex.problem!, /托管安装正在进行/);
+    assert.match(view.claude.problem!, /托管安装正在进行/);
+  } finally { finish(); await running; }
 });

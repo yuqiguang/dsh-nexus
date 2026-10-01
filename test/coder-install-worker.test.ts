@@ -53,11 +53,11 @@ async function runWorker(path: string, cli: string, cwd: string, command = proce
   } finally { clearTimeout(guard); }
 }
 
-test('standalone worker installs via stock npm without DSH host modules and reuses verified downloads', async t => {
-  const r = await registry(t);
+for (const version of ['0.155.1', '1.2.3-rc.1']) test(`standalone worker installs ${version} via stock npm without DSH host modules and reuses verified downloads`, async t => {
+  const r = await registry(t, 'normal', version);
   const worker = await isolatedWorker(t);
   const project = join(r.root, 'project'); await mkdir(project);
-  await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'fixture-install', private: true, dependencies: { '@openai/codex': '0.155.1' } }));
+  await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'fixture-install', private: true, dependencies: { '@openai/codex': version } }));
   await writeFile(join(project, '.npmrc'), `registry=${r.url}\ncache=${dirname(r.cache)}\naudit=false\nfund=false\n`);
   await assert.rejects(readFile(join(worker.plugin, 'node_modules/@deepseek-ai/dsh-home-paths/package.json')), { code: 'ENOENT' });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -67,7 +67,7 @@ test('standalone worker installs via stock npm without DSH host modules and reus
     if (attempt) assert.ok(result.metrics.some(item => item && 'state' in item && item.state === 'cached' && item.bytesPerSecond === 0));
     assert.equal(result.metrics.at(-1), null);
     assert.equal(r.tarRequests(), 1, 'npm and subsequent attempts must reuse the verified tarball');
-    assert.equal(JSON.parse(await readFile(join(project, 'node_modules/@openai/codex/package.json'), 'utf8')).version, '0.155.1');
+    assert.equal(JSON.parse(await readFile(join(project, 'node_modules/@openai/codex/package.json'), 'utf8')).version, version);
   }
 });
 

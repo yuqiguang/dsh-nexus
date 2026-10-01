@@ -2,6 +2,7 @@ import { isAbsolute, resolve } from 'node:path';
 import type { Records } from '../channels/records.js';
 import { ChannelError } from '../channels/types.js';
 import type { CoderKind } from './types.js';
+import { isManagedVersion } from './install-shared.js';
 
 /** Where a coder's binaries come from: the copy Nexus installs itself, or whatever the machine already has. */
 export type CoderSecurityMode = 'standard' | 'strict';
@@ -11,6 +12,8 @@ export type CodexWireApi = 'responses' | 'chat';
 
 export interface CodexSettings {
   source: CoderSource;
+  /** Empty/absent follows the plugin recommendation; an exact version pins future installs only. */
+  managedVersion?: string;
   model?: string;
   /** Compatible endpoint; empty means the official OpenAI API. Applies to the managed install only. */
   baseUrl?: string;
@@ -21,6 +24,8 @@ export interface CodexSettings {
 
 export interface ClaudeSettings {
   source: CoderSource;
+  /** Empty/absent follows the plugin recommendation; an exact version pins future installs only. */
+  managedVersion?: string;
   model?: string;
   /** Compatible endpoint; empty means the official Anthropic API. */
   baseUrl?: string;
@@ -106,6 +111,12 @@ function optional(value: unknown, max: number): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function managedVersion(value: unknown): { managedVersion?: string } {
+  if (value === undefined || value === '') return {};
+  if (!isManagedVersion(value)) throw new ChannelError('invalid_managed_version');
+  return { managedVersion: value };
+}
+
 function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   if (value === undefined || value === null || value === '') return fallback;
   if (!allowed.includes(value as T)) throw new ChannelError('invalid_configuration');
@@ -148,6 +159,9 @@ function decode(raw: unknown): CoderSettingsRecord | undefined {
     || !SOURCES.includes(value.codex.source) || !SOURCES.includes(value.claude.source) || !HEADERS.includes(value.claude.authHeader)
     || (value.roots !== undefined && (!Array.isArray(value.roots) || !value.roots.every(root => typeof root === 'string')))) {
     throw new ChannelError('invalid_saved_record');
+  }
+  for (const coder of ['codex', 'claude'] as const) {
+    if (value[coder].managedVersion !== undefined && !isManagedVersion(value[coder].managedVersion)) throw new ChannelError('invalid_saved_record');
   }
   if (value.securityMode !== undefined && !['standard', 'strict'].includes(value.securityMode)) throw new ChannelError('invalid_saved_record');
   if (value.projectRoot !== undefined && (typeof value.projectRoot !== 'string' || !isAbsolute(value.projectRoot))) throw new ChannelError('invalid_saved_record');
@@ -201,6 +215,7 @@ export class CoderSettingsStore {
       ...(rootsInput(input.roots) ? { roots: rootsInput(input.roots) } : {}),
       codex: {
         source: oneOf(codexInput.source, SOURCES, previous.codex.source),
+        ...managedVersion(codexInput.managedVersion === undefined ? previous.codex.managedVersion : codexInput.managedVersion),
         ...(optional(codexInput.model, 128) ? { model: optional(codexInput.model, 128) } : {}),
         ...(endpointUrl(codexInput.baseUrl) ? { baseUrl: endpointUrl(codexInput.baseUrl) } : {}),
         ...(optional(codexInput.wireApi, 16) ? { wireApi: oneOf(codexInput.wireApi, WIRE_APIS, 'responses') } : {}),
@@ -208,6 +223,7 @@ export class CoderSettingsStore {
       },
       claude: {
         source: oneOf(claudeInput.source, SOURCES, previous.claude.source),
+        ...managedVersion(claudeInput.managedVersion === undefined ? previous.claude.managedVersion : claudeInput.managedVersion),
         ...(optional(claudeInput.model, 128) ? { model: optional(claudeInput.model, 128) } : {}),
         ...(endpointUrl(claudeInput.baseUrl) ? { baseUrl: endpointUrl(claudeInput.baseUrl) } : {}),
         authHeader: oneOf(claudeInput.authHeader, HEADERS, previous.claude.authHeader),

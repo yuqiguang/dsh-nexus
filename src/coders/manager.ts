@@ -218,7 +218,7 @@ export class CodersManager {
 
   /** A source counts only when its install is complete and no install of that coder is running right now. */
   private pick(coder: CoderKind, preferred: CoderSource, detection: CoderDetection): { active: CoderSource | 'none'; fallback: boolean } {
-    const usable = (source: CoderSource) => detection[source].installed && !(source === 'managed' && this.deps.installer.installing() === coder);
+    const usable = (source: CoderSource) => detection[source].installed && !(source === 'managed' && this.deps.installer.installing() !== undefined);
     if (usable(preferred)) return { active: preferred, fallback: false };
     const other: CoderSource = preferred === 'managed' ? 'system' : 'managed';
     return usable(other) ? { active: other, fallback: true } : { active: 'none', fallback: false };
@@ -261,7 +261,7 @@ export class CodersManager {
     const claudePlatformProblem = coderPlatformProblem('claude', platform, securityMode);
     const codexPick = this.pick('codex', settings.codex.source, detection.codex);
     let codex: EffectiveRuntime['codex'];
-    if (codexPick.active === 'none') codex = { error: 'Codex 尚未安装。请在设置页的“编码工具”里安装，或在本机安装 codex 命令。' };
+    if (codexPick.active === 'none') codex = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。' : 'Codex 尚未安装。请在设置页的“编码工具”里安装，或在本机安装 codex 命令。' };
     else if (codexPlatformProblem) codex = { error: codexPlatformProblem };
     else {
       if (codexPick.active === 'managed') await this.ensureCodexHome(settings);
@@ -275,7 +275,7 @@ export class CodersManager {
     }
     const claudePick = this.pick('claude', settings.claude.source, detection.claude);
     let claude: EffectiveRuntime['claude'];
-    if (claudePick.active === 'none') claude = { error: this.deps.installer.installing() === 'claude' ? 'Claude Code 的托管安装正在进行，请等它完成。'
+    if (claudePick.active === 'none') claude = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。'
       : 'Claude Code 不可用：既没有完成的托管安装，插件自带的 SDK 也没有可用的 claude 命令或匹配本机的二进制。请在设置页的“编码工具”里安装。' };
     else if (claudePlatformProblem) claude = { error: claudePlatformProblem };
     else {
@@ -376,11 +376,15 @@ export class CodersManager {
     } else if (method === 'install') {
       const coder = input.coder;
       if (coder !== 'codex' && coder !== 'claude') throw new ChannelError('invalid_configuration');
-      try { void this.deps.installer.start(coder); }
-      catch { throw new ChannelError('install_in_progress'); }
+      if (!Number.isSafeInteger(input.revision) || (input.revision as number) < 0) throw new ChannelError('invalid_revision');
+      const settings = await this.load();
+      if (input.revision !== settings.revision) throw new ChannelError('configuration_changed');
+      if (this.tasks?.active().length || this.settingUpSandbox) throw new ChannelError('install_tasks_active');
+      if (this.deps.installer.installing()) throw new ChannelError('install_in_progress');
+      void this.deps.installer.start(coder, settings[coder].managedVersion);
       void this.deps.installer.whenDone().then(() => { this.detection = undefined; });
     } else if (method === 'windows-sandbox/setup') {
-      if ((this.deps.detect?.host?.platform ?? process.platform) !== 'win32' || this.settingUpSandbox || this.tasks?.active().length) throw new ChannelError('sandbox_setup_unavailable');
+      if ((this.deps.detect?.host?.platform ?? process.platform) !== 'win32' || this.deps.installer.installing() || this.settingUpSandbox || this.tasks?.active().length) throw new ChannelError('sandbox_setup_unavailable');
       const settings = this.settings ?? await this.load();
       const detected = await this.detected();
       const pick = this.pick('codex', settings.codex.source, detected.codex);

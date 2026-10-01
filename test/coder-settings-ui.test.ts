@@ -168,8 +168,8 @@ test('the coder settings page shows status, saves every field while clearing typ
   assert.equal(save.payload.config.securityMode, 'strict');
   assert.equal(save.payload.config.maxConcurrent, 3);
   assert.equal(save.payload.config.roots, '/srv/a\n/srv/b');
-  assert.deepEqual(save.payload.config.codex, { source: 'system', model: 'gpt-x', baseUrl: '', wireApi: 'responses', apiKey: 'codex-typed-secret' });
-  assert.deepEqual(save.payload.config.claude, { source: 'managed', model: 'deepseek-flash', baseUrl: 'https://api.deepseek.com/anthropic', authHeader: 'auth-token', token: 'claude-typed-secret' });
+  assert.deepEqual(save.payload.config.codex, { managedVersion: '', source: 'system', model: 'gpt-x', baseUrl: '', wireApi: 'responses', apiKey: 'codex-typed-secret' });
+  assert.deepEqual(save.payload.config.claude, { managedVersion: '', source: 'managed', model: 'deepseek-flash', baseUrl: 'https://api.deepseek.com/anthropic', authHeader: 'auth-token', token: 'claude-typed-secret' });
   assert.equal((ui.field('codex-key') as HTMLInputElement).value, '');
   assert.equal((ui.field('claude-token') as HTMLInputElement).value, '');
   assert.equal(ui.field('coders-concurrency').value, '3');
@@ -180,7 +180,7 @@ test('the coder settings page shows status, saves every field while clearing typ
   assert.equal(second.payload.config.maxConcurrent, 3);
   assert.equal('apiKey' in second.payload.config.codex, false, 'an untouched secret field is not resent');
   await ui.click('安装托管版本');
-  assert.deepEqual(calls.at(-1), { method: 'install', payload: { coder: 'codex' } });
+  assert.deepEqual(calls.at(-1), { method: 'install', payload: { coder: 'codex', revision: 2 } });
   assert.match(ui.text(), /Codex 托管安装：进行中/);
   await ui.click('删除');
   assert.deepEqual(calls.at(-1), { method: 'rules/remove', payload: { id: 'cr-1' } });
@@ -215,7 +215,7 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   assert.equal(claude.querySelector('progress'), null);
   assert.equal((codex.querySelector('footer button') as HTMLButtonElement).textContent, '正在安装…');
   await act(async () => { (claude.querySelector('footer button') as HTMLButtonElement).click(); });
-  assert.deepEqual(installs, [{ coder: 'codex' }], 'disabled controls must not enqueue a second installer');
+  assert.deepEqual(installs, [{ coder: 'codex', revision: 0 }], 'disabled controls must not enqueue a second installer');
   view.install = { ...view.install!, stage: 'verifying', lastOutputAt: Date.now(), log: 'npm http fetch GET 200 https://registry.npmjs.org/@openai/codex 100ms\nadded 2 packages\n' };
   await act(async () => { await delay(1700); });
   assert.match(codex.textContent!, /检查程序文件/);
@@ -233,7 +233,7 @@ test('managed install gives immediate local feedback then polls stage, logs and 
   assert.equal((claude.querySelector('footer button') as HTMLButtonElement).disabled, false);
   assert.equal(claude.querySelector('footer button')!.textContent, '安装托管版本');
   assert.doesNotMatch(claude.textContent!, /不会自动排队/);
-  assert.deepEqual(installs, [{ coder: 'codex' }], 'the second tool still requires an explicit click');
+  assert.deepEqual(installs, [{ coder: 'codex', revision: 0 }], 'the second tool still requires an explicit click');
 });
 
 test('reopening settings shows an existing Claude install, refresh failures and timeout with retry', async t => {
@@ -318,3 +318,45 @@ test('a settings revision changed elsewhere blocks saving until the page reloads
   await ui.click('重新载入');
   assert.equal(save.disabled, false);
 });
+
+for (const coder of ['codex', 'claude'] as const) {
+  test(`${coder} version choice survives polling, requires save before install, and restores the recommendation`, async t => {
+    let view = initial();
+    view[coder].managed = { installed: true, version: '0.0.1' };
+    const calls: { method: string; payload: any }[] = [];
+    const ui = await page(t, async (method, payload: any) => {
+      calls.push({ method, payload });
+      if (method === 'save') view.settings = { ...view.settings, revision: view.settings.revision + 1,
+        [coder]: { ...view.settings[coder], managedVersion: payload.config[coder].managedVersion || undefined } };
+      if (method === 'install') view.install = { coder, version: view.settings[coder].managedVersion, phase: 'installed', startedAt: 1, log: '' };
+      return structuredClone(view);
+    });
+    const card = () => ui.field(`${coder}-source`).closest('article')!;
+    const install = () => card().querySelector('footer button') as HTMLButtonElement;
+    assert.equal(ui.field(`${coder}-version-choice`).value, 'recommended');
+    await ui.enter(`${coder}-version-choice`, 'custom');
+    await ui.enter(`${coder}-managed-version`, 'latest');
+    await ui.submit();
+    assert.equal(calls.some(call => call.method === 'save'), false);
+    assert.equal(install().disabled, true);
+    await ui.enter(`${coder}-managed-version`, '1.2.3-rc.1');
+    await act(async () => { await delay(1550); });
+    assert.equal(ui.field(`${coder}-managed-version`).value, '1.2.3-rc.1');
+    assert.match(card().textContent!, /托管安装：0.0.1/);
+    assert.match(card().textContent!, /待安装版本：1.2.3-rc.1/);
+    assert.match(card().textContent!, /请先保存设置/);
+    await act(async () => { install().click(); });
+    assert.equal(calls.some(call => call.method === 'install'), false);
+    await ui.submit();
+    assert.equal(calls.find(call => call.method === 'save')?.payload.config[coder].managedVersion, '1.2.3-rc.1');
+    assert.equal(install().disabled, false);
+    await act(async () => { install().click(); });
+    assert.deepEqual(calls.find(call => call.method === 'install')?.payload, { coder, revision: 1 });
+    assert.match(card().textContent!, /本次安装版本：1.2.3-rc.1/);
+    await ui.enter(`${coder}-version-choice`, 'recommended');
+    await ui.submit();
+    assert.equal(calls.filter(call => call.method === 'save').at(-1)?.payload.config[coder].managedVersion, '');
+    assert.equal(ui.field(`${coder}-managed-version`), null);
+    assert.equal(calls.filter(call => call.method === 'install').length, 1, 'restoring the recommendation must not replace an install');
+  });
+}

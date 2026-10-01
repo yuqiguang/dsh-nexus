@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { CodersView, CoderStatusView } from '../coders/manager.js';
 import type { InstallProgress, InstallStatus } from '../coders/install.js';
+import { MANAGED_PACKAGES, isManagedVersion } from '../coders/install-shared.js';
 import { explain } from './ChannelSettings.js';
 
 export interface CoderNavigation { openTask(id: string): void }
@@ -30,17 +31,43 @@ const problems: Record<string, string> = { binary_missing: '缺少可执行文�
   install_incomplete: '安装未完成', claude_cli_missing: '缺少 claude 命令和匹配本机的内置二进制',
   windows_launcher_unsupported: '检测到命令包装脚本，但无法定位 Windows 原生程序；请使用托管安装' };
 
+interface VersionDraft { managedVersion: string; versionChoice: 'recommended' | 'custom' }
+
 interface Draft {
   revision: number; defaultCoder: 'codex' | 'claude'; roots: string; maxTaskMinutes: number; maxConcurrent: number; autoApproveSafe: boolean; securityMode: 'standard' | 'strict'; allowedNetworkDomains: string;
-  codex: { source: 'managed' | 'system'; model: string; baseUrl: string; wireApi: 'responses' | 'chat'; apiKey: string };
-  claude: { source: 'managed' | 'system'; model: string; baseUrl: string; authHeader: 'auth-token' | 'api-key'; token: string };
+  codex: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; wireApi: 'responses' | 'chat'; apiKey: string };
+  claude: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; authHeader: 'auth-token' | 'api-key'; token: string };
 }
 
 function fromView(view: CodersView): Draft {
   const { settings } = view;
   return { securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, roots: (settings.roots ?? []).join('\n'), maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: settings.maxConcurrent ?? 2, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: (settings.allowedNetworkDomains ?? ['registry.npmjs.org']).join('\n'),
-    codex: { source: settings.codex.source, model: settings.codex.model ?? '', baseUrl: settings.codex.baseUrl ?? '', wireApi: settings.codex.wireApi ?? 'responses', apiKey: '' },
-    claude: { source: settings.claude.source, model: settings.claude.model ?? '', baseUrl: settings.claude.baseUrl ?? '', authHeader: settings.claude.authHeader, token: '' } };
+    codex: { managedVersion: settings.codex.managedVersion ?? '', versionChoice: settings.codex.managedVersion ? 'custom' : 'recommended', source: settings.codex.source, model: settings.codex.model ?? '', baseUrl: settings.codex.baseUrl ?? '', wireApi: settings.codex.wireApi ?? 'responses', apiKey: '' },
+    claude: { managedVersion: settings.claude.managedVersion ?? '', versionChoice: settings.claude.managedVersion ? 'custom' : 'recommended', source: settings.claude.source, model: settings.claude.model ?? '', baseUrl: settings.claude.baseUrl ?? '', authHeader: settings.claude.authHeader, token: '' } };
+}
+
+function ManagedVersion({ coder, value, disabled, change }: {
+  coder: 'codex' | 'claude'; value: VersionDraft; disabled: boolean; change(value: VersionDraft): void;
+}) {
+  const recommended = MANAGED_PACKAGES[coder].version;
+  const custom = value.versionChoice === 'custom';
+  const invalid = custom && !isManagedVersion(value.managedVersion.trim());
+  return <div>
+    <label htmlFor={`${coder}-version-choice`}>{coder === 'claude' ? '托管版本（Agent SDK）' : '托管版本'}</label>
+    <select id={`${coder}-version-choice`} value={value.versionChoice} disabled={disabled}
+      onChange={event => change({ ...value, versionChoice: event.target.value as VersionDraft['versionChoice'] })}>
+      <option value="recommended">推荐版本 {recommended}</option><option value="custom">指定版本</option>
+    </select>
+    {custom && <>
+      <label htmlFor={`${coder}-managed-version`}>指定{coder === 'claude' ? ' Agent SDK ' : ''}版本号</label>
+      <input id={`${coder}-managed-version`} maxLength={96} value={value.managedVersion} disabled={disabled} autoComplete="off"
+        placeholder={recommended} aria-invalid={invalid} onChange={event => change({ ...value, managedVersion: event.target.value })} />
+      <p className="nexus-channel-hint">其他版本尚未通过本插件的兼容性验证；如遇运行问题，可切回推荐版本并重新安装。</p>
+      {invalid && <p role="alert">{explain('invalid_managed_version')}</p>}
+    </>}
+    {coder === 'claude' && <p className="nexus-channel-hint">这里选择 Agent SDK 及配套程序版本，与 Claude Code 命令显示的版本号不同。</p>}
+    <p className="nexus-channel-hint">待安装版本：{custom ? value.managedVersion.trim() || '请填写' : recommended}。保存设置后点击安装才会替换托管程序，使用推荐版本也不会自动升级。</p>
+  </div>;
 }
 
 function Install({ label, status }: { label: string; status: InstallStatus }) {
@@ -73,6 +100,10 @@ function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12
 
 const installStages = { preparing: '准备安装', downloading: '下载程序包', packages: '安装依赖', verifying: '检查程序文件', configuring: '写入配置' };
 const installFailures: Record<string, string> = {
+  installed_version_mismatch: '安装文件的版本与目标版本不一致，请重新安装。',
+  installed_sdk_missing: '缺少 Agent SDK 入口文件，请重新安装。',
+  E404: '下载源没有此版本或对应的平台包，请检查版本号或切回推荐版本。',
+  ETARGET: '下载源没有此版本或对应的平台包，请检查版本号或切回推荐版本。',
   ERR_MODULE_NOT_FOUND: '安装子进程缺少运行依赖，请更新或重新安装 Nexus 插件后重试。',
   MODULE_NOT_FOUND: '安装子进程缺少运行依赖，请更新或重新安装 Nexus 插件后重试。',
   npm_start_failed: '无法启动 npm，请检查本机 Node.js 和 npm 安装。',
@@ -108,6 +139,7 @@ function InstallActivity({ progress, readError }: { progress: InstallProgress; r
     <p role={progress.phase === 'failed' ? 'alert' : 'status'}>
       {names[progress.coder]} 托管安装：{active ? `进行中 · ${installStages[progress.stage ?? 'packages']}` : progress.phase === 'installed' ? '已完成' : `失败：${failure ?? '请查看安装日志'}`}
     </p>
+    {progress.version && <p>本次安装版本：{progress.version}</p>}
     {active && <progress aria-label={`${names[progress.coder]} 托管安装进度`}
       {...(network && download.total ? { value: download.bytes, max: download.total } : {})} />}
     {download && <div className="nexus-download-progress">
@@ -173,29 +205,32 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
     return <section className="nexus-channel-settings" aria-label="编码工具"><h2>编码工具</h2>
       {readError ? <p role="alert" className="nexus-channel-error">{readError}</p> : <p role="status">正在读取编码工具设置…</p>}</section>;
   }
+  const invalidVersion = [draft.codex, draft.claude].some(value => value.versionChoice === 'custom' && !isManagedVersion(value.managedVersion.trim()));
   const stale = dirty && draft.revision !== view.settings.revision;
   const edit = (change: (draft: Draft) => Draft) => { setDirty(true); setDraft(previous => previous && change(previous)); };
   const reload = () => { setDraft(fromView(view)); setDirty(false); };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (invalidVersion || stale) return;
     const { codex, claude } = draft;
     if (await action('save', { revision: draft.revision, config: { defaultCoder: draft.defaultCoder, securityMode: draft.securityMode, roots: draft.roots, maxTaskMinutes: draft.maxTaskMinutes, maxConcurrent: draft.maxConcurrent, autoApproveSafe: draft.autoApproveSafe, allowedNetworkDomains: draft.allowedNetworkDomains,
-      codex: { source: codex.source, model: codex.model, baseUrl: codex.baseUrl, wireApi: codex.wireApi, ...(codex.apiKey ? { apiKey: codex.apiKey } : {}) },
-      claude: { source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
+      codex: { managedVersion: codex.versionChoice === 'custom' ? codex.managedVersion.trim() : '', source: codex.source, model: codex.model, baseUrl: codex.baseUrl, wireApi: codex.wireApi, ...(codex.apiKey ? { apiKey: codex.apiKey } : {}) },
+      claude: { managedVersion: claude.versionChoice === 'custom' ? claude.managedVersion.trim() : '', source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
   };
   const installing = view.install?.phase === 'installing';
   const activeInstall = startingInstall ?? (installing ? view.install?.coder : undefined);
   const startInstall = async (coder: 'codex' | 'claude') => {
     setStartingInstall(coder); setInstallRequestFailed(undefined);
-    const confirmed = await action('install', { coder });
+    const confirmed = await action('install', { coder, revision: view.settings.revision });
     setStartingInstall(undefined);
     if (!confirmed) setInstallRequestFailed({ coder, previousStart: view.install?.startedAt });
   };
   const installButton = (coder: 'codex' | 'claude', status: CoderStatusView) =>
-    <button type="button" disabled={busy || installing} onClick={() => void startInstall(coder)}>
+    <button type="button" disabled={busy || installing || dirty || stale} onClick={() => void startInstall(coder)}>
       {startingInstall === coder ? '正在启动安装…' : installing && view.install?.coder === coder ? '正在安装…' : activeInstall ? `请先等待 ${names[activeInstall]} 安装结束` : status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
   const installActivity = (coder: 'codex' | 'claude') => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
     : <>
+      {dirty && <p className="nexus-channel-hint">请先保存设置，再安装所选版本。</p>}
       {activeInstall && activeInstall !== coder && <p className="nexus-channel-hint" role="status">正在安装 {names[activeInstall]}，一次只能安装一个工具。结束后请再点击安装 {names[coder]}，不会自动排队。</p>}
       {installRequestFailed?.coder === coder && error && <p role="alert">安装请求未能确认：{error}。请等待状态刷新后再决定是否重试。</p>}
       {view.install?.coder === coder && <InstallActivity progress={view.install} readError={readError} />}
@@ -247,6 +282,8 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           <option value="managed">Nexus 托管（使用下方的端点和 API key）</option><option value="system">系统安装（沿用本机 Codex 的登录和配置）</option></select>
         <p className="nexus-channel-hint">系统安装使用 DSH 所在电脑当前用户的 Codex 配置，默认目录为 <code>{view.platform === 'win32' ? '%USERPROFILE%\\.codex' : '~/.codex'}</code>；若 DSH 启动环境设置了 CODEX_HOME，则使用指定目录。托管安装使用 Nexus 独立配置目录。Windows 与 WSL 的配置分别保存。</p>
 
+        <ManagedVersion coder="codex" value={draft.codex} disabled={busy || installing}
+          change={value => edit(d => ({ ...d, codex: { ...d.codex, ...value } }))} />
         <label htmlFor="codex-model">模型（可选）</label>
         <input id="codex-model" maxLength={128} value={draft.codex.model} disabled={busy} autoComplete="off" placeholder="留空用 Codex 默认"
           onChange={event => edit(d => ({ ...d, codex: { ...d.codex, model: event.target.value } }))} />
@@ -277,6 +314,8 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
         <select id="claude-source" value={draft.claude.source} disabled={busy} onChange={event => edit(d => ({ ...d, claude: { ...d.claude, source: event.target.value as 'managed' | 'system' } }))}>
           <option value="managed">Nexus 托管的 Claude Code</option><option value="system">系统安装（使用本机可用的 Claude Code）</option></select>
         <p className="nexus-channel-hint">来源决定使用哪个程序。两种来源均使用下方的端点和凭据，以及 Nexus 专用配置目录；不会自动沿用终端中 Claude Code 的登录。</p>
+        <ManagedVersion coder="claude" value={draft.claude} disabled={busy || installing}
+          change={value => edit(d => ({ ...d, claude: { ...d.claude, ...value } }))} />
         <label htmlFor="claude-model">模型（可选）</label>
         <input id="claude-model" maxLength={128} value={draft.claude.model} disabled={busy} autoComplete="off" placeholder="例如 deepseek-flash"
           onChange={event => edit(d => ({ ...d, claude: { ...d.claude, model: event.target.value } }))} />
@@ -301,7 +340,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
       </article>
       {stale && <p role="alert">{explain('configuration_changed')} <button type="button" onClick={reload}>重新载入</button></p>}
       <footer className="nexus-channel-card" style={{ borderStyle: 'none', paddingTop: 0 }}>
-        <button type="submit" className="primary" disabled={busy || stale}>保存设置</button>
+        <button type="submit" className="primary" disabled={busy || stale || invalidVersion}>保存设置</button>
         {dirty && <button type="button" disabled={busy} onClick={reload}>放弃修改</button>}
       </footer>
     </form>

@@ -57,6 +57,8 @@ test('Windows managed installs require the native executable; an npm shim alone 
   assert.equal(installer.progress()?.phase, 'failed');
   assert.equal(await readMarker(layout, 'codex'), undefined);
   await file(binary);
+  await file(join(layout.nodeModules, '@openai/codex/package.json'), JSON.stringify({ version: MANAGED_PACKAGES.codex.version }));
+  await file(join(layout.nodeModules, '@openai/codex-win32-x64/package.json'), JSON.stringify({ version: `${MANAGED_PACKAGES.codex.version}-win32-x64` }));
   await installer.start('codex');
   assert.equal(installer.progress()?.phase, 'installed');
   const detected = await detectCodex(layout, { host: windows, env: { Path: '' } });

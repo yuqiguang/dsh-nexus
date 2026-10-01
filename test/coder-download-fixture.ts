@@ -9,11 +9,11 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 
-export async function registry(t: TestContext, mode: 'normal' | 'unknown-size' | 'corrupt' | 'reset-once' | 'hanging' = 'normal') {
+export async function registry(t: TestContext, mode: 'normal' | 'unknown-size' | 'corrupt' | 'reset-once' | 'hanging' = 'normal', version = '0.155.1') {
   const root = await mkdtemp(join(tmpdir(), 'nexus-download-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(join(root, 'fixture/package'), { recursive: true });
-  await writeFile(join(root, 'fixture/package/package.json'), JSON.stringify({ name: '@openai/codex', version: '0.155.1' }));
+  await writeFile(join(root, 'fixture/package/package.json'), JSON.stringify({ name: '@openai/codex', version }));
   await writeFile(join(root, 'fixture/package/data'), randomBytes(192 * 1024));
   const archive = join(root, 'fixture.tgz');
   await exec('tar', ['-czf', archive, '-C', join(root, 'fixture'), 'package']);
@@ -22,11 +22,11 @@ export async function registry(t: TestContext, mode: 'normal' | 'unknown-size' |
   let tarRequests = 0, authed = false;
   const server = createServer((request, response) => {
     authed ||= request.headers.authorization === 'Bearer fixture-secret';
-    const manifest = { name: '@openai/codex', version: '0.155.1', dist: { tarball: `${url}/package.tgz`, integrity } };
+    const manifest = { name: '@openai/codex', version, dist: { tarball: `${url}/package.tgz`, integrity } };
     response.setHeader('cache-control', 'public, max-age=3600');
     if (request.url !== '/package.tgz') {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify(request.url?.includes('/0.155.1') ? manifest : { name: '@openai/codex', 'dist-tags': { latest: '0.155.1' }, versions: { '0.155.1': manifest } }));
+      response.end(JSON.stringify(request.url?.includes('/' + version) ? manifest : { name: '@openai/codex', 'dist-tags': { latest: version }, versions: { [version]: manifest } }));
       return;
     }
     tarRequests++;

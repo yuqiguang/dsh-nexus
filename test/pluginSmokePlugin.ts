@@ -252,10 +252,17 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.equal(coders.result.value.settings.revision, 0);
         assert.equal(coders.result.value.project, undefined);
         assert.equal(coders.result.value.workspaces, undefined);
-        const saved = await (await coderRequest('save', { revision: 0, config: { maxConcurrent: 1 } })).json();
+        const saved = await (await coderRequest('save', { revision: 0, config: { maxConcurrent: 1, codex: { managedVersion: '1.2.3-rc.1' }, claude: { managedVersion: '0.3.200' } } })).json();
         assert.equal(saved.result.ok, true, saved.result.error?.code);
         assert.deepEqual(saved.result.value.effectiveRoots, coders.result.value.effectiveRoots);
         checks.push('packaged_tools_need_no_duplicate_project_selection');
+        assert.equal(saved.result.value.settings.codex.managedVersion, '1.2.3-rc.1');
+        assert.equal(saved.result.value.settings.claude.managedVersion, '0.3.200');
+        const invalid = await (await coderRequest('save', { revision: 1, config: { codex: { managedVersion: 'latest' } } })).json();
+        assert.equal(invalid.result.error?.code, 'invalid_managed_version');
+        const stale = await (await coderRequest('install', { coder: 'codex', revision: 0 })).json();
+        assert.equal(stale.result.error?.code, 'configuration_changed');
+        checks.push('packaged_version_selection_validated_without_install');
         checks.push('tarball_bundle_activates', 'host_module_identity', 'packaged_client_loads', 'packaged_settings_save_redacted', 'packaged_coder_settings_route');
       } else {
         assert.equal(result.result.value.connections.find((item: { channel: string }) => item.channel === 'feishu').revision, 1);
@@ -263,6 +270,9 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.equal(coders.result.ok, true, coders.result.error?.code);
         assert.equal(coders.result.value.settings.revision, 1);
         assert.equal(coders.result.value.settings.maxConcurrent, 1);
+        assert.equal(coders.result.value.settings.codex.managedVersion, '1.2.3-rc.1');
+        assert.equal(coders.result.value.settings.claude.managedVersion, '0.3.200');
+        checks.push('managed_version_preferences_survive_restart');
         assert.equal(coders.result.value.project, undefined);
         checks.push('coder_settings_survive_restart_without_project_selection');
         checks.push(config.phase === 9 ? 'desktop_carrier_settings_restored' : 'installed_plugin_restart_restores_settings');
