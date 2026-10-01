@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 import type { Readable } from 'node:stream';
-import { MANAGED_PACKAGES, safeDownloadUrl } from './install.js';
+import { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
 
 export interface DownloadProgress {
   package: string;

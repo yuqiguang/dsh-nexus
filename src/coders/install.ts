@@ -8,13 +8,8 @@ import type { CoderKind } from './types.js';
 import type { CodexSettings } from './settings.js';
 import { redact } from './normalize.js';
 import type { DownloadProgress } from './install-download.js';
-
-/** Versions Nexus installs for itself; bump deliberately and rerun the adapter tests. */
-export const MANAGED_PACKAGES: Record<CoderKind, { name: string; version: string }> = {
-  // 0.155.0-alpha and 0.155.0 fail to build the bubblewrap sandbox when Docker leaves `net:[…]` nsfs mounts in mountinfo (WSL, 2026-09-20); 0.155.1 handles them.
-  codex: { name: '@openai/codex', version: '0.155.1' },
-  claude: { name: '@anthropic-ai/claude-agent-sdk', version: '0.3.273' },
-};
+import { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
+export { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
 
 /** Environment variable the generated Codex provider reads its key from. */
 export const CODEX_KEY_ENV = 'NEXUS_CODEX_API_KEY';
@@ -357,7 +352,7 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
           try {
             const value = JSON.parse(line) as (DownloadProgress & { error?: string }) | null;
             if (value === null) onDownload?.();
-            else if (typeof value.error === 'string' && /^(?:E[A-Z0-9_]+|ERR_[A-Z_]+|download_[a-z_]+|npm_launcher_missing)$/.test(value.error)) workerError = value.error;
+            else if (typeof value.error === 'string' && /^(?:E[A-Z0-9_]+|ERR_[A-Z_]+|download_[a-z_]+|npm_launcher_missing|npm_start_failed|MODULE_NOT_FOUND)$/.test(value.error)) workerError = value.error;
             else if (typeof value.package === 'string' && value.package.length <= 200
               && ['connecting', 'downloading', 'cached', 'retrying', 'verified'].includes(value.state)
               && [value.bytes, value.bytesPerSecond, value.attempt, value.total ?? 0].every(n => Number.isFinite(n) && n >= 0)) {
@@ -382,22 +377,6 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
 
 const INSTALL_TIMEOUT_MS = 60 * 60_000;
 const LOG_LIMIT = 4096;
-
-const PUBLIC_NPM_REGISTRIES = new Set(['registry.npmjs.org', 'registry.npmmirror.com', 'registry.yarnpkg.com']);
-
-export function safeDownloadUrl(raw: string): string {
-  try {
-    const url = new URL(raw);
-    const path = decodeURIComponent(url.pathname);
-    // Only retain standard public registry package paths. Custom mirrors/CDNs may
-    // put signatures in the path itself, so their origin is the useful safe part.
-    const publicPath = PUBLIC_NPM_REGISTRIES.has(url.hostname) && !url.port
-      && /^\/(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:\/-\/[a-z0-9][a-z0-9._-]*\.tgz)?\/?$/.test(path);
-    return url.origin + (publicPath ? path : path === '/' ? '/' : '/[路径已隐藏]')
-      + (url.search || url.hash ? ' [参数已隐藏]' : '')
-      + (url.username || url.password ? ' [认证信息已隐藏]' : '');
-  } catch { return '[下载地址已隐藏]'; }
-}
 
 function safeInstallText(text: string): string {
   return redact(text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')

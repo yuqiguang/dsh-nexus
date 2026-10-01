@@ -55,6 +55,9 @@ function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12
 
 const installStages = { preparing: '准备安装', downloading: '下载程序包', packages: '安装依赖', verifying: '检查程序文件', configuring: '写入配置' };
 const installFailures: Record<string, string> = {
+  ERR_MODULE_NOT_FOUND: '安装子进程缺少运行依赖，请更新或重新安装 Nexus 插件后重试。',
+  MODULE_NOT_FOUND: '安装子进程缺少运行依赖，请更新或重新安装 Nexus 插件后重试。',
+  npm_start_failed: '无法启动 npm，请检查本机 Node.js 和 npm 安装。',
   install_timeout: '下载或安装超时，请检查网络或代理后重试。', ECONNRESET: '下载连接被重置，请检查网络或代理后重试。',
   ETIMEDOUT: '连接下载源超时，请检查网络或代理。', ENOTFOUND: '无法解析下载源的域名。',
   EAI_AGAIN: '暂时无法解析下载源的域名。', ECONNREFUSED: '下载源或代理拒绝连接。',
