@@ -208,6 +208,76 @@ test('the coder settings page shows status, saves every field while clearing typ
   assert.deepEqual(calls.at(-1), { method: 'clear-secret', payload: { coder: 'claude', revision: 2 } });
 });
 
+test('managed install gives immediate local feedback then polls stage, logs and completion', async t => {
+  let view = initial();
+  let confirm!: (view: CodersView) => void;
+  const request = new Promise<CodersView>(resolve => { confirm = resolve; });
+  const ui = await page(t, async method => method === 'install' ? request : structuredClone(view));
+  const codex = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Codex')!;
+  const claude = [...ui.dom.window.document.querySelectorAll('article')].find(card => card.querySelector('h3')?.textContent === 'Claude Code')!;
+  await ui.click('安装托管版本');
+  assert.match(codex.textContent!, /正在启动 Codex 托管安装/);
+  assert.equal((codex.querySelector('footer button') as HTMLButtonElement).textContent, '正在启动安装…');
+  assert.equal((claude.querySelector('footer button') as HTMLButtonElement).disabled, true);
+  view = { ...view, install: { coder: 'codex', phase: 'installing', stage: 'packages', startedAt: Date.now() - 65_000, log: '' } };
+  await act(async () => confirm(structuredClone(view)));
+  assert.match(codex.textContent!, /下载并安装依赖/);
+  assert.match(codex.textContent!, /已用时 1 分/);
+  assert.match(codex.textContent!, /暂时没有新日志/);
+  assert.equal(codex.querySelector('progress')?.hasAttribute('value'), false, 'download totals are unknown');
+  assert.equal(claude.querySelector('progress'), null);
+  assert.equal((codex.querySelector('footer button') as HTMLButtonElement).textContent, '正在安装…');
+  view.install = { ...view.install!, stage: 'verifying', lastOutputAt: Date.now(), log: 'npm http fetch GET 200 [下载地址已隐藏] 100ms\nadded 2 packages\n' };
+  await act(async () => { await delay(1700); });
+  assert.match(codex.textContent!, /检查程序文件/);
+  assert.match(codex.querySelector('details pre')!.textContent!, /added 2 packages/);
+  view.install = { ...view.install!, phase: 'installed', finishedAt: Date.now() };
+  view.codex.managed = { installed: true, version: '0.155.1' };
+  await act(async () => { await delay(1700); });
+  assert.match(codex.textContent!, /Codex 托管安装：已完成/);
+  assert.match(codex.textContent!, /总用时/);
+  assert.equal(codex.querySelector('progress'), null);
+  assert.equal((codex.querySelector('footer button') as HTMLButtonElement).disabled, false);
+  assert.match(codex.querySelector('footer button')!.textContent!, /重新安装托管版本/);
+  assert.ok(codex.querySelector('details'), 'logs remain available after success');
+});
+
+test('reopening settings shows an existing Claude install, refresh failures and timeout with retry', async t => {
+  let failRead = false;
+  let view: CodersView = { ...initial(), install: { coder: 'claude', phase: 'installing', stage: 'packages', startedAt: Date.now() - 40_000, lastOutputAt: Date.now() - 35_000, log: '' } };
+  const ui = await page(t, async () => {
+    if (failRead) throw new Error('connection_failed');
+    return structuredClone(view);
+  });
+  const panel = () => ui.dom.window.document.querySelector('[aria-label="Claude Code 托管安装状态"]')!;
+  assert.match(panel().textContent!, /下载并安装依赖/);
+  assert.match(panel().textContent!, /最近输出在/);
+  failRead = true;
+  await act(async () => { await delay(1700); });
+  assert.match(panel().textContent!, /安装状态暂时无法刷新/);
+  failRead = false;
+  view.install = { ...view.install!, phase: 'failed', finishedAt: Date.now(), error: 'install_timeout', log: 'npm error ETIMEDOUT\n' };
+  await act(async () => { await delay(1700); });
+  assert.match(panel().querySelector('[role=alert]')!.textContent!, /下载或安装超时/);
+  assert.match(panel().textContent!, /ETIMEDOUT/);
+  assert.doesNotMatch(panel().textContent!, /暂时无法刷新|install_timeout/);
+  assert.equal(panel().querySelector('progress'), null);
+  const button = panel().closest('article')!.querySelector('footer button') as HTMLButtonElement;
+  assert.equal(button.disabled, false);
+});
+
+test('a rejected install request gives feedback next to its button and releases the starting state', async t => {
+  const ui = await page(t, async method => {
+    if (method === 'install') throw new Error('connection_failed');
+    return initial();
+  });
+  await ui.click('安装托管版本');
+  const card = [...ui.dom.window.document.querySelectorAll('article')].find(item => item.querySelector('h3')?.textContent === 'Codex')!;
+  assert.match(card.textContent!, /安装请求未能确认/);
+  assert.doesNotMatch(card.textContent!, /正在启动安装/);
+  assert.equal((card.querySelector('footer button') as HTMLButtonElement).disabled, false);
+});
+
 test('a settings revision changed elsewhere blocks saving until the page reloads', async t => {
   let view = initial();
   let reads = 0;

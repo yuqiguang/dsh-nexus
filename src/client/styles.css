@@ -28,6 +28,11 @@
 .nexus-channel-card textarea { resize: vertical; min-height: 64px; }
 .nexus-channel-card code { font-size: 12px; overflow-wrap: anywhere; }
 .nexus-channel-card pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.nexus-install-activity { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #f6f6f6); overflow-wrap: anywhere; }
+.nexus-install-activity p { margin: 4px 0; }
+.nexus-install-activity progress { width: 100%; height: 6px; accent-color: var(--dsw-alias-brand-primary, #4f6bff); }
+.nexus-install-activity summary { cursor: pointer; font-size: 12px; margin-top: 8px; }
+.nexus-install-activity pre { max-height: 200px; overflow-y: auto; font-size: 12px; }
 .nexus-readiness { padding-left: 20px; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
 .nexus-memory-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
 .nexus-memory-list li { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 8px 0; border-top: 1px solid var(--dsw-alias-border-l2, #eee); overflow-wrap: anywhere; }

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { CodersView, CoderStatusView } from '../coders/manager.js';
-import type { InstallStatus } from '../coders/install.js';
+import type { InstallProgress, InstallStatus } from '../coders/install.js';
 import { explain } from './ChannelSettings.js';
 import { CodingStart, type CodingNavigation } from './CodingStart.js';
 
@@ -53,6 +53,39 @@ function Status({ status }: { status: CoderStatusView }) {
 
 function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12: false }); }
 
+const installStages = { preparing: '准备安装', packages: '下载并安装依赖', verifying: '检查程序文件', configuring: '写入配置' };
+function elapsed(ms: number) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
+function InstallActivity({ progress, readError }: { progress: InstallProgress; readError?: string }) {
+  const [now, setNow] = useState(Date.now);
+  const active = progress.phase === 'installing';
+  useEffect(() => {
+    setNow(Date.now());
+    if (!active) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active, progress.startedAt]);
+  const quietFor = now - (progress.lastOutputAt ?? progress.startedAt);
+  const failure = progress.error === 'install_timeout' ? '下载或安装超时，请检查网络或代理后重试。' : progress.error;
+  return <div className="nexus-install-activity" aria-label={`${names[progress.coder]} 托管安装状态`}>
+    <p role={progress.phase === 'failed' ? 'alert' : 'status'}>
+      {names[progress.coder]} 托管安装：{active ? `进行中 · ${installStages[progress.stage ?? 'packages']}` : progress.phase === 'installed' ? '已完成' : `失败：${failure ?? '请查看安装日志'}`}
+    </p>
+    {active && <progress aria-label={`${names[progress.coder]} 托管安装进度`} />}
+    <p className="nexus-channel-hint">{active ? '已用时' : '总用时'} {elapsed((progress.finishedAt ?? now) - progress.startedAt)}
+      {active && progress.lastOutputAt !== undefined && ` · 最近输出在 ${elapsed(quietFor)}前`}</p>
+    {active && (readError ? <p role="alert">安装状态暂时无法刷新：{readError}。连接恢复后会自动更新。</p>
+      : <p className="nexus-channel-hint">{quietFor >= 30 ? '暂时没有新日志，可能正在等待网络响应或解压文件；下载和安装超过 15 分钟会报超时。' : '状态会自动更新；关闭设置页面后安装仍会继续，请保持 DSH 运行。'}</p>)}
+    {progress.log && <>
+      <p className="nexus-channel-hint">最近日志：<code>{progress.log.trim().split('\n').filter(Boolean).at(-1)}</code></p>
+      <details><summary>查看安装日志（最近部分，已脱敏）</summary><pre><code>{progress.log}</code></pre></details>
+    </>}
+  </div>;
+}
+
 export function CoderSettings({ api = coderApi, navigation, close }: { api?: CoderApi; navigation?: () => CodingNavigation | undefined; close?: () => void }) {
   const [view, setView] = useState<CodersView>();
   const [draft, setDraft] = useState<Draft>();
@@ -60,6 +93,8 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [readError, setReadError] = useState<string>();
+  const [startingInstall, setStartingInstall] = useState<'codex' | 'claude'>();
+  const [installRequestFailed, setInstallRequestFailed] = useState<{ coder: 'codex' | 'claude'; previousStart?: number }>();
   const generation = useRef(0);
   const writing = useRef(false);
   useEffect(() => {
@@ -71,7 +106,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
       const started = generation.current;
       try {
         const next = await api('list', {}, controller.signal);
-        if (!controller.signal.aborted && started === generation.current) { setView(next); setReadError(undefined); }
+        if (!controller.signal.aborted && started === generation.current) {
+          setView(next); setReadError(undefined);
+          setInstallRequestFailed(previous => previous && next.install?.coder === previous.coder && next.install.startedAt !== previous.previousStart ? undefined : previous);
+        }
       } catch (failure) { if (!controller.signal.aborted && started === generation.current) setReadError(explain((failure as Error).message)); }
       finally { pending = false; }
     };
@@ -83,7 +121,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   const action: Action = async (method, payload = {}) => {
     writing.current = true; generation.current++;
     setBusy(true); setError(undefined);
-    try { setView(await api(method, payload)); return true; }
+    try { setView(await api(method, payload)); setReadError(undefined); return true; }
     catch (failure) { setError(explain((failure as Error).message)); return false; }
     finally { writing.current = false; setBusy(false); }
   };
@@ -102,18 +140,26 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
       claude: { source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
   };
   const installing = view.install?.phase === 'installing';
+  const startInstall = async (coder: 'codex' | 'claude') => {
+    setStartingInstall(coder); setInstallRequestFailed(undefined);
+    const confirmed = await action('install', { coder });
+    setStartingInstall(undefined);
+    if (!confirmed) setInstallRequestFailed({ coder, previousStart: view.install?.startedAt });
+  };
   const installButton = (coder: 'codex' | 'claude', status: CoderStatusView) =>
-    <button type="button" disabled={busy || installing} onClick={() => void action('install', { coder })}>
-      {status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
+    <button type="button" disabled={busy || installing} onClick={() => void startInstall(coder)}>
+      {startingInstall === coder ? '正在启动安装…' : installing && view.install?.coder === coder ? '正在安装…' : status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
+  const installActivity = (coder: 'codex' | 'claude') => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
+    : <>
+      {installRequestFailed?.coder === coder && error && <p role="alert">安装请求未能确认：{error}。请等待状态刷新后再决定是否重试。</p>}
+      {view.install?.coder === coder && <InstallActivity progress={view.install} readError={readError} />}
+    </>;
   return <section className="nexus-channel-settings" aria-label="编码工具">
     <h2>编码工具</h2>
     <CodingStart view={view} disabled={busy || dirty} action={action} navigation={navigation} close={close} />
     {dirty && <p className="nexus-channel-hint">请先保存或放弃下方工具设置的修改，再切换项目。</p>}
     <p>把编码任务派给本机的 Codex 或 Claude Code。Nexus 可以自己安装一份（托管）并用这里的端点和密钥运行，也可以使用系统里已有的安装。密钥保存在本机，不会回填到页面。</p>
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
-    {view.install && <p role={view.install.phase === 'failed' ? 'alert' : 'status'} className="nexus-channel-account">
-      {names[view.install.coder]} 托管安装：{view.install.phase === 'installing' ? '进行中…' : view.install.phase === 'installed' ? `已完成（${when(view.install.finishedAt ?? view.install.startedAt)}）` : `失败：${view.install.error ?? ''}`}
-      {view.install.phase !== 'installed' && view.install.log && <><br /><code>{view.install.log.split('\n').filter(Boolean).slice(-3).join(' / ')}</code></>}</p>}
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">
         <header><h3>通用</h3></header>
@@ -173,6 +219,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           {installButton('codex', view.codex)}
           {view.settings.codex.apiKeyConfigured && <button type="button" disabled={busy || stale} onClick={() => void action('clear-secret', { coder: 'codex', revision: view.settings.revision })}>清除 API key</button>}
         </footer>
+        {installActivity('codex')}
       </article>
       <article className="nexus-channel-card">
         <header><h3>Claude Code</h3><Status status={view.claude} /></header>
@@ -204,6 +251,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           {installButton('claude', view.claude)}
           {view.settings.claude.tokenConfigured && <button type="button" disabled={busy || stale} onClick={() => void action('clear-secret', { coder: 'claude', revision: view.settings.revision })}>清除 token</button>}
         </footer>
+        {installActivity('claude')}
       </article>
       {stale && <p role="alert">{explain('configuration_changed')} <button type="button" onClick={reload}>重新载入</button></p>}
       <footer className="nexus-channel-card" style={{ borderStyle: 'none', paddingTop: 0 }}>

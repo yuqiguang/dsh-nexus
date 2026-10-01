@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import type { CoderKind } from './types.js';
 import type { CodexSettings } from './settings.js';
+import { redact } from './normalize.js';
 
 /** Versions Nexus installs for itself; bump deliberately and rerun the adapter tests. */
 export const MANAGED_PACKAGES: Record<CoderKind, { name: string; version: string }> = {
@@ -289,10 +290,12 @@ export async function ensureClaudeHome(layout: ManagedLayout): Promise<void> {
 export interface InstallProgress {
   coder: CoderKind;
   phase: 'installing' | 'installed' | 'failed';
+  stage?: 'preparing' | 'packages' | 'verifying' | 'configuring';
   startedAt: number;
+  lastOutputAt?: number;
   finishedAt?: number;
   error?: string;
-  /** Tail of npm's output, for the page. */
+  /** Bounded, sanitized tail of npm's output, for the page. */
   log: string;
 }
 
@@ -345,6 +348,40 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
 const INSTALL_TIMEOUT_MS = 15 * 60_000;
 const LOG_LIMIT = 4096;
 
+function safeInstallText(text: string): string {
+  return redact(text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''))
+    // Registry URLs may include userinfo, signed paths or query credentials.
+    .replace(/\b(?:https?|ftp):\/\/[^\s"'<>]+/gi, '[下载地址已隐藏]')
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 ***')
+    .replace(/\b((?:_auth(?:Token)?|authorization|[\w-]*(?:token|password|passwd|secret|api[_-]?key))["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1***')
+    .replace(/\b(?:sk|npm)_[A-Za-z0-9_-]+|\bsk-[A-Za-z0-9_-]+/g, '***');
+}
+
+/** Publish whole lines so a credential split across stream chunks is never exposed. */
+function installLog(progress: InstallProgress, now: () => number) {
+  let pending = '', oversized = false;
+  const append = () => {
+    const line = oversized ? '[过长日志行已省略]' : safeInstallText(pending);
+    progress.log = (progress.log + line + '\n').slice(-LOG_LIMIT);
+    pending = ''; oversized = false;
+  };
+  return {
+    write(chunk: string) {
+      if (!chunk) return;
+      progress.lastOutputAt = now();
+      const parts = chunk.split(/\r\n|[\r\n]/);
+      for (let i = 0; i < parts.length; i++) {
+        if (!oversized) {
+          if (pending.length + parts[i]!.length > LOG_LIMIT * 4) { pending = ''; oversized = true; }
+          else pending += parts[i];
+        }
+        if (i < parts.length - 1) append();
+      }
+    },
+    flush() { if (pending || oversized) append(); },
+  };
+}
+
 /** Installs one coder's pinned package into the managed root; one install at a time, progress readable by the page. */
 export class CoderInstaller {
   private current?: InstallProgress;
@@ -362,9 +399,9 @@ export class CoderInstaller {
   /** Starts an install; rejects when one is already running. The returned promise settles when npm finishes. */
   start(coder: CoderKind): Promise<void> {
     if (this.current?.phase === 'installing') throw new Error('install_in_progress');
-    this.current = { coder, phase: 'installing', startedAt: this.now(), log: '' };
+    this.current = { coder, phase: 'installing', stage: 'preparing', startedAt: this.now(), log: '' };
     this.running = this.run(coder).catch(error => {
-      if (this.current) Object.assign(this.current, { phase: 'failed', finishedAt: this.now(), error: (error as Error)?.message ?? String(error) });
+      if (this.current) Object.assign(this.current, { phase: 'failed', finishedAt: this.now(), error: safeInstallText((error as Error)?.message ?? String(error)).slice(-LOG_LIMIT) });
     });
     return this.running;
   }
@@ -387,12 +424,19 @@ export class CoderInstaller {
     const timer = setTimeout(() => controller.abort(new Error('install_timeout')), this.timeoutMs);
     timer.unref();
     const progress = this.current!;
-    const result = await this.npm(['install', '--no-audit', '--no-fund', '--loglevel=error', '--omit=dev', '--omit=optional'], this.layout.root,
-      chunk => { progress.log = (progress.log + chunk).slice(-LOG_LIMIT); }, controller.signal);
-    clearTimeout(timer);
-    if (result.code !== 0) throw new Error(result.error ?? (controller.signal.aborted ? 'install_timeout' : `npm exited with ${result.code}`));
+    progress.stage = 'packages';
+    const log = installLog(progress, this.now);
+    let result: Awaited<ReturnType<NpmRunner>>;
+    try {
+      result = await this.npm(['install', '--no-audit', '--no-fund', '--loglevel=http', '--omit=dev', '--omit=optional'], this.layout.root,
+        chunk => log.write(chunk), controller.signal);
+    } finally { clearTimeout(timer); log.flush(); }
+    if (controller.signal.aborted) throw new Error('install_timeout');
+    if (result.code !== 0) throw new Error(result.error ?? `npm exited with ${result.code}`);
+    progress.stage = 'verifying';
     const binary = coder === 'codex' ? managedCodexBinary(this.layout, this.host) : join(this.layout.nodeModules, native.name, native.binary);
     if (!await exists(binary, constants.X_OK)) throw new Error(`platform_package_missing: ${native.name}`);
+    progress.stage = 'configuring';
     const marker: InstallMarker = { coder, version: pkg.version, platformPackage: native.name, at: this.now() };
     await writeFile(join(this.layout.markers, `${coder}.json`), JSON.stringify(marker, null, 2) + '\n', { mode: 0o600 });
     await this.afterInstall(coder);

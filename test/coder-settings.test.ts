@@ -206,17 +206,18 @@ test('the installer pins the package and its platform package, marks success onl
   const runs: { args: string[]; cwd: string }[] = [];
   const after: string[] = [];
   let clock = 1000;
-  const npm: NpmRunner = async (args, cwd, onOutput) => { runs.push({ args, cwd }); onOutput('added 1 package\n'); await fakeManaged(root, 'codex', { complete: false }); await fakeManaged(root, 'codex'); return { code: 0 }; };
-  const installer = new CoderInstaller(layout, npm, async coder => { after.push(coder); }, () => clock++, host);
+  const npm: NpmRunner = async (args, cwd, onOutput) => { assert.equal(installer.progress()?.stage, 'packages'); runs.push({ args, cwd }); onOutput('added 1 package\n'); await fakeManaged(root, 'codex', { complete: false }); await fakeManaged(root, 'codex'); return { code: 0 }; };
+  const installer: CoderInstaller = new CoderInstaller(layout, npm, async coder => { assert.equal(installer.progress()?.stage, 'configuring'); after.push(coder); }, () => clock++, host);
   assert.equal(installer.progress(), undefined);
   assert.equal(installer.installing(), undefined);
   const started = installer.start('codex');
+  assert.equal(installer.progress()?.stage, 'preparing');
   assert.equal(installer.installing(), 'codex');
   assert.throws(() => installer.start('claude'), /install_in_progress/);
   await started;
-  assert.deepEqual(installer.progress(), { coder: 'codex', phase: 'installed', startedAt: 1000, finishedAt: 1002, log: 'added 1 package\n' });
+  assert.deepEqual(installer.progress(), { coder: 'codex', phase: 'installed', stage: 'configuring', startedAt: 1000, lastOutputAt: 1001, finishedAt: 1003, log: 'added 1 package\n' });
   assert.equal(installer.installing(), undefined);
-  assert.deepEqual(runs, [{ args: ['install', '--no-audit', '--no-fund', '--loglevel=error', '--omit=dev', '--omit=optional'], cwd: root }]);
+  assert.deepEqual(runs, [{ args: ['install', '--no-audit', '--no-fund', '--loglevel=http', '--omit=dev', '--omit=optional'], cwd: root }]);
   assert.deepEqual(after, ['codex']);
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   assert.deepEqual(manifest.dependencies, { '@openai/codex': MANAGED_PACKAGES.codex.version, '@openai/codex-linux-x64': 'npm:@openai/codex@0.155.1-linux-x64' });
@@ -225,6 +226,7 @@ test('the installer pins the package and its platform package, marks success onl
   const incomplete = new CoderInstaller(layout, async () => { await fakeManaged(root, 'claude', { complete: false }); return { code: 0 }; }, async () => { throw new Error('must not run'); }, () => clock++, host);
   await incomplete.start('claude');
   assert.equal(incomplete.progress()?.phase, 'failed');
+  assert.equal(incomplete.progress()?.stage, 'verifying');
   assert.match(incomplete.progress()!.error!, /platform_package_missing/);
   assert.equal(await readMarker(layout, 'claude'), undefined);
   const failing = new CoderInstaller(layout, async () => ({ code: 1 }), async () => { throw new Error('must not run'); }, () => clock++, host);
@@ -237,6 +239,53 @@ test('the installer pins the package and its platform package, marks success onl
   const reinstall = new CoderInstaller(layout, async () => { sawMarker = (await readMarker(layout, 'codex')) !== undefined; return { code: 1 }; }, async () => {}, () => clock++, host);
   await reinstall.start('codex');
   assert.equal(sawMarker, false);
+});
+
+test('installation logs redact split credentials and URLs, bound long lines, and flush diagnostics on failure', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-install-log-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const snapshots: string[] = [];
+  const installer = new CoderInstaller(managedLayout(root), async (_args, _cwd, output) => {
+    for (const chunk of ['npm http fetch GET 200 https://user:split', 'Password@registry.example/package?signature=hiddenQuery 25ms\n',
+      'npm warn _authToken=split', 'Token\nAuthorization: Bearer hiddenBearer\n',
+      'npm warn password: "hiddenPassword"\nnpm error API_KEY=hiddenKey\n']) {
+      output(chunk); snapshots.push(installer.progress()!.log);
+    }
+    output('x'.repeat(20_000)); output('hiddenOversizedTail\n');
+    snapshots.push(installer.progress()!.log);
+    for (let i = 0; i < 1000; i++) output(`npm http fetch GET 200 https://registry.example/package${i} 25ms\n`);
+    snapshots.push(installer.progress()!.log);
+    output('npm error failed with npm_split'); output('Secret');
+    throw new Error('failed https://user:hiddenError@registry.example/path?key=hiddenQueryError');
+  }, async () => {}, Date.now, host);
+  await installer.start('codex');
+  assert.equal(snapshots[0], '', 'incomplete lines must not reach the page');
+  assert.match(snapshots[1]!, /npm http fetch GET 200 \[下载地址已隐藏\] 25ms/);
+  assert.match(snapshots[5]!, /过长日志行已省略/);
+  assert.equal(installer.progress()?.phase, 'failed');
+  assert.ok(installer.progress()?.lastOutputAt);
+  assert.match(installer.progress()!.log, /npm error failed with \*\*\*/);
+  const published = [...snapshots, installer.progress()!.log, installer.progress()!.error!];
+  for (const text of published) {
+    assert.ok(text.length <= 4096);
+    assert.doesNotMatch(text, /https?:\/\/|splitPassword|hidden\w+|splitToken|splitSecret/);
+  }
+});
+
+test('a timed out installer cannot mark success even if npm exits with code zero', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-install-timeout-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const installer = new CoderInstaller(managedLayout(root), async (_args, _cwd, _output, signal) => {
+    await new Promise<void>(resolve => {
+      const keepAlive = setTimeout(resolve, 1000);
+      signal.addEventListener('abort', () => { clearTimeout(keepAlive); resolve(); }, { once: true });
+    });
+    return { code: 0 };
+  }, async () => { throw new Error('must not configure a timed out install'); }, Date.now, host, 10);
+  await installer.start('codex');
+  assert.equal(installer.progress()?.phase, 'failed');
+  assert.equal(installer.progress()?.error, 'install_timeout');
+  assert.equal(await readMarker(managedLayout(root), 'codex'), undefined);
 });
 
 test('the npm runner ends the whole process group on timeout even when npm ignores SIGTERM', async () => {
@@ -374,7 +423,7 @@ test('a managed Codex needs an API key, gets a generated home with the key only 
   await fresh.manager.handle('install', { coder: 'codex' });
   assert.equal((await fresh.manager.view()).codex.active, 'none', 'a running install is not a usable source');
   await fresh.installer.whenDone();
-  assert.deepEqual(fresh.npmCalls, ['install --no-audit --no-fund --loglevel=error --omit=dev --omit=optional']);
+  assert.deepEqual(fresh.npmCalls, ['install --no-audit --no-fund --loglevel=http --omit=dev --omit=optional']);
   view = await fresh.manager.view();
   assert.equal(view.install?.phase, 'installed');
   assert.equal(view.codex.managed.installed, true);
