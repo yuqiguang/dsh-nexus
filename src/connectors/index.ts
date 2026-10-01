@@ -4,6 +4,7 @@ import type {} from '@deepseek-ai/dsh-storage-domain';
 import type { ChannelNotifier, SessionNotifier } from '../channels/notify.js';
 import { ChannelError } from '../channels/types.js';
 import { DshRecords } from '../dsh/records.js';
+import { AgendaData } from './agenda/data.js';
 import { AgendaConnector, type AgendaStatus } from './agenda/index.js';
 import type { Occurrence, Todo } from './agenda/render.js';
 import { ImapSmtpMail, type ImapOptions } from './mail/imap.js';
@@ -26,7 +27,6 @@ export interface ConnectorsView {
 }
 
 export interface ConnectorsDeps {
-  modules?: Readonly<{ agenda: boolean }>;
   ctx: Context;
   registry: Pick<SessionNotifier, 'bound' | 'inject'>;
   /** Where agenda reminders go: the quiet-hours gate in front of the bridges. */
@@ -46,32 +46,31 @@ export class Connectors {
   private readonly store: ConnectorSettingsStore;
   private mail?: MailConnector;
   private mailData!: MailData;
-  private readonly agenda: AgendaConnector;
+  private agenda?: AgendaConnector;
+  private agendaData!: AgendaData;
   private mailTest?: ConnectorsView['mailTest'];
   private mailTestAttempt = 0;
   private clearMailTest(): void { this.mailTestAttempt++; this.mailTest = undefined; }
   private readonly now: () => number;
-  private readonly modules: Readonly<{ agenda: boolean }>;
 
   constructor(private readonly deps: ConnectorsDeps) {
     this.now = deps.now ?? Date.now;
-    this.modules = Object.freeze({ agenda: deps.modules?.agenda ?? true });
     this.store = new ConnectorSettingsStore(new DshRecords(deps.ctx.credentials, 'nexus-connectors'));
-    this.agenda = new AgendaConnector({ ctx: deps.ctx, opener: deps.ctx.storageDomain, notifier: deps.notifier, sessions: () => deps.registry.bound(), timeZone: deps.timeZone,
-      now: deps.now, report: deps.report, sleep: deps.sleep });
+
   }
 
   async start(): Promise<void> {
     this.settings = await this.store.read();
     this.mailData = await MailData.open(this.deps.ctx.storageDomain, this.now);
     if (mailConfigured(this.settings.mail)) await this.mailData.bindLegacyCursor(this.settings.mail);
-    await this.agenda.start(this.agendaSettings());
+    this.agendaData = await AgendaData.open(this.deps.ctx.storageDomain, this.deps.timeZone, this.now);
     this.deps.ctx.effect(() => () => this.close());
   }
 
   async close(): Promise<void> {
     await this.mail?.close();
-    await this.agenda.close();
+    await this.agenda?.close();
+    await this.agendaData.close();
     await this.mailData.close();
   }
 
@@ -96,21 +95,39 @@ export class Connectors {
     }
   }
 
+  /** Optional native agenda runtime; its data store belongs to the core. */
+  async enableAgenda(ctx: Context): Promise<void> {
+    if (this.agenda) throw new Error('agenda runtime already active');
+    const deps = this.deps;
+    const runtime = new AgendaConnector({ ctx, data: this.agendaData, opener: deps.ctx.storageDomain,
+      notifier: deps.notifier, sessions: () => deps.registry.bound(), timeZone: deps.timeZone, now: deps.now, report: deps.report, sleep: deps.sleep });
+    this.agenda = runtime;
+    ctx.effect(() => async () => {
+      if (this.agenda === runtime) this.agenda = undefined;
+      await runtime.close();
+    });
+    try { await runtime.start(this.settings.agenda); }
+    catch (error) {
+      if (this.agenda === runtime) this.agenda = undefined;
+      await runtime.close();
+      throw error;
+    }
+  }
+
   /** Today's and the coming days' occurrences and the open todos, for the briefing. */
-  agendaFor(now: number, days: number): { occurrences: Occurrence[]; todos: Todo[] } {
-    if (!this.agendaEnabled()) return { occurrences: [], todos: [] };
-    return { occurrences: this.agenda.agenda(now, days), todos: this.agenda.listTodos().filter(todo => !todo.doneAt) };
+  agendaFor(now: number, days: number): { occurrences: Occurrence[]; todos: Todo[] } | undefined {
+    if (!this.agendaEnabled()) return undefined;
+    return { occurrences: this.agendaData.agenda(now, days), todos: this.agendaData.listTodos().filter(todo => !todo.doneAt) };
   }
 
   current(): ConnectorSettingsRecord { return this.settings; }
-  agendaEnabled(): boolean { return this.modules.agenda && this.settings.agenda.enabled; }
-  private agendaSettings() { return { ...this.settings.agenda, enabled: this.agendaEnabled() }; }
+  agendaEnabled(): boolean { return this.agenda?.enabled === true; }
 
   view(): ConnectorsView {
-    const upcoming = this.agenda.agenda(this.now(), 7).slice(0, 30).map(item => ({ id: item.event.id, title: item.event.title, start: item.start, end: item.end,
+    const upcoming = this.agendaData.agenda(this.now(), 7).slice(0, 30).map(item => ({ id: item.event.id, title: item.event.title, start: item.start, end: item.end,
       ...(item.event.location ? { location: item.event.location } : {}), ...(item.event.repeat ? { repeat: item.event.repeat } : {}) }));
-    return { modules: { ...this.modules, mail: !!this.mail }, settings: redactConnectors(this.settings), mail: this.mail?.view() ?? { phase: 'disabled', toolsRegistered: false, watches: this.mailData.listWatches(), lastUid: this.mailData.cursor.get('inbox')?.lastUid }, ...(this.mailTest ? { mailTest: this.mailTest } : {}),
-      agenda: { ...this.agenda.view(), upcoming, todos: this.agenda.listTodos().slice(0, 100) } };
+    return { modules: { agenda: !!this.agenda, mail: !!this.mail }, settings: redactConnectors(this.settings), mail: this.mail?.view() ?? { phase: 'disabled', toolsRegistered: false, watches: this.mailData.listWatches(), lastUid: this.mailData.cursor.get('inbox')?.lastUid }, ...(this.mailTest ? { mailTest: this.mailTest } : {}),
+      agenda: { ...(this.agenda?.view() ?? { toolsRegistered: false, events: this.agendaData.listEvents().length, openTodos: this.agendaData.listTodos().filter(todo => !todo.doneAt).length }), upcoming, todos: this.agendaData.listTodos().slice(0, 100) } };
   }
 
   private async saveAllowRecipients(rules: string[], assertCurrent: () => void): Promise<void> {
@@ -126,7 +143,7 @@ export class Connectors {
       this.settings = await this.store.save(input.revision as number, (input.config ?? {}) as Record<string, unknown>);
       this.clearMailTest();
       await this.mail?.apply(this.settings.mail);
-      await this.agenda.apply(this.agendaSettings());
+      await this.agenda?.apply(this.settings.agenda);
     } else if (method === 'clear-secret') {
       this.settings = await this.store.clearSecret(input.revision as number);
       this.clearMailTest();
@@ -146,12 +163,12 @@ export class Connectors {
     } else if (method === 'mail/watch/remove') {
       if (typeof input.id !== 'string' || !await this.mailData.removeWatch(input.id)) throw new ChannelError('not_found');
     } else if (method === 'agenda/event/remove') {
-      if (typeof input.id !== 'string' || !await this.agenda.removeEvent(input.id)) throw new ChannelError('not_found');
+      if (typeof input.id !== 'string' || !await this.agendaData.removeEvent(input.id)) throw new ChannelError('not_found');
     } else if (method === 'agenda/todo/remove') {
-      if (typeof input.id !== 'string' || !await this.agenda.removeTodo(input.id)) throw new ChannelError('not_found');
+      if (typeof input.id !== 'string' || !await this.agendaData.removeTodo(input.id)) throw new ChannelError('not_found');
     } else if (method === 'agenda/todo/done') {
       if (typeof input.id !== 'string') throw new ChannelError('invalid_configuration');
-      try { await this.agenda.updateTodo(input.id, { done: input.done !== false }); } catch { throw new ChannelError('not_found'); }
+      try { await this.agendaData.updateTodo(input.id, { done: input.done !== false }); } catch { throw new ChannelError('not_found'); }
     } else throw new ChannelError('unknown_action');
     return this.view();
   }

@@ -159,12 +159,13 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
       </article>
       <article className="nexus-channel-card">
         <header><h3>日历与待办</h3><span className={`nexus-channel-state ${agenda.toolsRegistered ? 'connected' : 'disabled'}`}>{agenda.toolsRegistered ? '已启用' : '未启用'}</span></header>
-        {view.modules?.agenda === false && <p role="status">日历模块当前关闭，停止工具、自动提醒与简报中的日程。已有数据保留，仍可管理；请在“Nexus 扩展”启用并重启后使用。</p>}
-        <p>由助理自己保管，不接外部服务，不需要授权。在聊天里说“明天下午三点和张老师开会”“记个待办周五前交报告”“今天有什么安排”即可；日程开始前和待办到期时会主动提醒，每日简报里也会列出。</p>
+        {view.modules?.agenda === false && <p role="status">日历与待办组件当前关闭，停止新的工具操作、提醒与简报读取。已有数据仍可管理；请在 DSH 插件详情的组件列表中启用“日历与待办”，并按宿主提示决定是否重启。</p>}
+        <p>由助理自己保管，不接外部日历服务，不需要授权。在聊天里说“明天下午三点和张老师开会”“记个待办周五前交报告”“今天有什么安排”即可；日程开始前和待办到期时会主动提醒，每日简报里也会列出。</p>
+        <p className="nexus-channel-hint">关闭组件不撤回已被渠道或静默队列接收的通知。DSH 原生定时提醒仍在任务页管理。</p>
         {agenda.toolsRegistered && <p className="nexus-channel-account">日程 {agenda.events} 条，未完成待办 {agenda.openTodos} 条。
           {agenda.nextReminderAt !== undefined && ` 下一次提醒：${when(agenda.nextReminderAt)}。`}{agenda.lastReminderAt !== undefined && ` 上次提醒：${when(agenda.lastReminderAt)}。`}</p>}
         <label htmlFor="agenda-enabled"><input id="agenda-enabled" type="checkbox" checked={draft.agendaEnabled} disabled={busy} style={{ width: 'auto', marginRight: 8 }}
-          onChange={event => edit({ agendaEnabled: event.target.checked })} />启用日历与待办服务（日历模块开启后提供工具和提醒）</label>
+          onChange={event => edit({ agendaEnabled: event.target.checked })} />启用日历与待办服务（组件开启后提供工具和提醒）</label>
         <label htmlFor="agenda-remind">日程开始前几分钟提醒（{REMIND_MINUTES.min} 到 {REMIND_MINUTES.max}，0 表示不提醒）</label>
         <input id="agenda-remind" maxLength={4} value={draft.remindMinutes} disabled={busy} autoComplete="off" onChange={event => edit({ remindMinutes: event.target.value })} />
         <label htmlFor="agenda-todo-time">只写了日期的待办，当天几点提醒（HH:MM）</label>

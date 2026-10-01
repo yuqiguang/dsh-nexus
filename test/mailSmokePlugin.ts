@@ -19,6 +19,7 @@ import { BridgeRegistry } from '../src/channels/notify.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 import { installBridge } from '../src/dsh/bridge.js';
 import { installAssistantPrompt } from '../src/assistant/prompt.js';
+import * as agendaComponent from '../src/connectors/agenda/plugin.js';
 import * as mailComponent from '../src/connectors/mail/plugin.js';
 import { installConnectors } from '../src/plugin.js';
 import { mailFixture, rfc822 } from './mailFixture.js';
@@ -75,6 +76,10 @@ class FixtureModel extends LlmAdapter {
       if (!answered('list')) { yield* this.toolCall('list', 'mail_list', {}); return; }
       yield* this.text(`收件箱：${result('list').split('\n')[0]}`); return;
     }
+    if (askedText === '测试停用后记待办') {
+      if (!answered('stale-agenda')) { yield* this.toolCall('stale-agenda', 'todo', { action: 'add', title: 'stale agenda fixture' }); return; }
+      yield* this.text(result('stale-agenda').includes('已记下') ? '错误：旧待办已写入' : '旧待办未写入'); return;
+    }
     if (askedText === '测试停用后批准') {
       if (!answered('stale-send')) { yield* this.toolCall('stale-send', 'mail_send', { to: ['stale@example.com'], subject: '旧请求', text: '不得发送' }); return; }
       yield* this.text(result('stale-send').includes('已发送') ? '错误：旧请求发出了' : '旧请求没有发送'); return;
@@ -130,6 +135,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
   const connectors = await installConnectors(ctx, registry, { notifier: registry, timeZone: () => 'Asia/Shanghai', report: message => failures.push(`mail: ${message}`), imap: { insecure: true, timeoutMs: 5000 } });
   ctx.provide('nexusConnectors', connectors);
   let mailFiber = ctx.plugin(mailComponent);
+  let agendaFiber = ctx.plugin(agendaComponent);
   let running = false;
   const timer = setInterval(() => {
     void access(config.triggerFile).then(() => {
@@ -144,7 +150,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
   ctx.effect(() => () => clearInterval(timer));
 
   async function run() {
-    await until(() => connectors.view().modules?.mail === true, 'native mail component did not activate');
+    await until(() => connectors.view().modules?.mail === true && connectors.view().modules?.agenda === true, 'native components did not activate');
     const origin = `http://127.0.0.1:${ctx.webServer.port}`;
     const exchange = await fetch(ctx.connection.authenticatedUrl(origin), { redirect: 'manual' });
     const cookie = exchange.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
@@ -291,7 +297,37 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     await turn('m9', '今天有什么安排');
     assert.match(texts.at(-1)!, /^今天：[\s\S]*十分钟后的事/);
     assert.doesNotMatch(texts.at(-1)!, /和张老师开会/, 'tomorrow is not in today');
-    // Turning the agenda off removes its tools too.
+    // Pause the native pre-execute chain, replace the component, and then let
+    // DSH resolve the tool again. The old execution must not use the new instance.
+    let releaseAgenda!: () => void;
+    let agendaWaiting = false;
+    const pausedAgenda = new Promise<void>(resolve => { releaseAgenda = resolve; });
+    const releaseHook = ctx.on('tools/pre-execute', async (exec, next) => {
+      if (exec.name === 'todo' && (exec.arguments as { title?: string })?.title === 'stale agenda fixture') {
+        agendaWaiting = true; await pausedAgenda;
+      }
+      return next();
+    });
+    void bridge.receive(inbound('agenda-stale', '测试停用后记待办')).catch(() => {});
+    await until(() => agendaWaiting, 'pending agenda tool missing');
+    assert.ok(connectors.agendaFor(Date.now(), 1)?.todos.some(todo => todo.title === '交报告'));
+    const keptAgenda = (await rpc('list') as unknown as { agenda: { todos: { id: string; title: string }[]; events: number } }).agenda;
+    await agendaFiber.dispose();
+    assert.equal(connectors.agendaFor(Date.now(), 1), undefined);
+    assert.equal(connectors.view().modules?.agenda, false);
+    assert.ok(!ctx.tools.get('calendar') && !ctx.tools.get('todo'));
+    assert.equal(connectors.view().agenda.events, keptAgenda.events);
+    const keptTodo = keptAgenda.todos.find(todo => todo.title === '交报告')!;
+    await rpc('agenda/todo/done', { id: keptTodo.id });
+    agendaFiber = ctx.plugin(agendaComponent);
+    await until(() => !!ctx.tools.get('calendar') && !!ctx.tools.get('todo'), 'agenda component did not reactivate');
+    releaseAgenda();
+    await agent.whenIdle(); await bridge.drain(); releaseHook();
+    assert.equal(texts.at(-1), '旧待办未写入');
+    assert.ok(!connectors.view().agenda.todos.some(todo => todo.title === 'stale agenda fixture'));
+    assert.ok(connectors.view().agenda.todos.find(todo => todo.id === keptTodo.id)?.doneAt);
+    assert.ok(!connectors.agendaFor(Date.now(), 1)?.todos.some(todo => todo.id === keptTodo.id));
+    // Turning the agenda service off removes its tools too.
     view = await rpc('save', { revision: (await rpc('list')).settings.revision, config: { agenda: { enabled: false } } });
     await turn('m10', '你好');
     assert.deepEqual(model.toolSets.at(-1), []);
@@ -301,6 +337,6 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       checks: ['connector_settings_requires_login', 'mail_tools_absent_until_enabled', 'mail_test_and_save_through_routes', 'mail_list_reads_inbox',
         'mail_send_to_unlisted_recipient_asks_on_channel', 'approval_releases_smtp_send_in_thread', 'listed_recipient_sends_without_approval', 'full_access_send_asks_in_chat_and_sends_after_answer', 'attachment_named_in_confirmation_and_sent_from_workspace',
         'watched_arrival_enters_session_as_event', 'unwatched_arrival_stays_silent', 'clearing_secret_removes_tools', 'native_mail_dispose_preserves_account_and_watches', 'old_native_approval_cannot_send_after_reenable',
-        'agenda_tools_present_by_default', 'calendar_add_and_todo_add_through_model', 'agenda_view_through_routes', 'event_reminder_pushed_once', 'daily_point_reminder_filed_by_model_and_pushed_at_its_moment', 'calendar_list_today', 'disabling_agenda_removes_tools'] }, null, 2));
+        'agenda_tools_present_when_component_enabled', 'agenda_native_disable_keeps_data', 'old_agenda_tool_refused_after_reenable', 'agenda_briefing_follows_component', 'calendar_add_and_todo_add_through_model', 'agenda_view_through_routes', 'event_reminder_pushed_once', 'daily_point_reminder_filed_by_model_and_pushed_at_its_moment', 'calendar_list_today', 'disabling_agenda_removes_tools'] }, null, 2));
   }
 }

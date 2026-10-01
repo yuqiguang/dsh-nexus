@@ -143,3 +143,18 @@ test('disabled native mailbox keeps configuration editable, blocks connection te
   await ui.click('清除密码并停用');
   assert.equal(calls.at(-1), 'clear-secret');
 });
+
+test('disabled native agenda keeps owner controls and explains native enablement and accepted notifications', async t => {
+  const view = initial();
+  view.modules = { mail: false, agenda: false };
+  view.agenda.toolsRegistered = false;
+  view.agenda.todos = [{ id: 'td-old', title: '保留的待办', createdAt: 1 }];
+  const calls: string[] = [];
+  const ui = await page(t, async method => { calls.push(method); return view; });
+  assert.match(ui.text(), /组件列表中启用“日历与待办”/);
+  assert.doesNotMatch(ui.text(), /Nexus 扩展/);
+  assert.match(ui.text(), /不撤回已被渠道或静默队列接收的通知/);
+  assert.equal(ui.field('agenda-remind').disabled, false);
+  await ui.click('完成');
+  assert.equal(calls.at(-1), 'agenda/todo/done');
+});

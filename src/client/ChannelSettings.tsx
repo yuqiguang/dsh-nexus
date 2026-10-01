@@ -14,7 +14,7 @@ export const errors: Record<string, string> = {
   invalid_remind_minutes: '提前提醒的分钟数要在 0 到 1440 之间。',
   invalid_feishu_app_id: 'App ID 应为 cli_ 开头的飞书应用 ID。',
   configuration_changed: '配置已在其他窗口修改，请重新载入后再保存。',
-  module_disabled: '此模块当前关闭，请在 Nexus 扩展中启用并保存，重启 DSH 后使用。',
+  module_disabled: '此组件已关闭或运行状态已变更，请在 DSH 插件详情的组件列表中确认启用状态后重新发起操作。',
   memory_scope_unavailable: '此记忆范围不可用。请重新载入；模型记忆需要有有效工作目录的原生主会话。',
   memory_legacy_readonly: '旧版未归类记忆不再自动读写，请明确选择目标范围逐条复制，或导出、删除。',
   memory_profile_exists: '目标范围已有同名画像，请先查看和整理目标内容；本次没有覆盖。',

@@ -1,6 +1,6 @@
 {
   "name": "nexus-next",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "private": true,
   "type": "module",
   "exports": {
@@ -14,7 +14,9 @@
     "./memory": "./dist/src/memory/plugin.js",
     "./memory/locale/*.json": "./locale/memory/*.json",
     "./mail": "./dist/src/connectors/mail/plugin.js",
-    "./mail/locale/*.json": "./locale/mail/*.json"
+    "./mail/locale/*.json": "./locale/mail/*.json",
+    "./agenda": "./dist/src/connectors/agenda/plugin.js",
+    "./agenda/locale/*.json": "./locale/agenda/*.json"
   },
   "files": [
     "dist/src",
@@ -24,7 +26,8 @@
     "locale/*.json",
     "locale/documents/*.json",
     "locale/memory/*.json",
-    "locale/mail/*.json"
+    "locale/mail/*.json",
+    "locale/agenda/*.json"
   ],
   "dsh": {
     "bundle": {

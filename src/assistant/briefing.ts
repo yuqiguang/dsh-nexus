@@ -9,7 +9,7 @@ import { formatLocal, localDate, nextOccurrence } from './clock.js';
 import type { AssistantSettingsRecord } from './settings.js';
 
 /** The assistant's own calendar and todo list, when the connector is on. */
-export type AgendaSource = (now: number, days: number) => { occurrences: Occurrence[]; todos: Todo[] };
+export type AgendaSource = (now: number, days: number) => { occurrences: Occurrence[]; todos: Todo[] } | undefined;
 
 /** The day's schedule and open todos, then the reminders and monitors the assistant itself holds. */
 export function briefingText(now: number, timeZone: string, reminders: readonly ScheduleRecord[], agenda?: ReturnType<AgendaSource>): string {

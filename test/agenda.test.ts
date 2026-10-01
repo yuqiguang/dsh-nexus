@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { ToolExecution } from '@deepseek-ai/dsh-tools';
+import { AgendaData } from '../src/connectors/agenda/data.js';
 import type { Context } from '@deepseek-ai/cordis';
 import { AgendaConnector, type AgendaDomain } from '../src/connectors/agenda/index.js';
 import { agendaBetween, conflicts, eventReminderText, occurrences, renderAgenda, renderTodo, sortTodos, todoReminderText, type AgendaEvent, type Todo } from '../src/connectors/agenda/render.js';
 import { addDays, addMonths, describeNow, formatDateTime, parseDate, parseDateTime, startOfDay } from '../src/connectors/agenda/time.js';
-import { briefingText } from '../src/assistant/briefing.js';
+import { PushGate, type AssistantDomain } from '../src/assistant/pushes.js';
+import { defaultAssistantSettings } from '../src/assistant/settings.js';
+import { DailyBriefing, briefingText } from '../src/assistant/briefing.js';
 import { agendaInput, defaultAgendaSettings, redactConnectors, ConnectorSettingsStore, type AgendaSettings } from '../src/connectors/settings.js';
 import { MemoryRecords, until } from './helpers.js';
 
@@ -73,7 +77,11 @@ function fakeDomain() {
     if (!tables.has(name)) tables.set(name, new Map());
     const records = tables.get(name)!;
     return { get: (key: string) => records.get(key), entries: () => [...records.entries()][Symbol.iterator](), keys: () => [...records.keys()][Symbol.iterator](),
-      get size() { return records.size; }, async put(key: string, value: unknown) { records.set(key, structuredClone(value)); }, async delete(key: string) { return records.delete(key); } };
+      get size() { return records.size; }, async put(key: string, value: unknown) { records.set(key, structuredClone(value)); }, async delete(key: string) { return records.delete(key); },
+      async update(key: string, fn: (current: unknown) => unknown) {
+        if (!records.has(key)) throw Object.assign(new Error('missing-key'), { code: 'missing-key' });
+        const value = structuredClone(fn(records.get(key))); records.set(key, value); return value;
+      } };
   };
   return { opener: { async open() { return { name: 'nexus_agenda', table: tableOf, async close() {} } as unknown as AgendaDomain; } }, tables };
 }
@@ -81,12 +89,25 @@ function fakeDomain() {
 function fakeContext() {
   const tools = new Map<string, { execute(args: unknown, exec: unknown): Promise<{ text: string }> }>();
   const sections: { name: string; text: () => string }[] = [];
+  const hooks: ((exec: ToolExecution, next: () => Promise<{ kind: string }>) => Promise<{ kind: string }>)[] = [];
   const ctx = {
+    on(_name: string, hook: typeof hooks[number]) { hooks.push(hook); return () => { const i = hooks.indexOf(hook); if (i >= 0) hooks.splice(i, 1); }; },
     tools: { register(tool: { name: string; execute: (args: unknown, exec: unknown) => Promise<{ text: string }> }) { tools.set(tool.name, tool); return () => { tools.delete(tool.name); }; } },
     systemPrompt: { section(section: { name: string; text: () => string }) { sections.push(section); return () => { sections.splice(sections.indexOf(section), 1); }; }, getSectionOrder() { return 10; } },
   } as unknown as Context;
-  const run = (name: string, args: unknown) => { const tool = tools.get(name); if (!tool) throw new Error(`tool ${name} is not registered`); return tool.execute(args, { agent: { id: 's1' } }); };
-  return { ctx, tools, sections, run };
+  const execution = (name: string, args: unknown) => ({ name, arguments: args, signal: new AbortController().signal }) as ToolExecution;
+  const prepare = async (exec: ToolExecution) => {
+    let decision = { kind: 'allow' };
+    for (const hook of [...hooks]) decision = await hook(exec, async () => decision);
+    return decision;
+  };
+  const run = async (name: string, args: unknown) => {
+    const exec = execution(name, args);
+    if ((await prepare(exec)).kind !== 'allow') throw new Error('denied');
+    const tool = tools.get(name); if (!tool) throw new Error(`tool ${name} is not registered`);
+    return tool.execute(args, exec);
+  };
+  return { ctx, tools, sections, run, hooks, prepare, execution };
 }
 
 test('the agenda tools add, list, update, complete and remove; clashes are reported before anything is written', async () => {
@@ -273,4 +294,181 @@ test('the briefing lists the day\'s events and open todos ahead of the reminders
   assert.equal(text, '早上好，9/21 的简报：\n今天的日程（1）：\n[ev-1] 9/21（周一）15:00–16:00 和张老师开会\n今天到期或已过期的待办（1）：\n[td-1] 交报告，9/21（周一） 前\n其他待办（1）：\n[td-2] 买菜\n今天没有待触发的提醒。');
   assert.match(briefingText(now, zone, [], { occurrences: [], todos: [] }), /^早上好，9\/21 的简报：\n今天没有日程。\n今天没有待触发的提醒。$/);
   assert.match(briefingText(now, zone, []), /^早上好，9\/21 的简报：\n今天没有待触发的提醒。$/, 'without the connector the briefing reads as before');
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+const noSleep = () => new Promise<void>(() => {});
+const dueEvent = (title: string) => ({ title, start: '2026-09-21 10:00', duration_minutes: 0, remind_minutes: 0 });
+
+async function runtimeFixture(notify: (sessionId: string, text: string, deliveryId: string) => Promise<boolean> = async () => true) {
+  const fake = fakeContext();
+  const storage = fakeDomain();
+  const data = await AgendaData.open(storage.opener, () => zone, () => T0);
+  const deps = { ctx: fake.ctx, data, opener: storage.opener, notifier: { notify }, sessions: () => ['s1', 's2'], timeZone: () => zone, now: () => T0, sleep: noSleep, report: () => {} };
+  const connector = new AgendaConnector(deps);
+  await connector.start(defaultAgendaSettings());
+  return { ...fake, storage, data, deps, connector };
+}
+
+test('old prepared requests and captured tools cannot write after disable and reactivation', async () => {
+  const f = await runtimeFixture();
+  const args = { action: 'add', title: 'stale todo' };
+  const oldExec = f.execution('todo', args);
+  await f.prepare(oldExec);
+  const oldTool = f.tools.get('todo')!;
+  const delayed = deferred<{ kind: string }>();
+  const oldGate = f.hooks[0]!(f.execution('calendar', {}), () => delayed.promise);
+  await f.connector.close();
+  assert.equal(f.tools.size, 0);
+  assert.equal(f.hooks.length, 0);
+  assert.equal(f.sections.length, 0);
+  delayed.resolve({ kind: 'allow' });
+  assert.equal((await oldGate).kind, 'deny');
+  const fresh = new AgendaConnector(f.deps);
+  await fresh.start(defaultAgendaSettings());
+  await assert.rejects(async () => oldTool.execute(args, oldExec), /module_disabled/);
+  await assert.rejects(async () => f.tools.get('todo')!.execute(args, oldExec), /module_disabled/, 'native dispatch resolves the new tool after policy');
+  assert.equal(f.data.listTodos().length, 0);
+  await f.run('todo', args);
+  assert.equal(f.data.listTodos().length, 1);
+  await fresh.close(); await f.data.close();
+});
+
+test('disabling during notification drains the accepted reminder, skips further recipients and does not replay it', async () => {
+  const accepted = deferred<boolean>();
+  const calls: { sessionId: string; text: string }[] = [];
+  const f = await runtimeFixture(async (sessionId, text) => { calls.push({ sessionId, text }); return accepted.promise; });
+  await f.data.addEvent(dueEvent('first'));
+  await f.data.addEvent(dueEvent('second'));
+  const ticking = f.connector.tick();
+  await until(() => calls.length === 1, 'first notification missing');
+  assert.equal(f.connector.tick(), ticking, 'overlapping ticks share one delivery pass');
+  let closed = false;
+  const closing = f.connector.close().then(() => { closed = true; });
+  assert.equal(f.connector.view().toolsRegistered, false);
+  assert.equal(await f.connector.tick(), 0);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closed, false);
+  accepted.resolve(true);
+  assert.equal(await ticking, 1);
+  await closing;
+  assert.equal(calls.length, 1, 'no second recipient or second reminder admitted after disable');
+  assert.equal(f.data.listEvents().find(e => e.title === 'first')!.remindedFor, T0);
+  assert.equal(f.data.listEvents().find(e => e.title === 'second')!.remindedFor, undefined);
+  const fresh = new AgendaConnector({ ...f.deps, notifier: { async notify(sessionId, text) { calls.push({ sessionId, text }); return true; } } });
+  await fresh.start(defaultAgendaSettings());
+  await fresh.tick();
+  assert.equal(calls.filter(c => c.text.includes('first')).length, 1);
+  assert.equal(calls.filter(c => c.text.includes('second')).length, 2);
+  await fresh.close(); await f.data.close();
+});
+
+test('a reminder receipt cannot recreate a deleted event or deliver a stale later event snapshot', async () => {
+  const accepted = deferred<boolean>();
+  const texts: string[] = [];
+  const f = await runtimeFixture(async (_sessionId, text) => { texts.push(text); return accepted.promise; });
+  const first = (await f.data.addEvent(dueEvent('delete me'))).event!;
+  const second = (await f.data.addEvent(dueEvent('old title'))).event!;
+  const ticking = f.connector.tick();
+  await until(() => texts.length === 1, 'notification missing');
+  await f.data.removeEvent(first.id);
+  await f.data.updateEvent(second.id, { title: 'new title' });
+  accepted.resolve(true);
+  await ticking;
+  assert.equal(f.data.listEvents().some(e => e.id === first.id), false);
+  assert.equal(f.data.listEvents()[0]!.title, 'new title');
+  assert.equal(f.data.listEvents()[0]!.remindedFor, undefined);
+  assert.equal(texts.length, 1);
+  await f.connector.tick();
+  assert.ok(texts.slice(1).every(text => text.includes('new title')));
+  await f.connector.close(); await f.data.close();
+});
+
+test('a reminder receipt cannot undo completion or overwrite a changed todo deadline', async () => {
+  const accepted = deferred<boolean>();
+  let calls = 0;
+  const f = await runtimeFixture(async () => { calls++; return accepted.promise; });
+  const todo = await f.data.addTodo({ title: 'report', due: '2026-09-21 10:00' });
+  const ticking = f.connector.tick();
+  await until(() => calls === 1, 'notification missing');
+  await f.data.updateTodo(todo.id, { done: true, due: '2026-09-22 10:00', note: 'owner edit' });
+  accepted.resolve(true);
+  await ticking;
+  assert.equal(calls, 1);
+  const saved = f.data.listTodos()[0]!;
+  assert.equal(saved.doneAt, T0);
+  assert.equal(saved.due, T0 + 86_400_000);
+  assert.equal(saved.note, 'owner edit');
+  assert.equal(saved.remindedFor, undefined);
+  await f.connector.close(); await f.data.close();
+});
+
+test('an admitted data write completes before runtime disposal and owner management stays usable', async () => {
+  const f = await runtimeFixture();
+  const store = (await f.storage.opener.open()).table('todos');
+  // Keep the real shared table but delay its durability acknowledgement.
+  const release = deferred<void>();
+  const original = f.data['domain'].table.bind(f.data['domain']);
+  let writing = false;
+  f.data['domain'].table = ((name: 'todos' | 'events') => name === 'todos' ? { ...store, async put(key: string, value: Todo) {
+    writing = true; await release.promise; await store.put(key, value);
+  } } : original(name)) as typeof f.data['domain']['table'];
+  const writingTool = f.run('todo', { action: 'add', title: 'accepted write' });
+  await until(() => writing, 'write missing');
+  let closed = false;
+  const closing = f.connector.close().then(() => { closed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closed, false);
+  release.resolve();
+  await writingTool; await closing;
+  assert.equal(f.data.listTodos()[0]!.title, 'accepted write');
+  await f.data.updateTodo(f.data.listTodos()[0]!.id, { done: true });
+  assert.equal(f.data.listTodos()[0]!.doneAt, T0);
+  await f.data.close();
+});
+
+test('an accepted quiet-hours reminder survives runtime disable without being generated twice', async () => {
+  let now = T0;
+  const queueStore = fakeDomain();
+  const sent: string[] = [];
+  const gate = await PushGate.open({ async open() { return await queueStore.opener.open() as unknown as AssistantDomain; } },
+    { async notify(_session, text) { sent.push(text); return true; } }, { ...defaultAssistantSettings(), timeZone: zone, quietStart: '09:00', quietEnd: '11:00' }, () => now);
+  const f = await runtimeFixture((...args) => gate.notify(...args));
+  f.deps.sessions = () => ['s1'];
+  await f.data.addEvent(dueEvent('quiet fixture'));
+  assert.equal(await f.connector.tick(), 1);
+  assert.equal(gate.pending().length, 1);
+  assert.equal(sent.length, 0);
+  await f.connector.close();
+  assert.equal(gate.pending().length, 1);
+  now += 2 * 3_600_000;
+  await gate.flush();
+  assert.equal(sent.length, 1);
+  const fresh = new AgendaConnector(f.deps);
+  await fresh.start(defaultAgendaSettings());
+  assert.equal(await fresh.tick(), 0);
+  assert.equal(gate.pending().length, 0);
+  await fresh.close(); await f.data.close(); await gate.close();
+});
+
+test('a briefing waiting on native reminders reads agenda availability at delivery time', async () => {
+  const catalog = deferred<[]>();
+  const sent: string[] = [];
+  let enabled = true;
+  let reads = 0;
+  const briefing = new DailyBriefing({ ctx: { schedule: { catalog: () => catalog.promise } } as unknown as Pick<Context, 'schedule'>,
+    notifier: { async notify(_session, text) { sent.push(text); return true; } }, sessions: () => ['s1'], now: () => T0 }, defaultAssistantSettings());
+  briefing.attachAgenda(() => { reads++; return enabled ? { occurrences: [], todos: [{ id: 'td-1', title: 'hidden after disable', createdAt: T0 }] } : undefined; });
+  const sending = briefing.send(true);
+  enabled = false;
+  catalog.resolve([]);
+  await sending;
+  assert.equal(reads, 1);
+  assert.doesNotMatch(sent[0]!, /hidden after disable|今天没有日程/);
+  assert.match(sent[0]!, /今天没有待触发的提醒/);
+  briefing.close();
 });

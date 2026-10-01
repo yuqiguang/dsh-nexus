@@ -10,3 +10,6 @@
     - id: nexus-mail
       name: nexus-next/mail
       disabled: true
+    - id: nexus-agenda
+      name: nexus-next/agenda
+      disabled: true

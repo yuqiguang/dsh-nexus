@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Calendar and Todos",
+    "description": "Personal events, todos, due reminders and agenda in daily briefings. Off by default; disabling keeps data and does not recall notifications already accepted for delivery."
+  }
+}

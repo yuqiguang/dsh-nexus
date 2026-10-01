@@ -25,11 +25,11 @@ export function backfillProfilePatch(patch, coderRoots) {
   const entry = inserts.find(item => item.id === 'nexus-channels' || item.id === 'nexus-feishu');
   if (entry?.config && !entry.config.coderRoots) { entry.config.coderRoots = coderRoots; }
   if (entry) {
-    for (const component of ['documents', 'memory', 'mail']) {
+    for (const component of ['documents', 'memory', 'mail', 'agenda']) {
       const id = `nexus-${component}`;
       if (inserts.some(item => item.id === id)) continue;
       const name = entry.name?.startsWith('file:')
-        ? new URL(`./${component === 'mail' ? 'connectors/mail' : component}/plugin.js`, entry.name).href : `nexus-next/${component}`;
+        ? new URL(`./${['mail', 'agenda'].includes(component) ? `connectors/${component}` : component}/plugin.js`, entry.name).href : `nexus-next/${component}`;
       patch.find(layer => Array.isArray(layer.insert)).insert.push({ id, name, disabled: true });
     }
     // The official bundle now owns these rows. Keep explicit configuration/disable overrides.

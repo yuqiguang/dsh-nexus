@@ -25,7 +25,6 @@ import { Assistant } from './assistant/index.js';
 import { DEFAULT_TIME_ZONE } from './assistant/settings.js';
 import { installAssistantPrompt } from './assistant/prompt.js';
 import { installUntrustedResults } from './assistant/untrusted.js';
-import { ModuleSettings } from './modules/settings.js';
 import { MemoryService, installMemory } from './memory/index.js';
 import { projectScope, sessionMemoryScope } from './memory/scope.js';
 import { installBridge, type BridgeExtras } from './dsh/bridge.js';
@@ -129,8 +128,6 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   const registry = new BridgeRegistry();
   const startedAt = Date.now();
   const report = (message: string) => console.error(`[nexus-service] ${message}`);
-  const modules = await ModuleSettings.open(new DshRecords(ctx.credentials, 'nexus-modules'), !!ctx.get('schedule'));
-  registerRpc(ctx, 'nexus-modules', ['list', 'save'], (method, payload) => modules.handle(method, payload));
   // Which completed turns each chat has seen; the bridges read it when they mount to deliver what ended while they were gone.
   const ledger = await DeliveryLedger.open(ctx.storageDomain);
   ctx.effect(() => () => { void ledger.close(); });
@@ -166,7 +163,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   };
   const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, notifier: registry, manager,
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
-  const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone, modules: modules.active });
+  const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone });
   ctx.provide('nexusConnectors', connectors);
   assistant.attachAgenda((now, days) => connectors.agendaFor(now, days));
   ctx.provide('nexusWorkspace', { root: workspace });

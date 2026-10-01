@@ -694,7 +694,7 @@ test('core retains mailbox credentials and watches while disabled, and rejects s
   let clients = 0;
   const checks: ReturnType<typeof deferred<Awaited<ReturnType<MailClient['check']>>>>[] = [];
   box.client.check = () => { const reply = deferred<Awaited<ReturnType<MailClient['check']>>>(); checks.push(reply); return reply.promise; };
-  const connectors = new Connectors({ ctx: core.ctx, client: () => { clients++; return box.client; }, modules: { agenda: false },
+  const connectors = new Connectors({ ctx: core.ctx, client: () => { clients++; return box.client; },
     registry: { bound: () => [], async inject() { return false; } }, notifier: { async notify() { return false; } }, timeZone: () => 'UTC', sleep: noSleep });
   await connectors.start();
   await connectors.handle('save', { revision: 0, config: { mail: runtimeSettings() } });

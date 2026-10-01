@@ -10,7 +10,6 @@ import { MemorySettings } from './MemorySettings.js';
 import { ConnectorSettings } from './ConnectorSettings.js';
 import { DocumentSettings } from './DocumentSettings.js';
 import { DataSettings } from './DataSettings.js';
-import { ModuleSettings } from './ModuleSettings.js';
 import styles from './styles.css';
 import { applyChatFold, readChatFold } from './chatFold.js';
 import { TASK_RESOURCE, TASK_TAB_ID, TASK_TAB_KIND, coderTaskPanel, coderTaskRow, taskIdOf, taskAddress } from './CoderTasks.js';
@@ -50,9 +49,6 @@ export function apply(ctx: Context): void {
       await ui.openWorkspace(workspace.workspaceId);
     }, ...(sidebar ? { openTask: (id: string) => sidebar.openResource(taskAddress(id)) } : {}) } : undefined;
   } })));
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-modules', order: 13, label: 'Nexus 扩展',
-  }, ModuleSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-assistant', order: 14, label: '助理',
   }, AssistantSettings));
