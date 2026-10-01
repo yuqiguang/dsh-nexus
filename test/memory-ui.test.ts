@@ -3,8 +3,10 @@ import { test, type TestContext } from 'node:test';
 import { act, createElement } from 'react';
 import { JSDOM } from 'jsdom';
 import { MemorySettings, type MemoryApi } from '../src/client/MemorySettings.js';
-import type { MemoryView } from '../src/memory/index.js';
+import { MemoryService, type MemoryView } from '../src/memory/index.js';
 import { LIMITS } from '../src/memory/store.js';
+import { LEGACY_SCOPE, scopeId, type MemoryScope } from '../src/memory/scope.js';
+import { fakeMemoryDomain } from './memoryFixture.js';
 
 const T0 = Date.parse('2026-09-20T10:00:00+08:00');
 const initial = (): MemoryView => ({ policy: { remember: 'auto', inject: true }, limits: LIMITS,
@@ -106,4 +108,47 @@ test('a limit error from the server is explained and the page keeps working', as
   await ui.submit('memory-event-text');
   assert.match(ui.text(), /超出记忆容量或长度限制/);
   assert.equal((ui.field('memory-event-text') as HTMLTextAreaElement).value, '太长', 'the draft survives a refused write');
+});
+
+test('scope selection clears old export and drafts; mutations and exports stay in the visible scope', async t => {
+  const a: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/a' };
+  const b: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/b' };
+  const service = await MemoryService.open(fakeMemoryDomain().opener, () => T0,
+    { async resolveSession() { return a; }, async projects() { return [a, b]; } });
+  t.after(() => service.close());
+  await service.handle('event/add', { scopeId: scopeId(a), text: 'A-private' });
+  await service.handle('event/add', { scopeId: scopeId(b), text: 'B-private' });
+  const calls: { method: string; payload: any }[] = [];
+  const ui = await page(t, async (method, payload) => { calls.push({ method, payload }); return service.handle(method, payload); });
+  await ui.enter('memory-scope', scopeId(a));
+  assert.match(ui.text(), /A-private/); assert.doesNotMatch(ui.text(), /B-private/);
+  await ui.click('导出 JSON');
+  assert.match((ui.dom.window.document.querySelector('[aria-label="导出的记忆"]') as HTMLTextAreaElement).value, /A-private/);
+  await ui.enter('memory-event-text', 'unsaved-A');
+  await ui.enter('memory-scope', scopeId(b));
+  assert.equal(ui.dom.window.document.querySelector('[aria-label="导出的记忆"]'), null);
+  assert.equal(ui.field('memory-event-text').value, '');
+  assert.doesNotMatch(ui.text(), /A-private/); assert.match(ui.text(), /B-private/);
+  await ui.enter('memory-event-text', 'B-new'); await ui.submit('memory-event-text');
+  assert.equal(calls.at(-1)?.payload.scopeId, scopeId(b));
+  assert.doesNotMatch((await service.handle('export', { scopeId: scopeId(a) })).exportJson!, /B-new/);
+});
+
+test('legacy classification requires an explicit target and copies the exact visible record without removing the original', async t => {
+  const scope: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/project' };
+  const service = await MemoryService.open(fakeMemoryDomain().opener, () => T0,
+    { async resolveSession() { return scope; }, async projects() { return [scope]; } });
+  t.after(() => service.close());
+  await service.legacy.setProfile('数据库', 'legacy-A', 'model');
+  const ui = await page(t, (method, payload) => service.handle(method, payload));
+  await ui.enter('memory-scope', LEGACY_SCOPE);
+  assert.equal(ui.dom.window.document.getElementById('memory-profile-key'), null);
+  const copyButton = [...ui.dom.window.document.querySelectorAll('button')].find(button => button.textContent === '复制到所选范围')!;
+  assert.equal(copyButton.disabled, true);
+  await ui.enter('memory-copy-target', scopeId(scope)); await ui.click('复制到所选范围');
+  assert.match(ui.text(), /已复制到所选范围/);
+  assert.equal(service.legacy.profile()[0]?.value, 'legacy-A');
+  assert.equal(service.store.forScope(scope).profile()[0]?.value, 'legacy-A');
+  await ui.click('复制到所选范围');
+  assert.match(ui.text(), /目标范围已有同名画像/);
 });

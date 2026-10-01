@@ -11,7 +11,7 @@ if (!/^dist(\.[a-z0-9-]+)?$/.test(outName)) {
   process.exit(1);
 }
 
-const compilation = spawnSync(process.execPath, ['--max-old-space-size=512', 'node_modules/typescript/bin/tsc', '--outDir', outName], {
+const compilation = spawnSync(process.execPath, ['--max-old-space-size=640', 'node_modules/typescript/bin/tsc', '--outDir', outName], {
   cwd: projectRoot, stdio: 'inherit',
 });
 if (compilation.status !== 0) process.exit(compilation.status ?? 1);

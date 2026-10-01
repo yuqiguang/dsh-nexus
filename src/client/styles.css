@@ -28,6 +28,7 @@
 .nexus-channel-card textarea { resize: vertical; min-height: 64px; }
 .nexus-channel-card code { font-size: 12px; overflow-wrap: anywhere; }
 .nexus-channel-card pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.nexus-readiness { padding-left: 20px; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
 .nexus-memory-list { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; }
 .nexus-memory-list li { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 8px 0; border-top: 1px solid var(--dsw-alias-border-l2, #eee); overflow-wrap: anywhere; }
 .nexus-memory-list li:first-child { border-top: none; }

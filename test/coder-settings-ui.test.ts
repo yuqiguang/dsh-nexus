@@ -16,6 +16,65 @@ const initial = (): CodersView => ({
   recentTasks: [{ id: 'ct-1', coder: 'codex', status: 'completed', description: '列目录', updatedAt: 1 }],
 });
 
+test('the first task flow selects a native project without IM and opens only a saved project', async t => {
+  let view: CodersView = { ...initial(), workspaces: [{ id: 'wa', title: '示例项目', path: '/srv/demo' }] };
+  const calls: { method: string; payload: any }[] = [], opened: string[] = [];
+  let closed = 0;
+  const ui = await page(t, async (method, payload: any) => {
+    calls.push({ method, payload });
+    if (method === 'project/select') view = { ...view, settings: { ...view.settings, revision: view.settings.revision + 1, projectRoot: payload.path }, project: { path: payload.path, allowed: true } };
+    return structuredClone(view);
+  }, { navigation: () => ({ pickDirectory: async () => null, openProject: async path => { opened.push(path); } }), close: () => { closed++; } });
+  const open = () => [...ui.dom.window.document.querySelectorAll('button')].find(item => item.textContent === '打开项目会话')!;
+  assert.match(ui.text(), /无需连接微信或飞书/);
+  assert.match(ui.text(), /凭据：尚未确认/);
+  assert.doesNotMatch(ui.text(), /配置已准备/);
+  assert.equal(open().disabled, true);
+  await ui.enter('nexus-known-project', '/srv/demo');
+  assert.equal(ui.field('nexus-project-path').value, '/srv/demo');
+  assert.equal(open().disabled, true, 'an edited path must be saved first');
+  await ui.click('使用此项目');
+  assert.deepEqual(calls.find(call => call.method === 'project/select')?.payload, { path: '/srv/demo', revision: 0, allow: false });
+  assert.equal(open().disabled, false);
+  await ui.click('打开项目会话');
+  assert.deepEqual(opened, ['/srv/demo']); assert.equal(closed, 1);
+  assert.ok(calls.every(call => ['list', 'project/select'].includes(call.method)), 'no installation, model call, or channel setup');
+  await ui.enter('codex-model', 'draft-model');
+  assert.equal(ui.field('nexus-project-path').disabled, true, 'unsaved advanced configuration is not discarded by project selection');
+});
+
+test('project consent is explicit, picker cancellation keeps the draft, and stale project edits cannot overwrite another window', async t => {
+  let view: CodersView = { ...initial(), project: { path: '/srv/original', allowed: true } };
+  const calls: { method: string; payload: any }[] = [];
+  const ui = await page(t, async (method, payload: any) => {
+    calls.push({ method, payload });
+    if (method === 'project/select') {
+      if (!payload.allow) throw new Error('project_permission_required');
+      view = { ...view, settings: { ...view.settings, revision: 1, projectRoot: '/srv/actual' }, project: { path: '/srv/actual', allowed: true } };
+    }
+    return structuredClone(view);
+  }, { navigation: () => ({ pickDirectory: async () => null, openProject: async () => {} }) });
+  await ui.enter('nexus-project-path', '/srv/linked');
+  await ui.click('选择目录');
+  assert.equal(ui.field('nexus-project-path').value, '/srv/linked');
+  await ui.click('使用此项目');
+  assert.match(ui.text(), /该项目不在允许范围内/);
+  const consent = ui.dom.window.document.querySelector('.nexus-coding-start input[type=checkbox]') as HTMLInputElement;
+  assert.equal(consent.checked, false);
+  await act(async () => consent.click());
+  await ui.click('使用此项目');
+  assert.equal(ui.field('nexus-project-path').value, '/srv/actual', 'canonical saved path replaces the draft');
+  assert.equal(consent.checked, false, 'consent is not reused for the next project');
+  await ui.enter('nexus-project-path', '/srv/next');
+  view = { ...view, settings: { ...view.settings, revision: 2 } };
+  await act(async () => { await delay(1700); });
+  assert.match(ui.text(), /配置已更新，请重新载入项目选择/);
+  const save = [...ui.dom.window.document.querySelectorAll('button')].find(item => item.textContent === '使用此项目')!;
+  assert.equal(save.disabled, true);
+  await ui.click('重新载入项目');
+  assert.equal(ui.field('nexus-project-path').value, '/srv/actual');
+});
+
 test('Windows sandbox setup is an explicit settings action and firewall failures are not offered as setup retries', async t => {
   let view = initial();
   view.codex = { ...view.codex, ready: false, windowsSandbox: 'notConfigured' };
@@ -46,7 +105,7 @@ test('settings use the host platform and host-generated login command, even in a
   assert.match(ui.text(), /DSH 所在电脑的 PowerShell/);
 });
 
-async function page(t: TestContext, api: CoderApi) {
+async function page(t: TestContext, api: CoderApi, extra: Partial<Parameters<typeof CoderSettings>[0]> = {}) {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://localhost/' });
   const globals = { window: dom.window, document: dom.window.document, navigator: dom.window.navigator,
     HTMLElement: dom.window.HTMLElement, HTMLInputElement: dom.window.HTMLInputElement, IS_REACT_ACT_ENVIRONMENT: true };
@@ -62,7 +121,7 @@ async function page(t: TestContext, api: CoderApi) {
       else Reflect.deleteProperty(globalThis, key);
     }
   });
-  await act(async () => root.render(createElement(CoderSettings, { api })));
+  await act(async () => root.render(createElement(CoderSettings, { api, ...extra })));
   const field = (id: string) => dom.window.document.getElementById(id) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
   const enter = async (id: string, value: string) => {
     await act(async () => {
@@ -100,7 +159,7 @@ test('the coder settings page shows status, saves every field while clearing typ
     return structuredClone(view);
   };
   const ui = await page(t, api);
-  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['通用', 'Codex', 'Claude Code', '习惯规则', '最近任务']);
+  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['开始编码', '通用', 'Codex', 'Claude Code', '习惯规则', '最近任务']);
   assert.match(ui.text(), /可用（系统安装，首选的Nexus 托管不可用）/);
   assert.match(ui.text(), /Logged in using an API key - sk-a…/);
   assert.match(ui.text(), /Claude Code 的 Agent SDK 尚未安装/);

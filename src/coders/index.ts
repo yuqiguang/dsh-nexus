@@ -9,6 +9,7 @@ import { ActiveBudget } from './budget.js';
 import { assertRetry } from './recovery.js';
 import { resolvePlanStep, VERIFY_SHELL_SYNTAX } from './plan.js';
 import { installBriefs } from './brief.js';
+import { deliveryReport } from './delivery.js';
 import { DependencyError, dependencyIds, waitForDependencies } from './dependencies.js';
 import { taskStatusLabel } from './status.js';
 import { CoderQueue } from './queue.js';
@@ -80,6 +81,8 @@ export interface CodersConfig {
 /** What the task panel shows: the task record, rendered for reading, and the coder's own log of the same span. */
 export interface TaskDetailView {
   id: string;
+  ownerSession?: string;
+  goal?: { id: string; revision: number; report: string };
   coder: CoderKind;
   coderName: string;
   status: TaskRecord['status'];
@@ -894,10 +897,19 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const { id, brief } = (payload && typeof payload === 'object' ? payload : {}) as { id?: unknown; brief?: unknown };
     const task = typeof id === 'string' ? store.get(id) : undefined;
     if (!task) throw new ChannelError('task_not_found');
+    let goal: TaskDetailView['goal'];
+    if (brief !== true && task.brief) {
+      // Read the current brief through its owner, including version-bound user reviews.
+      // An old task remains visible even if its goal record is no longer available.
+      try {
+        const current = briefs.get(task.brief.id, task.ownerSession);
+        goal = { id: current.id, revision: current.revision, report: deliveryReport(current, store.list()) };
+      } catch { /* No goal evidence to present. */ }
+    }
     const effective = brief === true ? undefined : await runtime();
     const homes = !effective ? { codex: [], claude: [] } : coderHomes({ ...('error' in effective.codex ? {} : { codex: effective.codex.env }), ...('error' in effective.claude ? {} : { claude: effective.claude.env }) });
     return {
-      id: task.id, coder: task.coder, coderName: CODER_NAMES[task.coder], status: task.status, statusLabel: taskStatusLabel(task), active: isActive(task),
+      id: task.id, ownerSession: task.ownerSession, ...(goal ? { goal } : {}), coder: task.coder, coderName: CODER_NAMES[task.coder], status: task.status, statusLabel: taskStatusLabel(task), active: isActive(task),
       description: task.description, ...(task.brief ? { brief: task.brief } : {}), ...(task.planStep ? { planStep: task.planStep } : {}), cwd: task.cwd, ...(task.permissions ? { permissionDescription: permissionSummary(task.permissions) } : {}), ...(task.stopReason ? { stopReason: task.stopReason } : {}), createdAt: task.createdAt, updatedAt: task.updatedAt,
       ...(task.dependsOn?.length ? { dependsOn: task.dependsOn } : {}),
       ...(task.resumedFrom ? { resumedFrom: task.resumedFrom } : {}), ...(isActive(task) ? { runningFor: runningFor(task) } : {}),

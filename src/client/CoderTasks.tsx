@@ -36,7 +36,7 @@ export function dispatchedTaskId(content: readonly unknown[]): string | undefine
 }
 
 /** Read one task, then again every `interval` while it is active and `live` holds; never two reads at once. */
-function useTask(id: string | undefined, brief: boolean, interval: number, live: boolean, api: TaskApi) {
+function useTask(id: string | undefined, brief: boolean, interval: number, live: boolean, api: TaskApi, refresh = 0) {
   const [view, setView] = useState<TaskDetailView | undefined>();
   const [problem, setProblem] = useState<string | undefined>();
   const active = useRef(true);
@@ -60,7 +60,7 @@ function useTask(id: string | undefined, brief: boolean, interval: number, live:
     };
     void load();
     return () => { controller.abort(); if (timer) clearTimeout(timer); };
-  }, [id, brief, interval, live, api]);
+  }, [id, brief, interval, live, api, refresh]);
   return { view, problem };
 }
 
@@ -117,11 +117,12 @@ function Entry({ entry }: { entry: TranscriptEntry }) {
 interface PanelProps { useTabInfo: () => { tab: { contentId: string; visible: boolean } } }
 
 /** The right-sidebar body for one coding task: its standing, then its process as the coder logged it. */
-export function coderTaskPanel(api: TaskApi = taskApi) {
+export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string) => void) {
   return function CoderTaskPanel({ useTabInfo }: PanelProps) {
     const { tab } = useTabInfo();
     const id = taskIdOf(tab.contentId);
-    const { view, problem } = useTask(id, false, 2000, tab.visible, api);
+    const [refresh, setRefresh] = useState(0);
+    const { view, problem } = useTask(id, false, 2000, tab.visible, api, refresh);
     if (!view) return <div className="nexus-coder-panel"><p className="nexus-channel-hint">{problem ?? '正在读取任务…'}</p></div>;
     const entries = view.transcript.entries;
     return (
@@ -131,6 +132,9 @@ export function coderTaskPanel(api: TaskApi = taskApi) {
           <span className="nexus-coder-row-status" data-state={view.status}>{view.statusLabel}</span>
         </header>
         <p className="nexus-coder-panel-task">{view.description}</p>
+        <p><button type="button" className="nexus-coder-row-open" onClick={() => setRefresh(value => value + 1)}>刷新结果</button></p>
+        {view.ownerSession && openSession && <p><button type="button" className="nexus-coder-row-open" onClick={() => openSession(view.ownerSession!)}>回到所属会话</button></p>}
+        <p className="nexus-channel-hint">继续修改、取消任务或回答审批，请在任务所属会话中操作。最后更新：{new Date(view.updatedAt).toLocaleString('zh-CN', { hour12: false })}。</p>
         {view.planStep && <p className="nexus-channel-hint">计划步骤：{view.planStep}</p>}
         <p className="nexus-channel-hint">{view.cwd}{view.resumedFrom ? `，续接 ${view.resumedFrom}` : ''}{view.runningFor ? `。${view.runningFor}` : ''}</p>
         {view.brief && <div className="nexus-channel-hint"><p>总体目标：{view.brief.objective}（{view.brief.id} v{view.brief.revision}）</p><p>共同约束：{view.brief.constraints || "无补充"}</p><p>本任务验收项：{view.brief.acceptance.map(item => `${item.id} ${item.text}`).join("；")}</p></div>}
@@ -144,6 +148,11 @@ export function coderTaskPanel(api: TaskApi = taskApi) {
           <p>{view.result.summary || view.result.detail || '（没有文本结果）'}</p>
           <p className="nexus-channel-hint">改动文件 {view.result.changedFiles.length} 个{view.result.verifyOk === undefined || view.result.verification === 'not-run' ? '，尚未独立验证' : view.result.verifyOk ? '，验证通过' : '，验证失败'}</p>
           {view.result.changedFiles.length > 0 && <ul>{view.result.changedFiles.slice(0, 40).map(file => <li key={file}>{file}</li>)}</ul>}
+        </div>}
+        {view.goal && <div className="nexus-coder-panel-result">
+          <strong>目标与验收</strong>
+          {view.brief && view.brief.revision !== view.goal.revision && <p>此任务属于旧目标版本 v{view.brief.revision}；以下显示当前版本 v{view.goal.revision} 的验收进度。</p>}
+          <p>{view.goal.report}</p>
         </div>}
         {view.decisions.length > 0 && <details className="nexus-coder-panel-decisions"><summary>监工的决定</summary><ul>{view.decisions.map((line, index) => <li key={index}>{line}</li>)}</ul></details>}
         <h4>过程</h4>

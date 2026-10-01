@@ -1,6 +1,6 @@
 {
   "name": "nexus-next",
-  "version": "0.2.9",
+  "version": "0.2.12",
   "private": true,
   "type": "module",
   "exports": {
@@ -26,7 +26,7 @@
       ]
     }
   },
-  "description": "Nexus for DSH: a community plugin for messaging channels, personal assistance, and supervised coding tasks.",
+  "description": "Nexus for DSH: a personal coding assistant for supervising, verifying, and continuing local coding tasks from desktop and messaging channels.",
   "engines": {
     "node": ">=22.20.0"
   },
@@ -39,7 +39,7 @@
     "health": "node scripts/health.mjs",
     "update": "node scripts/update.mjs",
     "build": "node --max-old-space-size=384 scripts/build.mjs",
-    "check": "node --max-old-space-size=512 node_modules/typescript/bin/tsc --noEmit",
+    "check": "node --max-old-space-size=640 node_modules/typescript/bin/tsc --noEmit",
     "test": "node --max-old-space-size=384 --test --test-reporter=spec --test-concurrency=1 ${NEXUS_DIST:-dist}/test/*.test.js",
     "smoke": "node scripts/smoke.mjs"
   },

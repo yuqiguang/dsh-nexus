@@ -13,7 +13,7 @@ import { SessionId } from '@deepseek-ai/dsh-session';
 import { access, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { installCoders } from '../src/coders/index.js';
+import { installCoders, type TaskDetailView } from '../src/coders/index.js';
 import type { ClaudeQuery, ClaudeStreamMessage } from '../src/coders/claude.js';
 import { installBridge } from '../src/dsh/bridge.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
@@ -182,7 +182,9 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     await writeFile(join(model.coderCwd, 'README.md'), 'smoke\n');
     ctx.web.registerSearchProvider({ id: 'nexus-research-fixture', available: () => true, async search() { return { sources: [{ url: 'https://example.com', title: 'fixture source' }], truncated: false }; } });
     ctx.web.registerFetchProvider({ id: 'nexus-research-fixture', available: () => true, async fetch({ url }) { return { url, statusCode: 200, body: { kind: 'text', content: 'fixture page' }, truncated: false }; } });
-    const store = await installCoders(ctx, { roots: [model.coderCwd], query, web: () => ctx.web });
+    let readTask: ((method: string, payload: unknown) => Promise<unknown>) | undefined;
+    const store = await installCoders(ctx, { roots: [model.coderCwd], query, web: () => ctx.web,
+      registerRpc: (family, _methods, handle) => { if (family === 'nexus-coder-tasks') readTask = handle; } });
     await bridge.receive(inbound('dispatch', '帮我看看这个目录里有什么。'));
     const agent = ctx.agents.get(sessionId)!;
     await agent.whenIdle();
@@ -238,6 +240,13 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.equal(done.activity, undefined);
     assert.deepEqual(done.decisions.map(decision => [decision.layer, decision.outcome]), [['hard', 'deny'], ['supervisor', 'allow'], ['user', 'allow'], ['supervisor', 'allow']]);
     assert.equal(done.result!.verifyOk, true);
+    assert.ok(readTask);
+    const detail = await readTask('get', { id: done.id }) as TaskDetailView;
+    assert.equal(detail.ownerSession, sessionId);
+    assert.equal(detail.goal?.revision, done.brief?.revision);
+    assert.match(detail.goal!.report, /业务验收待确认/);
+    assert.match(detail.goal!.report, /尚未完成全部验收/);
+    assert.equal((await readTask('get', { id: done.id, brief: true }) as TaskDetailView).goal, undefined);
     assert.equal(done.pending, undefined);
     assert.ok(texts.includes('Claude Code 已完成：目录里有 1 个文件，验证通过。它想读取 SSH 私钥被监工拒绝，ls 自动放行，git push 由你批准。'));
     const events = agent.session.snapshotEvents();
@@ -265,7 +274,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

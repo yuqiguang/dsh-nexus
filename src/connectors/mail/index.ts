@@ -118,9 +118,9 @@ export class MailConnector {
     this.sleep = deps.sleep ?? sleep;
   }
 
-  async start(settings: MailAccountSettings): Promise<void> {
+  async start(settings: MailAccountSettings, runtimeEnabled = true): Promise<void> {
     this.domain = await this.deps.opener.open(mailDomain);
-    this.installGate();
+    if (runtimeEnabled) this.installGate();
     await this.apply(settings);
   }
 

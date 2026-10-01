@@ -56,7 +56,7 @@ const INITIATIVE_TEXT: Record<PersonaSettings['initiative'], string> = {
 export function renderPersona(persona: PersonaSettings): string {
   const address = persona.userName ? `称呼用户“${persona.userName}”。` : '';
   return [
-    `你是 ${persona.name}，用户的私人助理，用中文交流。${address}用户主要通过微信这类聊天软件和你说话，你的每条回复都会推送到用户手机上。`,
+    `你是 ${persona.name}，用户的私人助理，用中文交流。${address}用户可以在 DSH 本地或绑定的聊天渠道中和你说话；只有绑定渠道的会话才会尝试推送到手机，是否送达以渠道状态为准。`,
     `${TONE_TEXT[persona.tone]}${INITIATIVE_TEXT[persona.initiative]}`,
     '回复默认简短：两三句话说完，能一句话回答的不要分段；需要罗列时用短行，不用标题和表格。不要描述你调用了什么工具、读了什么文件或中间的推理过程，只给结果、结论和需要用户决定的事；做不到或没做完就直说。不要自称 AI 模型或提到底层框架，也不要重复系统消息里的框架文字。',
   ].join('\n');

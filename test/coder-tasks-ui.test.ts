@@ -39,6 +39,23 @@ test('task addresses and the dispatched id round-trip', () => {
   assert.equal(dispatchedTaskId([{ type: 'text', text: '工作目录不存在' }]), undefined);
 });
 
+test('finished task details open the owning session and refresh versioned goal acceptance without dispatching work', async t => {
+  const opened: string[] = [];
+  let reads = 0;
+  const api: TaskApi = async () => detail({ ownerSession: 'original-session', active: false, status: 'completed',
+    brief: { id: 'goal', revision: 1, objective: '旧目标', constraints: '', acceptance: [{ id: 'a1', text: '旧验收项' }] },
+    goal: { id: 'goal', revision: 2, report: ++reads === 1 ? '当前目标：检查通过；业务验收待确认' : '当前目标：用户已确认' } });
+  const document = await render(t, coderTaskPanel(api, id => opened.push(id)) as ComponentType<never>,
+    { useTabInfo: () => ({ tab: { contentId: taskAddress('ct-0000abcd'), visible: true } }) });
+  assert.match(document.body.textContent!, /此任务属于旧目标版本 v1/);
+  assert.match(document.body.textContent!, /业务验收待确认/);
+  const click = (label: string) => act(async () => { [...document.querySelectorAll('button')].find(button => button.textContent === label)!.click(); });
+  await click('回到所属会话');
+  assert.deepEqual(opened, ['original-session']); assert.equal(reads, 1);
+  await click('刷新结果');
+  assert.equal(reads, 2); assert.match(document.body.textContent!, /用户已确认/);
+});
+
 test('the coder_task row shows the task and opens its panel; a refused dispatch says why', async t => {
   const opened: string[] = [];
   const asked: [string, boolean][] = [];

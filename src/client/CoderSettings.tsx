@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { CodersView, CoderStatusView } from '../coders/manager.js';
 import type { InstallStatus } from '../coders/install.js';
 import { explain } from './ChannelSettings.js';
+import { CodingStart, type CodingNavigation } from './CodingStart.js';
 
 export type CoderApi = (method: string, payload?: unknown, signal?: AbortSignal) => Promise<CodersView>;
 
@@ -52,7 +53,7 @@ function Status({ status }: { status: CoderStatusView }) {
 
 function when(at: number) { return new Date(at).toLocaleString('zh-CN', { hour12: false }); }
 
-export function CoderSettings({ api = coderApi }: { api?: CoderApi }) {
+export function CoderSettings({ api = coderApi, navigation, close }: { api?: CoderApi; navigation?: () => CodingNavigation | undefined; close?: () => void }) {
   const [view, setView] = useState<CodersView>();
   const [draft, setDraft] = useState<Draft>();
   const [dirty, setDirty] = useState(false);
@@ -106,6 +107,8 @@ export function CoderSettings({ api = coderApi }: { api?: CoderApi }) {
       {status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
   return <section className="nexus-channel-settings" aria-label="编码工具">
     <h2>编码工具</h2>
+    <CodingStart view={view} disabled={busy || dirty} action={action} navigation={navigation} close={close} />
+    {dirty && <p className="nexus-channel-hint">请先保存或放弃下方工具设置的修改，再切换项目。</p>}
     <p>把编码任务派给本机的 Codex 或 Claude Code。Nexus 可以自己安装一份（托管）并用这里的端点和密钥运行，也可以使用系统里已有的安装。密钥保存在本机，不会回填到页面。</p>
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
     {view.install && <p role={view.install.phase === 'failed' ? 'alert' : 'status'} className="nexus-channel-account">
@@ -217,8 +220,14 @@ export function CoderSettings({ api = coderApi }: { api?: CoderApi }) {
     </article>
     <article className="nexus-channel-card">
       <header><h3>最近任务</h3></header>
+      {view.project && <p className="nexus-channel-hint">当前项目：{view.project.path}。列出此目录及子目录中的最近 10 项任务。</p>}
       {view.recentTasks.length === 0 && <p className="nexus-channel-hint">还没有编码任务。</p>}
-      {view.recentTasks.map(task => <p key={task.id} className="nexus-channel-account">{task.id} · {names[task.coder]} · {task.statusLabel ?? taskStatus[task.status] ?? task.status} · {when(task.updatedAt)}<br />{task.description}</p>)}
+      {view.recentTasks.map(task => <div key={task.id} className="nexus-channel-account">
+        <p>{task.id} · {names[task.coder]} · {task.statusLabel ?? taskStatus[task.status] ?? task.status}<br />{task.description}</p>
+        {task.objective && <p className="nexus-channel-hint">总体目标：{task.objective}</p>}
+        <p className="nexus-channel-hint">{task.cwd ? `${task.cwd} · ` : ''}最后更新：{when(task.updatedAt)}</p>
+        {navigation?.()?.openTask && <button type="button" disabled={busy || dirty} onClick={() => { navigation?.()?.openTask?.(task.id); close?.(); }}>查看任务与验收</button>}
+      </div>)}
     </article>
   </section>;
 }

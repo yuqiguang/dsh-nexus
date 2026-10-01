@@ -1,4 +1,4 @@
-import type { SessionId } from '@deepseek-ai/dsh-session';
+import { SessionId } from '@deepseek-ai/dsh-session';
 import type { ResearchWeb } from './coders/research.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-credentials';
@@ -23,7 +23,9 @@ import { Assistant } from './assistant/index.js';
 import { DEFAULT_TIME_ZONE } from './assistant/settings.js';
 import { installAssistantPrompt } from './assistant/prompt.js';
 import { installUntrustedResults } from './assistant/untrusted.js';
+import { ModuleSettings } from './modules/settings.js';
 import { MemoryService, installMemory } from './memory/index.js';
+import { projectScope, sessionMemoryScope } from './memory/scope.js';
 import { installBridge, type BridgeExtras } from './dsh/bridge.js';
 import { DshRecords } from './dsh/records.js';
 import { installHealth, readBuildInfo } from './service/health.js';
@@ -128,9 +130,10 @@ export async function installCoderSettings(ctx: Context, profileRoots: string[],
   let manager: CodersManager;
   const installer = new CoderInstaller(layout, seams.npm, coder => manager.afterInstall(coder));
   const { npm: _npm, ...managerSeams } = seams;
-  manager = new CodersManager({ store: new CoderSettingsStore(new DshRecords(ctx.credentials, 'nexus-coders')), layout, profileRoots, installer, ...managerSeams });
+  manager = new CodersManager({ store: new CoderSettingsStore(new DshRecords(ctx.credentials, 'nexus-coders')), layout, profileRoots, installer,
+    workspaces: () => ctx.get('workspaceRegistry')?.list().map(({ id, title, path }) => ({ id, title, path })) ?? [], ...managerSeams });
   await manager.load();
-  registerRpc(ctx, 'nexus-coders', ['list', 'save', 'clear-secret', 'install', 'windows-sandbox/setup', 'rules/remove'], (method, payload) => manager.handle(method, payload));
+  registerRpc(ctx, 'nexus-coders', ['list', 'refresh', 'project/select', 'save', 'clear-secret', 'install', 'windows-sandbox/setup', 'rules/remove'], (method, payload) => manager.handle(method, payload));
   return manager;
 }
 
@@ -149,6 +152,8 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   const registry = new BridgeRegistry();
   const startedAt = Date.now();
   const report = (message: string) => console.error(`[nexus-service] ${message}`);
+  const modules = await ModuleSettings.open(new DshRecords(ctx.credentials, 'nexus-modules'), !!ctx.get('schedule'));
+  registerRpc(ctx, 'nexus-modules', ['list', 'save'], (method, payload) => modules.handle(method, payload));
   // Which completed turns each chat has seen; the bridges read it when they mount to deliver what ended while they were gone.
   const ledger = await DeliveryLedger.open(ctx.storageDomain);
   ctx.effect(() => () => { void ledger.close(); });
@@ -165,10 +170,10 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     rotation: () => assistant?.rotation() ?? DEFAULT_ROTATION,
     memory: { remember: (text, sessionId) => memory ? memory.summarize(text, sessionId) : Promise.resolve(undefined) },
     transcribe: (wav, signal) => assistant ? assistant.transcribe(wav, signal) : Promise.reject(new ChannelError('speech_not_configured')) });
-  installAssistantPrompt(ctx);
   installUntrustedResults(ctx);
   assistant = await installAssistant(ctx, registry);
-  memory = await installMemorySettings(ctx);
+  const memorySettings = await installMemorySettings(ctx, { enabled: modules.active.memory });
+  if (modules.active.memory) memory = memorySettings;
   // Coding tasks default to the channel workspace; the development profile widens this to the projects directory.
   // Every channel directory is a root too, so a task the chat asks for can run where the chat works.
   const profileRoots = [...new Set([...(config.coderRoots?.length ? config.coderRoots : [workspace]), ...await channels.workspaces()])].map(root => resolve(root));
@@ -183,9 +188,11 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   };
   const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, notifier: registry, manager,
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
-  const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone });
+  const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone, modules: modules.active });
   assistant.attachAgenda((now, days) => connectors.agendaFor(now, days));
-  await installDocuments(ctx, workspace);
+  if (modules.active.documents) await installDocuments(ctx, workspace);
+  else registerRpc(ctx, 'nexus-documents', ['list', 'detect', 'pandoc/install'], async () => { throw new ChannelError('module_disabled'); });
+  installAssistantPrompt(ctx);
   installFileFind({ ctx, workspace, ledger: files, timeZone });
   // The updater restarts only a quiet service: no open turn, and nothing happened in any session for a while.
   let lastActivityAt = startedAt;
@@ -236,11 +243,18 @@ export async function installDocuments(ctx: Context, workspace: string, seams: P
 }
 
 /** Long-term memory: tools, injection, and the `/api/nexus-memory/*` routes for the settings page. */
-export async function installMemorySettings(ctx: Context, seams: { now?: () => number } = {}): Promise<MemoryService> {
-  const service = await MemoryService.open(ctx.storageDomain, seams.now);
-  installMemory(ctx, service);
-  registerRpc(ctx, 'nexus-memory', ['list', 'export', 'policy', 'profile/set', 'profile/delete', 'event/add', 'event/delete', 'proposal/settle'],
-    (method, payload) => service.handle(method, payload));
+export async function installMemorySettings(ctx: Context, seams: { now?: () => number; enabled?: boolean } = {}): Promise<MemoryService> {
+  const service = await MemoryService.open(ctx.storageDomain, seams.now, {
+    resolveSession: async id => sessionMemoryScope(ctx.sessions.get(SessionId(id))?.header),
+    projects: async () => {
+      const projects = await Promise.all((ctx.get('workspaceRegistry')?.list() ?? []).map(workspace => projectScope(workspace.path).catch(() => undefined)));
+      return projects.filter(project => project !== undefined);
+    },
+  });
+  if (seams.enabled !== false) installMemory(ctx, service);
+  else ctx.effect(() => () => service.close());
+  registerRpc(ctx, 'nexus-memory', ['list', 'export', 'policy', 'profile/set', 'profile/delete', 'event/add', 'event/delete', 'proposal/settle', 'legacy/copy'],
+    async (method, payload) => ({ ...await service.handle(method, payload), moduleEnabled: seams.enabled !== false }));
   return service;
 }
 

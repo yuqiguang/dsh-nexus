@@ -110,11 +110,12 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">
         <header><h3>邮箱</h3><span className={`nexus-channel-state ${mail.phase}`}>{phases[mail.phase] ?? mail.phase}{mail.error ? `：${explain(mail.error)}` : ''}</span></header>
+        {view.modules?.mail === false && <p role="status">邮箱模块当前关闭，不运行邮件工具、轮询或连接测试。已有账号配置保留；请在“Nexus 扩展”启用并重启后使用。</p>}
         {mail.phase !== 'disabled' && <p className="nexus-channel-account">
           {mail.toolsRegistered ? '邮件工具已加入模型的工具集。' : '邮件工具未加入模型的工具集。'}
           {mail.checkedAt !== undefined && ` 上次检查收件箱：${when(mail.checkedAt)}。`}{mail.mailbox && ` 收件箱 ${mail.mailbox.exists} 封${mail.mailbox.unseen !== undefined ? `，未读 ${mail.mailbox.unseen}` : ''}。`}</p>}
         <label htmlFor="mail-enabled"><input id="mail-enabled" type="checkbox" checked={draft.enabled} disabled={busy} style={{ width: 'auto', marginRight: 8 }}
-          onChange={event => edit({ enabled: event.target.checked })} />启用邮箱（启用后模型才有 mail_list、mail_read、mail_send 等工具）</label>
+          onChange={event => edit({ enabled: event.target.checked })} />启用邮箱账号（邮箱模块开启后提供邮件工具）</label>
         <label htmlFor="mail-preset">服务商</label>
         <select id="mail-preset" value="" disabled={busy} onChange={event => applyPreset(event.target.value)}>
           <option value="">选一个服务商自动填入服务器…</option>
@@ -152,17 +153,18 @@ export function ConnectorSettings({ api = connectorApi }: { api?: ConnectorApi }
         <p className="nexus-channel-hint">发给名单之外的人时，助理会在聊天里向你确认；在聊天里说“以后发给某某不用问”也会加到这里。</p>
         {view.mailTest && <p className="nexus-channel-account">测试连接成功（{when(view.mailTest.at)}）：收件箱 {view.mailTest.exists} 封{view.mailTest.unseen !== undefined ? `，未读 ${view.mailTest.unseen}` : ''}。</p>}
         <footer>
-          <button type="button" disabled={busy || stale} onClick={() => void action('mail/test', { revision: view.settings.revision, config: config(draft) })}>测试连接</button>
+          <button type="button" disabled={busy || stale || view.modules?.mail === false} onClick={() => void action('mail/test', { revision: view.settings.revision, config: config(draft) })}>测试连接</button>
           {view.settings.mail.passwordConfigured && <button type="button" disabled={busy || stale} onClick={() => void action('clear-secret', { revision: view.settings.revision })}>清除密码并停用</button>}
         </footer>
       </article>
       <article className="nexus-channel-card">
         <header><h3>日历与待办</h3><span className={`nexus-channel-state ${agenda.toolsRegistered ? 'connected' : 'disabled'}`}>{agenda.toolsRegistered ? '已启用' : '未启用'}</span></header>
+        {view.modules?.agenda === false && <p role="status">日历模块当前关闭，停止工具、自动提醒与简报中的日程。已有数据保留，仍可管理；请在“Nexus 扩展”启用并重启后使用。</p>}
         <p>由助理自己保管，不接外部服务，不需要授权。在聊天里说“明天下午三点和张老师开会”“记个待办周五前交报告”“今天有什么安排”即可；日程开始前和待办到期时会主动提醒，每日简报里也会列出。</p>
         {agenda.toolsRegistered && <p className="nexus-channel-account">日程 {agenda.events} 条，未完成待办 {agenda.openTodos} 条。
           {agenda.nextReminderAt !== undefined && ` 下一次提醒：${when(agenda.nextReminderAt)}。`}{agenda.lastReminderAt !== undefined && ` 上次提醒：${when(agenda.lastReminderAt)}。`}</p>}
         <label htmlFor="agenda-enabled"><input id="agenda-enabled" type="checkbox" checked={draft.agendaEnabled} disabled={busy} style={{ width: 'auto', marginRight: 8 }}
-          onChange={event => edit({ agendaEnabled: event.target.checked })} />启用日历与待办（启用后模型才有 calendar、todo 工具）</label>
+          onChange={event => edit({ agendaEnabled: event.target.checked })} />启用日历与待办服务（日历模块开启后提供工具和提醒）</label>
         <label htmlFor="agenda-remind">日程开始前几分钟提醒（{REMIND_MINUTES.min} 到 {REMIND_MINUTES.max}，0 表示不提醒）</label>
         <input id="agenda-remind" maxLength={4} value={draft.remindMinutes} disabled={busy} autoComplete="off" onChange={event => edit({ remindMinutes: event.target.value })} />
         <label htmlFor="agenda-todo-time">只写了日期的待办，当天几点提醒（HH:MM）</label>

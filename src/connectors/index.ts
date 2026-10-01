@@ -12,6 +12,7 @@ import type { MailClient } from './mail/types.js';
 import { ConnectorSettingsStore, mailInput, redactConnectors, type ConnectorSettingsRecord, type ConnectorSettingsView, type MailAccountSettings } from './settings.js';
 
 export interface ConnectorsView {
+  modules?: { mail: boolean; agenda: boolean };
   settings: ConnectorSettingsView;
   mail: MailStatus;
   /** The mailbox as the last "测试连接" saw it. */
@@ -24,6 +25,7 @@ export interface ConnectorsView {
 }
 
 export interface ConnectorsDeps {
+  modules?: Readonly<{ mail: boolean; agenda: boolean }>;
   ctx: Context;
   registry: Pick<SessionNotifier, 'bound' | 'inject'>;
   /** Where agenda reminders go: the quiet-hours gate in front of the bridges. */
@@ -45,9 +47,11 @@ export class Connectors {
   private readonly agenda: AgendaConnector;
   private mailTest?: ConnectorsView['mailTest'];
   private readonly now: () => number;
+  private readonly modules: Readonly<{ mail: boolean; agenda: boolean }>;
 
   constructor(private readonly deps: ConnectorsDeps) {
     this.now = deps.now ?? Date.now;
+    this.modules = Object.freeze({ mail: deps.modules?.mail ?? true, agenda: deps.modules?.agenda ?? true });
     this.store = new ConnectorSettingsStore(new DshRecords(deps.ctx.credentials, 'nexus-connectors'));
     this.mail = new MailConnector({ ctx: deps.ctx, registry: deps.registry, opener: deps.ctx.storageDomain, timeZone: deps.timeZone, now: deps.now, report: deps.report, sleep: deps.sleep,
       client: settings => deps.client ? deps.client(settings) : new ImapSmtpMail(settings, deps.imap),
@@ -58,28 +62,32 @@ export class Connectors {
 
   async start(): Promise<void> {
     this.settings = await this.store.read();
-    await this.mail.start(this.settings.mail);
-    await this.agenda.start(this.settings.agenda);
+    await this.mail.start(this.mailSettings(), this.modules.mail);
+    await this.agenda.start(this.agendaSettings());
     this.deps.ctx.effect(() => () => { void this.mail.close(); void this.agenda.close(); });
   }
 
   /** Today's and the coming days' occurrences and the open todos, for the briefing. */
   agendaFor(now: number, days: number): { occurrences: Occurrence[]; todos: Todo[] } {
+    if (!this.agendaEnabled()) return { occurrences: [], todos: [] };
     return { occurrences: this.agenda.agenda(now, days), todos: this.agenda.listTodos().filter(todo => !todo.doneAt) };
   }
 
   current(): ConnectorSettingsRecord { return this.settings; }
+  agendaEnabled(): boolean { return this.modules.agenda && this.settings.agenda.enabled; }
+  private mailSettings() { return { ...this.settings.mail, enabled: this.modules.mail && this.settings.mail.enabled }; }
+  private agendaSettings() { return { ...this.settings.agenda, enabled: this.agendaEnabled() }; }
 
   view(): ConnectorsView {
     const upcoming = this.agenda.agenda(this.now(), 7).slice(0, 30).map(item => ({ id: item.event.id, title: item.event.title, start: item.start, end: item.end,
       ...(item.event.location ? { location: item.event.location } : {}), ...(item.event.repeat ? { repeat: item.event.repeat } : {}) }));
-    return { settings: redactConnectors(this.settings), mail: this.mail.view(), ...(this.mailTest ? { mailTest: this.mailTest } : {}),
+    return { modules: { ...this.modules }, settings: redactConnectors(this.settings), mail: this.mail.view(), ...(this.mailTest ? { mailTest: this.mailTest } : {}),
       agenda: { ...this.agenda.view(), upcoming, todos: this.agenda.listTodos().slice(0, 100) } };
   }
 
   private async saveAllowRecipients(rules: string[]): Promise<void> {
     this.settings = await this.store.save(this.settings.revision, { mail: { allowRecipients: rules } });
-    await this.mail.apply(this.settings.mail);
+    await this.mail.apply(this.mailSettings());
   }
 
   async handle(method: string, payload: unknown): Promise<ConnectorsView> {
@@ -88,13 +96,14 @@ export class Connectors {
     const input = payload as Record<string, unknown>;
     if (method === 'save') {
       this.settings = await this.store.save(input.revision as number, (input.config ?? {}) as Record<string, unknown>);
-      await this.mail.apply(this.settings.mail);
-      await this.agenda.apply(this.settings.agenda);
+      await this.mail.apply(this.mailSettings());
+      await this.agenda.apply(this.agendaSettings());
     } else if (method === 'clear-secret') {
       this.settings = await this.store.clearSecret(input.revision as number);
       this.mailTest = undefined;
-      await this.mail.apply(this.settings.mail);
+      await this.mail.apply(this.mailSettings());
     } else if (method === 'mail/test') {
+      if (!this.modules.mail) throw new ChannelError('module_disabled');
       // Test what the page shows, saved or not: the draft's password may be empty to mean "the saved one".
       const draft = input.config && typeof input.config === 'object' ? (input.config as { mail?: unknown }).mail : undefined;
       const candidate = draft === undefined ? this.settings.mail : mailInput(draft, this.settings.mail);

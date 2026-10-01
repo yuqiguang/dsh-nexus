@@ -3,27 +3,13 @@ import { test } from 'node:test';
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { rank, tokens } from '../src/memory/search.js';
 import { LIMITS, MemoryLimitError, MemoryStore, memoryDomain, type MemoryDomain, type MemoryDomainOpener, type MemoryPolicy } from '../src/memory/store.js';
+import { scopeId, type MemoryScope } from '../src/memory/scope.js';
 import { INJECT_BUDGET, MemoryService } from '../src/memory/index.js';
 
-/** In-memory stand-in for the native storage domain, with the same table and global semantics. */
-export function fakeMemoryDomain(policy: MemoryPolicy = { remember: 'auto', inject: true }): { opener: MemoryDomainOpener; tables: Map<string, Map<string, unknown>>; policy: () => MemoryPolicy } {
-  const tables = new Map<string, Map<string, unknown>>();
-  let global = structuredClone(policy);
-  const tableOf = (name: string) => {
-    if (!tables.has(name)) tables.set(name, new Map());
-    const records = tables.get(name)!;
-    return {
-      get: (key: string) => records.get(key), entries: () => [...records.entries()][Symbol.iterator](), keys: () => [...records.keys()][Symbol.iterator](),
-      get size() { return records.size; },
-      async put(key: string, value: unknown) { records.set(key, structuredClone(value)); },
-      async delete(key: string) { return records.delete(key); },
-      async update(key: string, fn: (current: unknown) => unknown) { const next = structuredClone(fn(records.get(key))); records.set(key, next); return next; },
-    };
-  };
-  const domain = { name: memoryDomain.name, global: { get: () => global, async set(value: MemoryPolicy) { global = structuredClone(value); } },
-    table: tableOf, async close() {} } as unknown as MemoryDomain;
-  return { opener: { async open() { return domain; } }, tables, policy: () => global };
-}
+import { fakeMemoryDomain } from './memoryFixture.js';
+
+const TEST_SCOPE: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/project' };
+const source = { async resolveSession() { return TEST_SCOPE; }, async projects() { return [TEST_SCOPE]; } };
 
 const textOf = (message: UserMessage | undefined) => message?.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n') ?? '';
 const user = (text: string): UserMessage => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
@@ -51,7 +37,7 @@ test('ranking returns only items sharing a term, rare terms outrank common ones,
 });
 
 test('the store enforces hard limits with actionable errors instead of truncating, and dedupes identical events', async () => {
-  const { opener } = fakeMemoryDomain();
+  const { opener } = fakeMemoryDomain({ remember: 'auto', inject: true });
   const store = await MemoryStore.open(opener);
   const entry = await store.setProfile(' 称呼 ', '  老 于  ', 'model', T0);
   assert.deepEqual(entry, { key: '称呼', value: '老 于', updatedAt: T0, source: 'model' });
@@ -77,32 +63,32 @@ test('the store enforces hard limits with actionable errors instead of truncatin
 
 test('proposals are settled by the user: accepting writes with user provenance, rejecting only removes', async () => {
   const { opener } = fakeMemoryDomain({ remember: 'ask', inject: true });
-  const service = await MemoryService.open(opener, () => T0);
-  const reply = await service.remember({ kind: 'profile', key: '公司', text: 'Nexus', sessionId: 's1' });
+  const service = await MemoryService.open(opener, () => T0, source);
+  const reply = await service.remember({ sessionId: 's1', kind: 'profile', key: '公司', text: 'Nexus' });
   assert.match(reply, /待确认/);
-  await service.remember({ kind: 'event', text: '用户说下周出差', sessionId: 's1' });
-  assert.deepEqual(service.store.profile(), []);
-  assert.deepEqual(service.store.events(), []);
-  const [profileProposal, eventProposal] = service.store.proposals();
-  await service.handle('proposal/settle', { id: profileProposal!.id, accept: true });
-  await service.handle('proposal/settle', { id: eventProposal!.id, accept: false });
-  assert.deepEqual(service.store.profile(), [{ key: '公司', value: 'Nexus', updatedAt: T0, source: 'user' }]);
-  assert.deepEqual(service.store.events(), []);
-  assert.deepEqual(service.store.proposals(), []);
-  await assert.rejects(service.handle('proposal/settle', { id: 'mp-gone', accept: true }), /not_found/);
-  await service.handle('policy', { remember: 'off', inject: true });
-  await assert.rejects(service.remember({ kind: 'event', text: '不会被记住' }), /已关闭记忆写入/);
-  await assert.rejects(service.handle('policy', { remember: 'sometimes', inject: true }), /invalid_configuration/);
+  await service.remember({ sessionId: 's1', kind: 'event', text: '用户说下周出差' });
+  assert.deepEqual(service.store.forScope(TEST_SCOPE).profile(), []);
+  assert.deepEqual(service.store.forScope(TEST_SCOPE).events(), []);
+  const [profileProposal, eventProposal] = service.store.forScope(TEST_SCOPE).proposals();
+  await service.handle('proposal/settle', { scopeId: scopeId(TEST_SCOPE), id: profileProposal!.id, accept: true });
+  await service.handle('proposal/settle', { scopeId: scopeId(TEST_SCOPE), id: eventProposal!.id, accept: false });
+  assert.deepEqual(service.store.forScope(TEST_SCOPE).profile().map(({ scope, ...entry }) => entry), [{ key: '公司', value: 'Nexus', updatedAt: T0, source: 'user' }]);
+  assert.deepEqual(service.store.forScope(TEST_SCOPE).events(), []);
+  assert.deepEqual(service.store.forScope(TEST_SCOPE).proposals(), []);
+  await assert.rejects(service.handle('proposal/settle', { scopeId: scopeId(TEST_SCOPE), id: 'mp-gone', accept: true }), /not_found/);
+  await service.handle('policy', { scopeId: scopeId(TEST_SCOPE), remember: 'off', inject: true });
+  await assert.rejects(service.remember({ sessionId: 's1', kind: 'event', text: '不会被记住' }), /已关闭记忆写入/);
+  await assert.rejects(service.handle('policy', { scopeId: scopeId(TEST_SCOPE), remember: 'sometimes', inject: true }), /invalid_configuration/);
 });
 
 test('injection admits the profile once per session, only relevant events, never twice, and audits every injection', async () => {
-  const { opener } = fakeMemoryDomain();
+  const { opener } = fakeMemoryDomain({ remember: 'auto', inject: true });
   let now = T0;
-  const service = await MemoryService.open(opener, () => now++);
+  const service = await MemoryService.open(opener, () => now++, source);
   assert.equal(await service.inject('s1', [user('你好')]), undefined, 'nothing stored means nothing injected');
-  await service.remember({ kind: 'profile', key: '称呼', text: '老于' });
-  await service.remember({ kind: 'event', text: '9 月 12 日和王总谈了合作，下月签约', tags: ['王总'] });
-  await service.remember({ kind: 'event', text: '用户家里的猫叫团子' });
+  await service.remember({ sessionId: 's1', kind: 'profile', key: '称呼', text: '老于' });
+  await service.remember({ sessionId: 's1', kind: 'event', text: '9 月 12 日和王总谈了合作，下月签约', tags: ['王总'] });
+  await service.remember({ sessionId: 's1', kind: 'event', text: '用户家里的猫叫团子' });
   const first = await service.inject('s1', [user('王总那边怎么说')]);
   assert.ok(first);
   assert.equal(first.source.kind, 'nexus-memory');
@@ -127,54 +113,54 @@ test('injection admits the profile once per session, only relevant events, never
   service.onSessionEvent({ id: 's1' } as never, { type: 'compaction/end' } as never);
   const afterCompaction = await service.inject('s1', [user('王总')]);
   assert.ok(afterCompaction && /称呼：老于/.test(textOf(afterCompaction)));
-  const audit = service.store.injections();
+  const audit = service.store.forScope(TEST_SCOPE).injections();
   assert.equal(audit.length, 4);
   assert.deepEqual(audit.map(record => record.sessionId), ['s1', 's2', 's1', 's1'], 'newest first');
   assert.equal(audit.at(-1)!.query, '王总那边怎么说');
   assert.equal(audit.at(-1)!.profile, true);
   assert.equal(audit.at(-1)!.eventIds.length, 1);
   // A changed profile is injected again in the same session; a deleted event is not.
-  await service.remember({ kind: 'profile', key: '公司', text: 'Nexus' });
+  await service.remember({ sessionId: 's1', kind: 'profile', key: '公司', text: 'Nexus' });
   const changed = await service.inject('s1', [user('公司的事')]);
   assert.ok(changed && /公司：Nexus/.test(textOf(changed)));
-  const catEvent = service.store.events().find(event => event.text.includes('团子'))!;
-  await service.forget({ id: catEvent.id });
+  const catEvent = service.store.forScope(TEST_SCOPE).events().find(event => event.text.includes('团子'))!;
+  await service.forget({ id: catEvent.id }, 's1');
   assert.doesNotMatch(textOf(await service.inject('s3', [user('团子')])), /团子/, 'a deleted event is never injected again');
-  assert.doesNotMatch(service.recall('团子', 5), /团子/);
-  await service.handle('policy', { remember: 'auto', inject: false });
+  assert.doesNotMatch(await service.recall('团子', 5, 's1'), /团子/);
+  await service.handle('policy', { scopeId: scopeId(TEST_SCOPE), remember: 'auto', inject: false });
   assert.equal(await service.inject('s4', [user('王总')]), undefined, 'injection can be switched off');
 });
 
 test('injection stays within the character budget and caps the number of events', async () => {
-  const { opener } = fakeMemoryDomain();
-  const service = await MemoryService.open(opener, () => T0);
-  for (let index = 0; index < 12; index++) await service.remember({ kind: 'event', text: `第 ${index} 次会议讨论预算 ${'细节'.repeat(100)}` });
+  const { opener } = fakeMemoryDomain({ remember: 'auto', inject: true });
+  const service = await MemoryService.open(opener, () => T0, source);
+  for (let index = 0; index < 12; index++) await service.remember({ sessionId: 's1', kind: 'event', text: `第 ${index} 次会议讨论预算 ${'细节'.repeat(100)}` });
   const injected = await service.inject('s1', [user('预算会议')]);
   assert.ok(injected);
   const text = textOf(injected);
   assert.ok(text.length <= INJECT_BUDGET.totalChars + 200, `injected ${text.length} chars`);
   const shown = (text.match(/\[me-/g) ?? []).length;
   assert.ok(shown >= 1 && shown <= INJECT_BUDGET.events, `showed ${shown} events`);
-  assert.equal(service.store.injections()[0]!.eventIds.length, shown);
+  assert.equal(service.store.forScope(TEST_SCOPE).injections()[0]!.eventIds.length, shown);
 });
 
 test('the settings routes write with user provenance, validate input, and export everything', async () => {
-  const { opener } = fakeMemoryDomain();
-  const service = await MemoryService.open(opener, () => T0);
-  await service.handle('profile/set', { key: '称呼', value: '老于' });
-  await service.handle('event/add', { text: '国庆去成都', tags: ['旅行'] });
-  const view = await service.handle('list', {});
-  assert.deepEqual(view.profile, [{ key: '称呼', value: '老于', updatedAt: T0, source: 'user' }]);
+  const { opener } = fakeMemoryDomain({ remember: 'auto', inject: true });
+  const service = await MemoryService.open(opener, () => T0, source);
+  await service.handle('profile/set', { scopeId: scopeId(TEST_SCOPE), key: '称呼', value: '老于' });
+  await service.handle('event/add', { scopeId: scopeId(TEST_SCOPE), text: '国庆去成都', tags: ['旅行'] });
+  const view = await service.handle('list', { scopeId: scopeId(TEST_SCOPE),});
+  assert.deepEqual(view.profile.map(({ scope, ...entry }) => entry), [{ key: '称呼', value: '老于', updatedAt: T0, source: 'user' }]);
   assert.equal(view.events[0]!.source, 'user');
   assert.deepEqual(view.counts, { profile: 1, events: 1, proposals: 0 });
-  await assert.rejects(service.handle('profile/set', { key: '', value: 'x' }), /memory_limit/);
-  await assert.rejects(service.handle('profile/delete', { key: '没有' }), /not_found/);
-  await assert.rejects(service.handle('event/delete', { id: 'me-none' }), /not_found/);
-  await assert.rejects(service.handle('nope', {}), /unknown_action/);
+  await assert.rejects(service.handle('profile/set', { scopeId: scopeId(TEST_SCOPE), key: '', value: 'x' }), /memory_limit/);
+  await assert.rejects(service.handle('profile/delete', { scopeId: scopeId(TEST_SCOPE), key: '没有' }), /not_found/);
+  await assert.rejects(service.handle('event/delete', { scopeId: scopeId(TEST_SCOPE), id: 'me-none' }), /not_found/);
+  await assert.rejects(service.handle('nope', { scopeId: scopeId(TEST_SCOPE),}), /unknown_action/);
   await assert.rejects(service.handle('policy', 'bad'), /invalid_configuration/);
-  const exported = JSON.parse((await service.handle('export', {})).exportJson!);
-  assert.deepEqual(Object.keys(exported).sort(), ['events', 'exportedAt', 'policy', 'profile', 'proposals']);
+  const exported = JSON.parse((await service.handle('export', { scopeId: scopeId(TEST_SCOPE),})).exportJson!);
+  assert.deepEqual(Object.keys(exported).sort(), ['events', 'exportedAt', 'policy', 'profile', 'proposals', 'scope']);
   assert.equal(exported.events[0].text, '国庆去成都');
-  await service.handle('event/delete', { id: view.events[0]!.id });
-  assert.deepEqual((await service.handle('list', {})).events, []);
+  await service.handle('event/delete', { scopeId: scopeId(TEST_SCOPE), id: view.events[0]!.id });
+  assert.deepEqual((await service.handle('list', { scopeId: scopeId(TEST_SCOPE),})).events, []);
 });

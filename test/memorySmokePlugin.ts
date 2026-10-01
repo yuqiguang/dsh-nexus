@@ -5,11 +5,13 @@ import { LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo, type Strea
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-host-webserver';
-import { access, writeFile } from 'node:fs/promises';
+import { access, mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { installBridge } from '../src/dsh/bridge.js';
 import { installAssistantPrompt } from '../src/assistant/prompt.js';
 import { installMemorySettings } from '../src/plugin.js';
 import { MEMORY_PLUGIN } from '../src/memory/index.js';
+import { projectScope, scopeId, LEGACY_SCOPE } from '../src/memory/scope.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 
 export const name = 'nexus-memory-smoke';
@@ -101,12 +103,13 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
 
   async function run() {
     const checks: string[] = [];
+    const channelScope = await projectScope(config.workspace, String(sessionId));
     const origin = `http://127.0.0.1:${ctx.webServer.port}`;
     const exchange = await fetch(ctx.connection.authenticatedUrl(origin), { redirect: 'manual' });
     const cookie = exchange.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
     const rpc = async (method: string, payload: object = {}) => {
       const response = await fetch(`${origin}/api/nexus-memory/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json', cookie },
-        body: JSON.stringify({ type: 'client-request', rpcId: 'memory-smoke', method, payload }) });
+        body: JSON.stringify({ type: 'client-request', rpcId: 'memory-smoke', method, payload: { scopeId: scopeId(channelScope), ...payload } }) });
       assert.equal(response.status, 200);
       const body = await response.json();
       assert.equal(body.result.ok, true, body.result.error?.code);
@@ -118,6 +121,10 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       await bridge.drain();
     };
     if (config.phase === 17) {
+      assert.equal(service.store.policy().remember, 'ask');
+      // The fixture deliberately opts into automatic writes to exercise tool persistence.
+      await service.handle('policy', { remember: 'auto', inject: true });
+      await service.legacy.setProfile('旧版秘密', 'legacy-must-stay-hidden', 'model');
       await turn('m1', '记住：我叫老于，不吃香菜；上周和王总谈了合作');
       assert.equal(texts.at(-1), '记住了。');
       assert.equal(model.calls, 4, 'three remember calls and the reply');
@@ -137,6 +144,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       assert.match(second.recall, /称呼：老于/);
       assert.match(second.recall, /饮食：不吃香菜/);
       assert.match(second.recall, /王总谈了合作/);
+      assert.doesNotMatch(second.recall, /legacy-must-stay-hidden/);
       const audit = (await rpc('list')).injections;
       assert.equal(audit.length, 1);
       assert.equal(audit[0]!.sessionId, sessionId);
@@ -153,6 +161,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
         'memory_recall_injected_before_next_user_message', 'memory_injection_audited', 'memory_recall_event_persisted_in_native_session');
     } else {
       // Restart: memory lives in native storage; the first message of the resumed session gets the profile again.
+      assert.equal(service.store.policy().remember, 'auto', 'the fixture policy survives initialization on restart');
       assert.equal(model.calls, 0);
       const before = await rpc('list');
       assert.deepEqual(before.counts, { profile: 2, events: 1, proposals: 0 });
@@ -178,6 +187,30 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       checks.push('memory_survives_restart_in_native_storage', 'memory_profile_reinjected_in_resumed_session', 'memory_settings_delete_stops_injection',
         'memory_resumed_session_loads_with_recall_events');
     }
+    // Two native local sessions with different cwd values, beside the channel owner above.
+    const localA = SessionId('memory-project-a'), localB = SessionId('memory-project-b');
+    const other = join(config.workspace, 'memory-project-b'); await mkdir(other, { recursive: true });
+    if (config.phase === 17) {
+      await ctx.sessionController.create({ sessionId: localA, cwd: config.workspace });
+      await ctx.sessionController.create({ sessionId: localB, cwd: other });
+    }
+    for (const id of [localA, localB]) {
+      const resolved = await ctx.sessionController.resolveAgent(id);
+      if ('error' in resolved) throw resolved.error;
+    }
+    if (config.phase === 17) {
+      await service.remember({ sessionId: localA, kind: 'profile', key: '数据库', text: 'private-project-a' });
+      await service.remember({ sessionId: localB, kind: 'profile', key: '数据库', text: 'private-project-b' });
+      await service.handle('profile/set', { key: '语言', value: 'local-global-preference' });
+    }
+    const a = await service.recall('数据库', 8, localA), b = await service.recall('数据库', 8, localB);
+    assert.match(a, /private-project-a/); assert.doesNotMatch(a, /private-project-b|legacy-must-stay-hidden|老于/);
+    assert.match(b, /private-project-b/); assert.doesNotMatch(b, /private-project-a|legacy-must-stay-hidden|老于/);
+    assert.match(a, /local-global-preference/); assert.match(b, /local-global-preference/);
+    assert.doesNotMatch(await service.recall('数据库', 8, sessionId), /private-project-a|private-project-b|local-global-preference/);
+    const legacy = await service.handle('export', { scopeId: LEGACY_SCOPE });
+    assert.match(legacy.exportJson!, /legacy-must-stay-hidden/);
+    checks.push('native_cwd_project_memory_isolated', 'native_channel_identity_memory_isolated', 'global_preferences_owner_scoped', 'legacy_memory_preserved_not_injected');
     assert.deepEqual(failures, []);
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls, checks }, null, 2));
   }

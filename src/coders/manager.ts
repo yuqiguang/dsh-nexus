@@ -1,4 +1,6 @@
 import { requireWindowsFirewall } from './windows-firewall.js';
+import { inspectProject, type CodingProject, type CodingWorkspace } from './projects.js';
+import { isInside } from './rules.js';
 import { taskStatusLabel } from './status.js';
 import { windowsSandbox, type WindowsSandboxStatus } from './windows-sandbox.js';
 import { access, constants, mkdir } from 'node:fs/promises';
@@ -26,6 +28,8 @@ export interface CoderStatusView {
   problem?: string;
   /** Codex system install: `codex login status` output with keys masked. Managed: derived from the settings. */
   login?: string;
+  /** Configuration/login evidence only, not a successful model request. */
+  credentialState?: 'configured' | 'missing' | 'unknown';
   lastTask?: { id: string; status: TaskRecord['status']; statusLabel?: string; updatedAt: number; detail?: string };
 }
 
@@ -34,6 +38,8 @@ export interface CodersView {
   settings: CoderSettingsView;
   profileRoots: string[];
   effectiveRoots: string[];
+  workspaces?: CodingWorkspace[];
+  project?: CodingProject;
   managedRoot: string;
   claudeHome: string;
   claudeLogin?: ClaudeLoginInstructions;
@@ -41,7 +47,7 @@ export interface CodersView {
   claude: CoderStatusView;
   install?: InstallProgress;
   rules: { id: string; source: HabitRule['source']; text: string }[];
-  recentTasks: { id: string; coder: CoderKind; status: TaskRecord['status']; statusLabel?: string; description: string; updatedAt: number }[];
+  recentTasks: { id: string; coder: CoderKind; status: TaskRecord['status']; statusLabel?: string; description: string; updatedAt: number; cwd?: string; ownerSession?: string; objective?: string }[];
 }
 
 export type CodexRuntime = { command: string; env: NodeJS.ProcessEnv; source: CoderSource; model?: string };
@@ -70,7 +76,8 @@ export interface ManagerDeps {
   installer: CoderInstaller;
   detect?: DetectOptions;
   /** Test seam for `codex login status`. */
-  loginStatus?: (command: string, env: NodeJS.ProcessEnv) => Promise<string>;
+  loginStatus?: (command: string, env: NodeJS.ProcessEnv) => Promise<string | CoderLoginStatus>;
+  workspaces?: () => CodingWorkspace[];
   env?: NodeJS.ProcessEnv;
   now?: () => number;
 }
@@ -101,9 +108,11 @@ function maskKeys(text: string): string {
   return text.replace(/\b(sk-|key-|token-)?[A-Za-z0-9_*-]{20,}\b/g, match => `${match.slice(0, 4)}…`).trim();
 }
 
-async function codexLoginStatus(command: string, env: NodeJS.ProcessEnv): Promise<string> {
+export interface CoderLoginStatus { text: string; state: 'configured' | 'missing' | 'unknown' }
+
+async function codexLoginStatus(command: string, env: NodeJS.ProcessEnv): Promise<CoderLoginStatus> {
   const result = await probe(command, ['login', 'status'], env);
-  return maskKeys(result.output.split('\n').find(Boolean) ?? (result.ok ? '已登录' : '无法读取登录状态'));
+  return { text: maskKeys(result.output.split('\n').find(Boolean) ?? (result.ok ? '已登录' : '无法读取登录状态')), state: result.ok ? 'configured' : 'unknown' };
 }
 
 /** Coder settings, installs, and the runtime the supervisor uses; the settings page talks to this through the RPC routes. */
@@ -133,8 +142,8 @@ export class CodersManager {
   private readonly concurrencyListeners = new Set<(limit: number) => void>();
   private detection?: { at: number; codex: CoderDetection; claude: CoderDetection };
   private detecting?: Promise<{ codex: CoderDetection; claude: CoderDetection }>;
-  private login?: { at: number; key: string; text: string };
-  private loggingIn?: Promise<string>;
+  private login?: { at: number; key: string; value: CoderLoginStatus };
+  private loggingIn?: Promise<CoderLoginStatus>;
   private tasks?: CoderStore;
   /** config.toml content last written to the managed Codex home; rewritten only when the settings change it. */
   private codexToml?: string;
@@ -293,22 +302,23 @@ export class CodersManager {
     return task ? { id: task.id, status: task.status, statusLabel: taskStatusLabel(task), updatedAt: task.updatedAt, ...(task.result?.detail ? { detail: task.result.detail } : {}) } : undefined;
   }
 
-  private async codexLogin(settings: CoderSettingsRecord, active: CoderSource | 'none', detection: CoderDetection): Promise<string | undefined> {
-    if (active === 'managed') return settings.codex.apiKey ? `使用设置里的 API key${settings.codex.baseUrl ? `，端点 ${settings.codex.baseUrl}` : '，官方端点'}` : '未配置 API key';
+  private async codexLogin(settings: CoderSettingsRecord, active: CoderSource | 'none', detection: CoderDetection): Promise<CoderLoginStatus | undefined> {
+    if (active === 'managed') return { text: settings.codex.apiKey ? `使用设置里的 API key${settings.codex.baseUrl ? `，端点 ${settings.codex.baseUrl}` : '，官方端点'}` : '未配置 API key', state: settings.codex.apiKey ? 'configured' : 'missing' };
     if (active === 'none' && settings.codex.source === 'managed' && !settings.codex.apiKey) return undefined;
     if (active !== 'system' || !detection.system.path) return undefined;
     const key = `${detection.system.path}:${detection.system.version}`;
     const cached = this.login?.key === key ? this.login : undefined;
-    if (cached && this.now() - cached.at < LOGIN_TTL_MS) return cached.text;
+    if (cached && this.now() - cached.at < LOGIN_TTL_MS) return cached.value;
     const refresh = this.loggingIn ??= (async () => {
       await Promise.resolve();
       try {
-        const text = await timed('codex login status', () => (this.deps.loginStatus ?? codexLoginStatus)(detection.system.path!, this.env));
-        this.login = { at: this.now(), key, text };
-        return text;
+        const result = await timed('codex login status', () => (this.deps.loginStatus ?? codexLoginStatus)(detection.system.path!, this.env));
+        const value: CoderLoginStatus = typeof result === 'string' ? { text: maskKeys(result), state: 'unknown' } : { ...result, text: maskKeys(result.text) };
+        this.login = { at: this.now(), key, value };
+        return value;
       } finally { this.loggingIn = undefined; }
     })();
-    if (cached) { void refresh.catch(() => {}); return cached.text; }
+    if (cached) { void refresh.catch(() => {}); return cached.value; }
     return refresh;
   }
 
@@ -327,28 +337,49 @@ export class CodersManager {
     const codex = status('codex', codexPick, detection.codex, runtime.codex);
     if ((this.deps.detect?.host?.platform ?? process.platform) === 'win32' && codexPick.active !== 'none') codex.windowsSandbox = this.settingUpSandbox ? 'checking' : this.sandbox?.status ?? 'failed';
     const login = await this.codexLogin(settings, codexPick.active, detection.codex);
-    if (login) codex.login = login;
+    if (login) { codex.login = login.text; codex.credentialState = login.state; }
     const claude = status('claude', claudePick, detection.claude, runtime.claude);
+    const claudeOauth = await access(join(this.deps.layout.claudeHome, '.credentials.json'), constants.R_OK).then(() => true, () => false);
+    claude.credentialState = settings.claude.token || claudeOauth ? 'configured' : 'missing';
     claude.login = settings.claude.token ? `使用设置里的 token${settings.claude.baseUrl ? `，端点 ${settings.claude.baseUrl}` : '，官方端点'}`
-      : await access(join(this.deps.layout.claudeHome, '.credentials.json'), constants.R_OK).then(() => 'OAuth 登录（Nexus 专用配置目录）', () => '未配置凭据');
+      : claudeOauth ? 'OAuth 登录（Nexus 专用配置目录）' : '未配置凭据';
+    const project = settings.projectRoot ? await inspectProject(settings.projectRoot, runtime.roots)
+      .catch(() => ({ path: settings.projectRoot!, allowed: false, problem: 'project_directory_unavailable' })) : undefined;
     const progress = this.deps.installer.progress();
     return {
       platform: this.deps.detect?.host?.platform ?? process.platform,
       settings: redact(settings), profileRoots: [...this.deps.profileRoots], effectiveRoots: runtime.roots,
+      workspaces: this.deps.workspaces?.() ?? [], ...(project ? { project } : {}),
       managedRoot: this.deps.layout.root, claudeHome: this.deps.layout.claudeHome, codex, claude,
       claudeLogin: this.claudeLogin(detection.claude, claudePick.active),
       ...(progress ? { install: progress } : {}),
       rules: (this.tasks?.rules() ?? []).map(rule => ({ id: rule.id, source: rule.source, text: describeRule(rule) })),
-      recentTasks: (this.tasks?.list() ?? []).slice(0, 5).map(task => ({ id: task.id, coder: task.coder, status: task.status, statusLabel: taskStatusLabel(task),
+      recentTasks: (this.tasks?.list() ?? []).filter(task => !settings.projectRoot || isInside(settings.projectRoot, task.cwd)).slice(0, 10).map(task => ({ id: task.id, coder: task.coder, status: task.status, statusLabel: taskStatusLabel(task),
+        cwd: task.cwd, ownerSession: task.ownerSession, ...(task.brief ? { objective: task.brief.objective } : {}),
         description: task.description.length > 120 ? `${task.description.slice(0, 120)}…` : task.description, updatedAt: task.updatedAt })),
     };
   }
 
   async handle(method: string, payload: unknown): Promise<CodersView> {
     if (method === 'list') return timed('coders list', () => this.view());
+    if (method === 'refresh') {
+      await this.load();
+      await this.loggingIn?.catch(() => {});
+      this.login = undefined;
+      await this.detected(true);
+      return this.view();
+    }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new ChannelError('invalid_configuration');
     const input = payload as Record<string, unknown>;
-    if (method === 'save') {
+    if (method === 'project/select') {
+      const settings = await this.load();
+      if (settings.revision !== input.revision) throw new ChannelError('configuration_changed');
+      const roots = this.effectiveRoots(settings);
+      const project = await inspectProject(input.path, roots);
+      if (!project.allowed && input.allow !== true) throw new ChannelError('project_permission_required');
+      this.updateSettings(await this.deps.store.selectProject(input.revision as number, project.path,
+        project.allowed ? undefined : [...roots, project.path]));
+    } else if (method === 'save') {
       const saved = await this.deps.store.save(input.revision as number, input.config as Record<string, unknown>);
       this.updateSettings(saved);
       if (this.detection?.codex.managed.installed) await this.ensureCodexHome(saved);
