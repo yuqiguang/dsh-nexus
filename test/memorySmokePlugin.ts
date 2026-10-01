@@ -211,6 +211,22 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     const legacy = await service.handle('export', { scopeId: LEGACY_SCOPE });
     assert.match(legacy.exportJson!, /legacy-must-stay-hidden/);
     checks.push('native_cwd_project_memory_isolated', 'native_channel_identity_memory_isolated', 'global_preferences_owner_scoped', 'legacy_memory_preserved_not_injected');
+    const localScope = await projectScope(config.workspace);
+    const localStore = service.store.forScope(localScope);
+    if (config.phase === 17) {
+      for (let n = 0; n < 221; n++) await localStore.addEvent({ text: `分页记录-${n}`, tags: n === 0 ? ['旧记录标签'] : [], source: 'user' }, n);
+      for (let n = 0; n < 25; n++) await localStore.recordInjection({ at: n, sessionId: localA, query: `分页日志-${n}`, profile: true, eventIds: [] });
+    }
+    const page = await rpc('list', { scopeId: scopeId(localScope), eventPage: 1, injectionPage: 1 });
+    assert.equal(page.events.length, 20);
+    assert.equal(page.injections.length, 10);
+    assert.equal(page.counts.events, 221);
+    const older = await rpc('list', { scopeId: scopeId(localScope), eventQuery: '旧记录标签' });
+    assert.deepEqual(older.events.map(event => event.text), ['分页记录-0']);
+    assert.equal((await rpc('list')).counts.events, 1, 'paged local records never enter the channel scope');
+    const complete = await service.handle('export', { scopeId: scopeId(localScope), eventQuery: '旧记录标签', eventPage: 5 });
+    assert.equal(JSON.parse(complete.exportJson!).events.length, 221);
+    checks.push('native_memory_paging_and_full_search', 'native_memory_export_unfiltered', 'native_memory_pages_owner_isolated');
     assert.deepEqual(failures, []);
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls, checks }, null, 2));
   }

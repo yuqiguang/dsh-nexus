@@ -39,7 +39,7 @@ export function markUntrusted(source: string, text: string): string {
 /** DSH's web tools already open every result with their own untrusted-data notice, so only the redaction is added. */
 const WEB_TOOLS = new Set(['web_fetch', 'web_search']);
 /** The file tools and the argument naming the file, for files the chat delivered into `inbox/`. */
-const FILE_TOOLS: Readonly<Record<string, string>> = { read: 'file_path', doc_read: 'path' };
+const FILE_TOOLS: Readonly<Record<string, string>> = { read: 'file_path' };
 
 /** Where a tool result came from when it is text someone else wrote, or undefined when it is not. */
 export function untrustedSource(name: string, args: unknown, cwd: string | undefined): { kind: 'web' } | { kind: 'file'; path: string } | undefined {

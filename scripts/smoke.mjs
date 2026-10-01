@@ -53,12 +53,12 @@ const mediaOnly = process.argv.includes('--media-only');
 const memoryOnly = process.argv.includes('--memory-only');
 const serviceOnly = process.argv.includes('--service-only');
 const mailOnly = process.argv.includes('--mail-only');
-const documentsOnly = process.argv.includes('--documents-only');
+if (process.argv.includes('--documents-only')) throw new Error('Document compatibility checks were retired; use --plugin-only and --media-only.');
 const nativeOnly = process.argv.includes('--native-only');
 const rebindOnly = process.argv.includes('--rebind-only');
 const dataOnly = process.argv.includes('--data-only');
-for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : codersOnly ? [12] : wechatOnly ? [5, 6] : remindersOnly ? [13, 14] : mediaOnly ? [15, 16] : memoryOnly ? [17, 18] : serviceOnly ? [19, 20] : mailOnly ? [21] : documentsOnly ? [22] : nativeOnly ? [1, 2] : rebindOnly ? [23, 24] : dataOnly ? [25, 26]
-  : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]) {
+for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : codersOnly ? [12] : wechatOnly ? [5, 6] : remindersOnly ? [13, 14] : mediaOnly ? [15, 16] : memoryOnly ? [17, 18] : serviceOnly ? [19, 20] : mailOnly ? [21] : nativeOnly ? [1, 2] : rebindOnly ? [23, 24] : dataOnly ? [25, 26]
+  : [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26]) {
   if (await availableMemory() < 800) throw new Error('Not enough available RAM to start the smoke check (800 MiB required).');
   // What scripts/start.mjs does before DSH starts, and before this runner writes the phase's profile patch: swap in the import phase 25 staged.
   if (phase === 26) {
@@ -101,6 +101,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
   const componentOverrides = previousPatch.filter(row => ['nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda'].includes(row.id) && !row.insert);
   await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([
     ...componentOverrides,
+    ...(installedPlugin && phase !== 10 ? [{ id: 'nexus-documents', name: 'nexus-next/documents', disabled: phase === 8 }] : []),
     { id: 'session-title-llm', disabled: true },
     ...(phase === 12 ? [{ id: 'web', config: { searchProvider: 'nexus-research-fixture', fetchProvider: 'nexus-research-fixture' } }] : []),
     { id: 'agent-default-model', config: { provider: 'nexus-fixture', model: 'fixture' } },
@@ -108,7 +109,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     ...(installedPlugin ? [] : [{ insert: assistantPlugins }]),
     { insert: [{ id: 'nexus-native-smoke',
       name: pathToFileURL(installedPlugin ? join(packageFixture, 'pluginSmokePlugin.js') : join(projectRoot,
-        phase >= 25 ? 'dist/test/dataSmokePlugin.js' : phase >= 23 ? 'dist/test/rebindSmokePlugin.js' : phase === 22 ? 'dist/test/documentSmokePlugin.js' : phase === 21 ? 'dist/test/mailSmokePlugin.js' : phase >= 19 ? 'dist/test/serviceSmokePlugin.js' : phase >= 17 ? 'dist/test/memorySmokePlugin.js' : phase >= 15 ? 'dist/test/mediaSmokePlugin.js' : phase >= 13 ? 'dist/test/reminderSmokePlugin.js' : phase === 12 ? 'dist/test/coderSmokePlugin.js' : phase === 11 ? 'dist/test/questionSmokePlugin.js' : phase < 3 ? 'dist/test/nativeSmokePlugin.js'
+        phase >= 25 ? 'dist/test/dataSmokePlugin.js' : phase >= 23 ? 'dist/test/rebindSmokePlugin.js' : phase === 21 ? 'dist/test/mailSmokePlugin.js' : phase >= 19 ? 'dist/test/serviceSmokePlugin.js' : phase >= 17 ? 'dist/test/memorySmokePlugin.js' : phase >= 15 ? 'dist/test/mediaSmokePlugin.js' : phase >= 13 ? 'dist/test/reminderSmokePlugin.js' : phase === 12 ? 'dist/test/coderSmokePlugin.js' : phase === 11 ? 'dist/test/questionSmokePlugin.js' : phase < 3 ? 'dist/test/nativeSmokePlugin.js'
           : phase < 5 ? 'dist/test/settingsSmokePlugin.js' : 'dist/test/wechatSmokePlugin.js')).href,
       config: { phase, workspace, triggerFile, reportFile, packageDir: join(activeProfile, 'node_modules/nexus-next') } }] },
     // Supplemental shared-Fetch-only host. Current Desktop uses an HTTP Host; this is not an Electron test.
@@ -187,11 +188,11 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     if (phase === 20) console.log('Native DSH phase 20: clean stop recorded on SIGTERM.');
   }
 }
-if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !rebindOnly && !dataOnly) {
+if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !rebindOnly && !dataOnly) {
   assert.equal(summaries[0].sessionId, summaries[1].sessionId);
   assert.equal(summaries[1].completedTurns, 2);
 }
-if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !documentsOnly && !nativeOnly && !rebindOnly && !dataOnly) {
+if (!pluginOnly && !interactionOnly && !codersOnly && !wechatOnly && !remindersOnly && !mediaOnly && !memoryOnly && !serviceOnly && !mailOnly && !nativeOnly && !rebindOnly && !dataOnly) {
   assert.equal(summaries[4].sessionId, summaries[5].sessionId);
   assert.equal(summaries[5].recoveryModelCalls, 0);
 }
@@ -203,5 +204,5 @@ const summary = { passed: true, dshVersion: manifest.version, model: 'local scri
   channels: 'local channel fixtures and fault-injected loopback WeChat HTTP', checks: summaries.flatMap(item => item.checks),
   peakRssMiB: Math.round(peakRssMiB), minimumAvailableMiB: Math.round(minimumAvailableMiB),
   phases: summaries, evidence: runRoot };
-await writeFile(join(root, pluginOnly ? 'latest-plugin.json' : interactionOnly ? 'latest-interaction.json' : codersOnly ? 'latest-coders.json' : wechatOnly ? 'latest-wechat.json' : remindersOnly ? 'latest-reminders.json' : mediaOnly ? 'latest-media.json' : memoryOnly ? 'latest-memory.json' : serviceOnly ? 'latest-service.json' : mailOnly ? 'latest-mail.json' : documentsOnly ? 'latest-documents.json' : nativeOnly ? 'latest-native.json' : rebindOnly ? 'latest-rebind.json' : dataOnly ? 'latest-data.json' : 'latest.json'), JSON.stringify(summary, null, 2) + '\n');
+await writeFile(join(root, pluginOnly ? 'latest-plugin.json' : interactionOnly ? 'latest-interaction.json' : codersOnly ? 'latest-coders.json' : wechatOnly ? 'latest-wechat.json' : remindersOnly ? 'latest-reminders.json' : mediaOnly ? 'latest-media.json' : memoryOnly ? 'latest-memory.json' : serviceOnly ? 'latest-service.json' : mailOnly ? 'latest-mail.json' : nativeOnly ? 'latest-native.json' : rebindOnly ? 'latest-rebind.json' : dataOnly ? 'latest-data.json' : 'latest.json'), JSON.stringify(summary, null, 2) + '\n');
 console.log(`${pluginOnly ? 'Installed plugin lifecycle' : 'Native session restart'} verified. Peak DSH RSS: ${summary.peakRssMiB} MiB.`);

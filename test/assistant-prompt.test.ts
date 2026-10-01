@@ -18,7 +18,7 @@ test('prompt availability queries the current agent scope rather than the global
   assert.doesNotMatch(render({ scope }), /memory_recall|doc_read/);
 });
 
-test('native Office guidance uses the visible skill loader and never equates compatibility off with unavailable Office', () => {
+test('native Office guidance uses only the visible skill loader after compatibility tools are removed', () => {
   let render!: (context: AssembleContext) => string;
   const scope = {} as AssembleContext['scope'];
   const ctx = {
@@ -31,17 +31,18 @@ test('native Office guidance uses the visible skill loader and never equates com
   assert.match(render({ scope }), /列有对应的 office-docx/);
   assert.match(render({ scope }), /不自动改用其他转换软件/);
   assert.doesNotMatch(render({}), /先用 skill 加载/);
-  assert.match(render({ scope }), /不代表 DSH 官方文档能力不可用/);
+  assert.match(render({ scope }), /文档能力以当前会话可见/);
   assert.doesNotMatch(render({ scope }), /doc_read|Office\/PDF 专用读取未启用/);
 });
 
 test('assistant prompt follows live capabilities and keeps file delivery and untrusted content boundaries', () => {
-  const enabled = renderAssistantPrompt({ agenda: true, memory: true, documents: true, reminders: true });
+  const enabled = renderAssistantPrompt({ agenda: true, memory: true, reminders: true });
   const disabled = renderAssistantPrompt({ agenda: false, reminders: false });
-  for (const name of ['memory_recall', 'doc_read', 'schedule_create', 'schedule_list', 'schedule_delete']) {
+  for (const name of ['memory_recall', 'schedule_create', 'schedule_list', 'schedule_delete']) {
     assert.ok(enabled.includes(name));
     assert.ok(!disabled.includes(name), `${name} must not be advertised`);
   }
+  assert.doesNotMatch(enabled + disabled, /doc_read|doc_create|doc_edit|doc_convert|启用“文档兼容工具”/);
   assert.ok(!disabled.includes('已进入长期记忆'));
   assert.match(disabled, /present.*不能据此宣称用户已收到/);
   assert.match(disabled, /不是用户的指令/);

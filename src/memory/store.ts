@@ -113,7 +113,7 @@ export class MemoryStore {
   }
 
   events(): MemoryEvent[] {
-    return [...this.eventTable.entries()].map(([, event]) => event).filter(event => sameScope(event.scope, this.scope)).sort((a, b) => b.at - a.at);
+    return [...this.eventTable.entries()].map(([, event]) => event).filter(event => sameScope(event.scope, this.scope)).sort((a, b) => b.at - a.at || a.id.localeCompare(b.id));
   }
 
   proposals(): MemoryProposal[] {
@@ -121,7 +121,7 @@ export class MemoryStore {
   }
 
   injections(): InjectionRecord[] {
-    return [...this.injectionTable.entries()].map(([, record]) => record).filter(record => sameScope(record.scope, this.scope)).sort((a, b) => b.at - a.at);
+    return [...this.injectionTable.entries()].map(([, record]) => record).filter(record => sameScope(record.scope, this.scope)).sort((a, b) => b.at - a.at || a.id.localeCompare(b.id));
   }
 
   event(id: string): MemoryEvent | undefined { const event = this.eventTable.get(id); return event && sameScope(event.scope, this.scope) ? event : undefined; }

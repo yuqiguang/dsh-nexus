@@ -1,9 +1,6 @@
 - insert:
     - id: nexus-channels
       name: nexus-next
-    - id: nexus-documents
-      name: nexus-next/documents
-      disabled: true
     - id: nexus-memory
       name: nexus-next/memory
       disabled: true

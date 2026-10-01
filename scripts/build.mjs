@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { writeFile } from 'node:fs/promises';
+import { rm, writeFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { projectRoot } from './setup.mjs';
 
@@ -9,6 +9,14 @@ const outName = process.env.NEXUS_DIST ?? 'dist';
 if (!/^dist(\.[a-z0-9-]+)?$/.test(outName)) {
   console.error(`NEXUS_DIST must be "dist" or "dist.<name>", not ${JSON.stringify(outName)}`);
   process.exit(1);
+}
+
+// Removed sources must not survive in an incremental build's tarball or test glob.
+// These paths contain only the retired component's generated files, never user documents.
+for (const path of ['src/documents', 'src/client/DocumentSettings.js', 'test/documents.test.js',
+  'test/document-ui.test.js', 'test/documentSmokePlugin.js']) {
+  await rm(`${projectRoot}/${outName}/${path}`, { recursive: true, force: true });
+  if (path.endsWith('.js')) await rm(`${projectRoot}/${outName}/${path}.map`, { force: true });
 }
 
 const compilation = spawnSync(process.execPath, ['--max-old-space-size=640', 'node_modules/typescript/bin/tsc', '--outDir', outName], {

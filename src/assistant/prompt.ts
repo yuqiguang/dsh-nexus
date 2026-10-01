@@ -4,7 +4,7 @@ import { QUIET_REPLY } from '../dsh/schedule.js';
 
 /** How the model should use native reminders and attachments when the user talks to it from a phone; who it is comes from the persona. */
 export function installAssistantPrompt(ctx: Context, current: (context: AssembleContext) => AssistantCapabilities = context => ({
-  memory: !!ctx.tools.get('memory_recall', context.scope), documents: !!ctx.tools.get('doc_read', context.scope),
+  memory: !!ctx.tools.get('memory_recall', context.scope),
   skills: !!ctx.tools.get('skill', context.scope),
   agenda: !!ctx.tools.get('calendar', context.scope), reminders: !!ctx.tools.get('schedule_create', context.scope),
 })): void {
@@ -15,14 +15,14 @@ export function installAssistantPrompt(ctx: Context, current: (context: Assemble
   }));
 }
 
-export interface AssistantCapabilities { memory?: boolean; documents?: boolean; skills?: boolean; agenda: boolean; reminders: boolean }
+export interface AssistantCapabilities { memory?: boolean; skills?: boolean; agenda: boolean; reminders: boolean }
 
 /** The native skill catalog already reflects workspace, scope and invocation policy.
  * Do not infer Office availability from installed packages or a global registry. */
-export function documentGuidance(capabilities: Pick<AssistantCapabilities, 'documents' | 'skills'>): string {
+export function documentGuidance(capabilities: Pick<AssistantCapabilities, 'skills'>): string {
   return [
     capabilities.skills ? 'Office 文件先查看当前会话的技能列表；列有对应的 office-docx、office-xlsx 或 office-pptx 时，先用 skill 加载并遵循它，使用技能指定的运行环境和检查、交付流程。技能列出不代表运行依赖已验证；缺失或执行失败时如实说明，不自动改用其他转换软件。' : '',
-    capabilities.documents ? '当前也提供 Nexus 文档兼容工具 doc_read、doc_create、doc_edit、doc_convert；仅在当前会话未提供对应 Office 技能，或用户明确选择兼容流程时使用。PDF 文字提取是否可用以工具实际结果为准。' : 'Nexus 文档兼容工具当前未启用，这不代表 DSH 官方文档能力不可用。根据当前会话实际提供的工具和技能处理；确有缺项时说明具体限制，旧格式等兼容需求可在 DSH 插件详情中启用“文档兼容工具”。',
+    '文档能力以当前会话可见的工具、技能与运行环境为准；缺少对应能力时说明限制，不调用已移除的 Nexus 文档兼容工具。',
     '文本文件用 read 工具按路径读取；不要把 Office 二进制当纯文本读取。',
   ].filter(Boolean).join('');
 }

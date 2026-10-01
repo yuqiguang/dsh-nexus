@@ -5,7 +5,6 @@ import type {} from '@deepseek-ai/dsh-credentials';
 import { registerRpc } from './dsh/rpc.js';
 import type {} from './dsh/nexus.js';
 export { registerRpc } from './dsh/rpc.js';
-export { installDocuments } from './documents/plugin.js';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import { mkdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';

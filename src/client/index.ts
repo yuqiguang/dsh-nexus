@@ -8,7 +8,6 @@ import { CoderSettings } from './CoderSettings.js';
 import { AssistantSettings } from './AssistantSettings.js';
 import { MemorySettings } from './MemorySettings.js';
 import { ConnectorSettings } from './ConnectorSettings.js';
-import { DocumentSettings } from './DocumentSettings.js';
 import { DataSettings } from './DataSettings.js';
 import styles from './styles.css';
 import { applyChatFold, readChatFold } from './chatFold.js';
@@ -38,7 +37,7 @@ export function apply(ctx: Context): void {
     name: 'settings.section', id: 'nexus-channels', order: 12, label: '渠道连接',
   }, ChannelSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-coders', order: 11, label: 'Nexus 编码',
+    name: 'settings.section', id: 'nexus-coders', order: 11, label: '编码工具',
   }, ({ close }: { close: () => void }) => createElement(CoderSettings, { close, navigation: () => {
     // Public client services, read lazily so settings still work in a minimal host.
     const ui = ctx.get('uiWorkspace') as { pickDirectory(): Promise<string | null>; openWorkspace(id: string): Promise<void> } | undefined;
@@ -58,9 +57,6 @@ export function apply(ctx: Context): void {
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-connectors', order: 16, label: '邮箱与日程',
   }, ConnectorSettings));
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-documents', order: 17, label: '文档兼容工具',
-  }, DocumentSettings));
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-data', order: 18, label: '数据',
   }, DataSettings));

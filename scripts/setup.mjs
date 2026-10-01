@@ -25,7 +25,17 @@ export function backfillProfilePatch(patch, coderRoots) {
   const entry = inserts.find(item => item.id === 'nexus-channels' || item.id === 'nexus-feishu');
   if (entry?.config && !entry.config.coderRoots) { entry.config.coderRoots = coderRoots; }
   if (entry) {
-    for (const component of ['documents', 'memory', 'mail', 'agenda']) {
+    // Retire our old development insertion and its overrides. Installed bundles no longer
+    // insert this id; DSH ignores their unmatched overrides without loading a module.
+    const documentNames = ['nexus-next/documents', ...(entry.name?.startsWith('file:')
+      ? [new URL('./documents/plugin.js', entry.name).href] : [])];
+    const foreignDocument = inserts.some(row => row.id === 'nexus-documents' && row.name && !documentNames.includes(row.name));
+    const retired = row => row.id === 'nexus-documents' && (row.name ? documentNames.includes(row.name) : !foreignDocument);
+    for (const layer of patch) {
+      if (Array.isArray(layer.insert)) layer.insert = layer.insert.filter(row => !retired(row));
+    }
+    for (let i = patch.length - 1; i >= 0; i--) if (!patch[i].insert && retired(patch[i])) patch.splice(i, 1);
+    for (const component of ['memory', 'mail', 'agenda']) {
       const id = `nexus-${component}`;
       if (inserts.some(item => item.id === id)) continue;
       const name = entry.name?.startsWith('file:')

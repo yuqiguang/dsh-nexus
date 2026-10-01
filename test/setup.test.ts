@@ -35,7 +35,7 @@ const rewritten = (): PatchRow[] => [
 test('back-filling adds coder roots and moves owned reminder rows to the official bundle', () => {
   const patch = backfillProfilePatch(original(), ['/nexus']);
   const inserted = patch[0]!.insert!;
-  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda']);
+  assert.deepEqual(inserted.map(row => row.id), ['nexus-channels', 'nexus-memory', 'nexus-mail', 'nexus-agenda']);
   assert.deepEqual(inserted[0]!.config?.coderRoots, ['/nexus']);
   assert.deepEqual(inserted[0]!.config?.workspaceRoot, '/nexus/workspace', 'an existing workspace path is kept');
 });
@@ -54,13 +54,32 @@ test('a patch without a nexus-channels row is left alone', () => {
   assert.deepEqual(patch, [{ insert: [{ id: 'schedule', name: '@deepseek-ai/dsh-schedule' }] }]);
 });
 
-test('document component is default-off and later native overrides survive setup', () => {
+test('retired document insertions and enabled or disabled overrides are removed without touching other settings', () => {
+  for (const name of ['nexus-next/documents', 'file:///nexus/dist/src/documents/plugin.js']) {
+    for (const disabled of [true, false]) {
+      const patch = original();
+      patch[0]!.insert!.push({ id: 'nexus-documents', name, disabled });
+      patch.push({ id: 'nexus-documents', disabled }, { id: 'nexus-documents', name, config: { retained: true } },
+        { id: 'nexus-memory', disabled: false });
+      backfillProfilePatch(patch, ['/nexus']);
+      assert.ok(!JSON.stringify(patch).includes('nexus-documents'));
+      assert.deepEqual(patch.at(-1), { id: 'nexus-memory', disabled: false });
+      const once = JSON.stringify(patch);
+      assert.equal(JSON.stringify(backfillProfilePatch(patch, ['/nexus'])), once);
+    }
+  }
+  const foreign = original();
+  foreign[0]!.insert!.push({ id: 'nexus-documents', name: 'other-plugin', config: { keep: true } });
+  foreign.push({ id: 'nexus-documents', disabled: false });
+  backfillProfilePatch(foreign, ['/nexus']);
+  assert.equal(foreign[0]!.insert!.find(row => row.name === 'other-plugin')?.config?.keep, true);
+  assert.deepEqual(foreign.at(-1), { id: 'nexus-documents', disabled: false });
+});
+
+test('remaining components are default-off and native overrides survive setup', () => {
   const patch = backfillProfilePatch(original(), ['/nexus']);
-  const documents = patch[0]!.insert!.find(row => row.id === 'nexus-documents');
-  assert.deepEqual(documents, { id: 'nexus-documents', name: 'file:///nexus/dist/src/documents/plugin.js', disabled: true });
   const memory = patch[0]!.insert!.find(row => row.id === 'nexus-memory');
   assert.deepEqual(memory, { id: 'nexus-memory', name: 'file:///nexus/dist/src/memory/plugin.js', disabled: true });
-  patch.push({ id: 'nexus-documents', disabled: false });
   patch.push({ id: 'nexus-memory', disabled: false });
   assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-mail'), { id: 'nexus-mail', name: 'file:///nexus/dist/src/connectors/mail/plugin.js', disabled: true });
   patch.push({ id: 'nexus-mail', disabled: false });
@@ -95,7 +114,7 @@ test('moving reminder services into the official bundle preserves their explicit
     { id: 'nexus-channels', name: 'file:///nexus/dist/src/plugin.js', config: {} },
   ] }, { id: 'schedule', config: { deliveryHistoryDays: 10 } }];
   const patch = backfillProfilePatch(source, ['/nexus']);
-  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda']);
+  assert.deepEqual(patch[0]!.insert!.map(row => row.id), ['nexus-channels', 'nexus-memory', 'nexus-mail', 'nexus-agenda']);
   assert.deepEqual(patch.slice(1).map(row => [row.id, row.config]), [
     ['schedule', { deliveryHistoryDays: 7 }], ['time-context', {}], ['schedule', { deliveryHistoryDays: 10 }],
   ]);

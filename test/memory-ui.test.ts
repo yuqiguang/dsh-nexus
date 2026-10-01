@@ -124,6 +124,65 @@ test('a limit error from the server is explained and the page keeps working', as
   assert.equal((ui.field('memory-event-text') as HTMLTextAreaElement).value, '太长', 'the draft survives a refused write');
 });
 
+test('event and injection pages stay small, search reaches old records, and exports ignore the visible filter', async t => {
+  const service = await MemoryService.open(fakeMemoryDomain().opener, () => T0);
+  t.after(() => service.close());
+  const { LOCAL_PREFERENCES } = await import('../src/memory/scope.js');
+  const store = service.store.forScope(LOCAL_PREFERENCES);
+  for (let n = 0; n < 221; n++) await store.addEvent({ text: `event-row-${n}`, tags: n === 0 ? ['old-tag'] : [], source: 'user' }, n);
+  for (let n = 0; n < 25; n++) await store.recordInjection({ at: n, query: `injected-row-${n}`, sessionId: 'fixture', eventIds: [], profile: true });
+  const ui = await page(t, (method, payload) => service.handle(method, payload));
+  const listCount = (title: string) => [...ui.dom.window.document.querySelectorAll('h3')].find(node => node.textContent === title)!.closest('.nexus-channel-card')!.querySelectorAll('li').length;
+  assert.equal(listCount('事件'), 20);
+  assert.equal(listCount('最近注入'), 10);
+  await ui.click('事件下一页');
+  assert.match(ui.text(), /第 2\/12 页/);
+  await ui.click('注入记录下一页');
+  assert.match(ui.text(), /第 2\/3 页/);
+  await ui.enter('memory-filter', 'OLD-TAG');
+  assert.equal(listCount('事件'), 1);
+  assert.match(ui.text(), /event-row-0/);
+  assert.match(ui.text(), /第 1\/1 页/);
+  assert.match(ui.text(), /第 2\/3 页/, 'event search does not reset the audit page');
+  await ui.click('导出 JSON');
+  const exported = JSON.parse((ui.dom.window.document.querySelector('[aria-label="导出的记忆"]') as HTMLTextAreaElement).value);
+  assert.equal(exported.events.length, 221);
+  await ui.click(`删除事件 ${store.events().find(item => item.text === 'event-row-0')!.id}`);
+  assert.match(ui.text(), /没有匹配的事件记忆/);
+  await ui.enter('memory-filter', '');
+  assert.equal(listCount('事件'), 20);
+});
+
+test('a late search response cannot replace newer results or a newly selected scope', async t => {
+  const a: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/a' };
+  const b: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/b' };
+  const service = await MemoryService.open(fakeMemoryDomain().opener, () => T0,
+    { async resolveSession() { return a; }, async projects() { return [a, b]; } });
+  t.after(() => service.close());
+  await service.handle('event/add', { scopeId: scopeId(a), text: 'slow-private' });
+  await service.handle('event/add', { scopeId: scopeId(a), text: 'current-result' });
+  await service.handle('event/add', { scopeId: scopeId(b), text: 'B-current' });
+  let release!: () => void;
+  const ui = await page(t, async (method, payload: any) => {
+    const result = await service.handle(method, payload);
+    if (method === 'list' && payload.eventQuery === 'slow') await new Promise<void>(resolve => { release = resolve; });
+    return result;
+  });
+  await ui.enter('memory-scope', scopeId(a));
+  await ui.enter('memory-filter', 'slow');
+  await ui.enter('memory-filter', 'current');
+  assert.match(ui.text(), /current-result/);
+  assert.doesNotMatch(ui.text(), /slow-private/);
+  await act(async () => release());
+  assert.doesNotMatch(ui.text(), /slow-private/);
+  await ui.enter('memory-filter', 'slow');
+  await ui.enter('memory-scope', scopeId(b));
+  await act(async () => release());
+  assert.match(ui.text(), /B-current/);
+  assert.doesNotMatch(ui.text(), /slow-private|current-result/);
+  assert.equal(ui.field('memory-filter').value, '');
+});
+
 test('scope selection clears old export and drafts; mutations and exports stay in the visible scope', async t => {
   const a: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/a' };
   const b: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/b' };

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { MemoryView } from '../memory/index.js';
+import type { MemoryPage, MemoryView } from '../memory/index.js';
 import { explain } from './ChannelSettings.js';
 
 export type MemoryApi = (method: string, payload?: unknown, signal?: AbortSignal) => Promise<MemoryView>;
@@ -21,6 +21,14 @@ export const memoryApi: MemoryApi = async (method, payload = {}, signal) => {
 const when = (at: number) => new Date(at).toLocaleString('zh-CN', { hour12: false });
 const REMEMBER_LABEL: Record<MemoryView['policy']['remember'], string> = { auto: '直接记住', ask: '先放待确认', off: '不记' };
 
+function Pages({ label, info, disabled, select }: { label: string; info: MemoryPage; disabled: boolean; select(page: number): void }) {
+  return <footer aria-label={`${label}分页`}>
+    <span className="nexus-channel-hint">共 {info.total} 条，第 {info.page + 1}/{info.pages} 页，每页 {info.pageSize} 条</span>
+    <button type="button" aria-label={`${label}上一页`} disabled={disabled || info.page === 0} onClick={() => select(info.page - 1)}>上一页</button>
+    <button type="button" aria-label={`${label}下一页`} disabled={disabled || info.page + 1 >= info.pages} onClick={() => select(info.page + 1)}>下一页</button>
+  </footer>;
+}
+
 export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
   const [view, setView] = useState<MemoryView>();
   const [busy, setBusy] = useState(false);
@@ -31,6 +39,8 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
   const [profileValue, setProfileValue] = useState('');
   const [eventText, setEventText] = useState('');
   const [filter, setFilter] = useState('');
+  const [listQuery, setListQuery] = useState<{ eventQuery?: string; eventPage?: number; injectionPage?: number }>({});
+  const [reading, setReading] = useState(false);
   const [scopeId, setScopeId] = useState<string>();
   const [targetScopeId, setTargetScopeId] = useState('');
   const [copied, setCopied] = useState(false);
@@ -44,20 +54,24 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
       pending = true;
       const started = generation.current;
       try {
-        const next = await api('list', scopeId ? { scopeId } : {}, controller.signal);
-        if (!controller.signal.aborted && started === generation.current) { setView(next); setReadError(undefined); }
-      } catch (failure) { if (!controller.signal.aborted && started === generation.current) setReadError(explain((failure as Error).message)); }
+        const next = await api('list', { ...listQuery, ...(scopeId ? { scopeId } : {}) }, controller.signal);
+        if (!controller.signal.aborted && started === generation.current) { setView(next); setReadError(undefined); setReading(false); }
+      } catch (failure) { if (!controller.signal.aborted && started === generation.current) { setReadError(explain((failure as Error).message)); setReading(false); } }
       finally { pending = false; }
     };
     void refresh();
     const timer = setInterval(() => { void refresh(); }, 10_000);
     return () => { controller.abort(); clearInterval(timer); };
-  }, [api, scopeId]);
+  }, [api, scopeId, listQuery]);
+  const navigate = (query: typeof listQuery) => {
+    generation.current++; setReading(true); setReadError(undefined);
+    setListQuery({ ...listQuery, ...query });
+  };
   const action = async (method: string, payload: unknown = {}): Promise<MemoryView | undefined> => {
-    if (writing.current) return undefined;
+    if (writing.current || reading) return undefined;
     writing.current = true; generation.current++;
     setBusy(true); setError(undefined);
-    try { const next = await api(method, { ...payload as object, ...(view?.scope ? { scopeId: view.scope.id } : {}) }); setView(next); setExported(undefined); return next; }
+    try { const next = await api(method, { ...listQuery, ...payload as object, ...(view?.scope ? { scopeId: view.scope.id } : {}) }); setView(next); setExported(undefined); return next; }
     catch (failure) { setError(explain((failure as Error).message)); return undefined; }
     finally { writing.current = false; setBusy(false); }
   };
@@ -79,14 +93,14 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
     setCopied(false);
     if (await action('legacy/copy', { ...payload, targetScopeId })) setCopied(true);
   };
-  const events = needle ? view.events.filter(item => item.text.toLowerCase().includes(needle) || item.tags?.some(tag => tag.toLowerCase().includes(needle))) : view.events;
+  const events = needle && !view.pagination ? view.events.filter(item => item.text.toLowerCase().includes(needle) || item.tags?.some(tag => tag.toLowerCase().includes(needle))) : view.events;
   return <section className="nexus-channel-settings" aria-label="记忆">
     <h2>记忆</h2>
     <p>新记忆按原生会话的工作目录和身份隔离；相同身份的全局个人偏好可以在项目间共享。模型只能写入当前项目。删除会停止后续检索与注入，已有会话上下文不会被撤回。</p>
     {view.scope && view.scopes && <div className="nexus-channel-card">
       <label htmlFor="memory-scope">查看与管理的范围</label>
       <select id="memory-scope" value={view.scope.id} disabled={busy} onChange={event => {
-        generation.current++; setScopeId(event.target.value); setView(undefined); setExported(undefined); setFilter('');
+        generation.current++; setScopeId(event.target.value); setView(undefined); setExported(undefined); setFilter(''); setListQuery({}); setReading(true);
         setProfileKey(''); setProfileValue(''); setEventText(''); setTargetScopeId(''); setCopied(false); setError(undefined);
       }}>{view.scopes.map(scope => <option key={scope.id} value={scope.id}>{scope.label}</option>)}</select>
       <p className="nexus-channel-hint">此选择只决定设置页管理哪组数据，不改变活动会话、项目或文件权限。新的本机项目可先在 DSH 中打开工作区；渠道范围在首次产生记忆后列出，各身份互不共享。</p>
@@ -151,16 +165,23 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
       </form>}
     </div>
     <div className="nexus-channel-card">
-      <header><h3>事件</h3><span className="nexus-channel-state">显示最近 {view.events.length} 条</span></header>
-      <label htmlFor="memory-filter">筛选</label>
-      <input id="memory-filter" value={filter} onChange={event => setFilter(event.target.value)} placeholder="按内容或标签筛选" />
-      {events.length === 0 ? <p className="nexus-channel-hint">没有事件记忆。</p> : <ul className="nexus-memory-list">
+      <header><h3>事件</h3><span className="nexus-channel-state">已保存 {view.counts.events}/{view.limits.events} 条</span></header>
+      <p className="nexus-channel-hint">按时间从新到旧浏览；搜索覆盖当前范围内的全部事件。普通事件满额后需先整理，系统不会自动删除；自动保存的对话摘要满额时只替换最旧摘要。</p>
+      {view.counts.events >= view.limits.events * 0.9 && <p role="status">事件容量即将用满，可先导出，再删除过时记录。</p>}
+      <label htmlFor="memory-filter">搜索事件</label>
+      <input id="memory-filter" value={filter} maxLength={200} disabled={busy} onChange={event => {
+        setFilter(event.target.value);
+        if (view.pagination) navigate({ eventQuery: event.target.value, eventPage: 0 });
+      }} placeholder="按内容或标签搜索当前范围" />
+      {view.pagination?.eventQuery && <p className="nexus-channel-hint">当前结果：{view.pagination.eventQuery}</p>}
+      {reading ? <p role="status">正在读取列表…</p> : events.length === 0 ? <p className="nexus-channel-hint">{needle ? '没有匹配的事件记忆。' : '没有事件记忆。'}</p> : <ul className="nexus-memory-list">
         {events.map(item => <li key={item.id}>
           <span><span className="nexus-channel-state">{when(item.at)}{item.source === 'summary' ? ' 对话摘要' : ''} </span>{item.text}{item.tags?.length ? <span className="nexus-channel-state"> #{item.tags.join(' #')}</span> : null}</span>
           <button type="button" disabled={busy} aria-label={`删除事件 ${item.id}`} onClick={() => { void action('event/delete', { id: item.id }); }}>删除</button>
           {legacy && <button type="button" disabled={busy || !targetScopeId} onClick={() => void copy({ kind: 'event', id: item.id, expectedText: item.text })}>复制到所选范围</button>}
         </li>)}
       </ul>}
+      {view.pagination && <Pages label="事件" info={view.pagination.events} disabled={busy || reading} select={eventPage => navigate({ eventPage })} />}
       {!legacy && <form onSubmit={event => { void addEvent(event); }}>
         <label htmlFor="memory-event-text">新增事件</label>
         <textarea id="memory-event-text" value={eventText} maxLength={view.limits.eventChars} onChange={event => setEventText(event.target.value)} placeholder="一句话，写清何时、什么、结论" />
@@ -169,11 +190,13 @@ export function MemorySettings({ api = memoryApi }: { api?: MemoryApi }) {
     </div>
     <div className="nexus-channel-card">
       <header><h3>最近注入</h3></header>
-      {view.injections.length === 0 ? <p className="nexus-channel-hint">还没有注入记录。</p> : <ul className="nexus-memory-list">
+      <p className="nexus-channel-hint">这是向模型提供记忆的使用记录，不是新增记忆。每个范围只保留最近 {view.limits.injections} 条，超过后自动清理最旧日志，不删除画像或事件，也不会把全部日志放进对话。</p>
+      {reading ? <p role="status">正在读取列表…</p> : view.injections.length === 0 ? <p className="nexus-channel-hint">还没有注入记录。</p> : <ul className="nexus-memory-list">
         {view.injections.map(record => <li key={record.id}>
           <span><span className="nexus-channel-state">{when(record.at)} </span>“{record.query}” → {record.profile ? '画像' : ''}{record.profile && record.eventIds.length ? '、' : ''}{record.eventIds.length ? `${record.eventIds.length} 条事件` : ''}</span>
         </li>)}
       </ul>}
+      {view.pagination && <Pages label="注入记录" info={view.pagination.injections} disabled={busy || reading} select={injectionPage => navigate({ injectionPage })} />}
     </div>
   </section>;
 }

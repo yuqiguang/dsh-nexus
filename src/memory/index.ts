@@ -25,6 +25,24 @@ const ZONE = 'Asia/Shanghai';
 /** What one turn may carry: enough for a profile and a handful of events, small enough not to crowd the user's own message. */
 export const INJECT_BUDGET = { profileChars: 1500, events: 5, totalChars: 2600 } as const;
 
+export interface MemoryPage { page: number; pageSize: number; total: number; pages: number }
+interface MemoryListQuery { eventPage: number; injectionPage: number; eventQuery: string }
+
+function memoryListQuery(input: Record<string, unknown>): MemoryListQuery {
+  const page = (value: unknown): number => {
+    if (value === undefined) return 0;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new ChannelError('invalid_configuration');
+    return value;
+  };
+  if (input.eventQuery !== undefined && (typeof input.eventQuery !== 'string' || input.eventQuery.length > 200)) throw new ChannelError('invalid_configuration');
+  return { eventPage: page(input.eventPage), injectionPage: page(input.injectionPage), eventQuery: ((input.eventQuery as string | undefined) ?? '').trim() };
+}
+
+function memoryPage<T>(items: T[], requested: number, pageSize: number): { items: T[]; info: MemoryPage } {
+  const pages = Math.max(1, Math.ceil(items.length / pageSize)), page = Math.min(requested, pages - 1);
+  return { items: items.slice(page * pageSize, (page + 1) * pageSize), info: { page, pageSize, total: items.length, pages } };
+}
+
 export interface MemoryView {
   moduleEnabled?: boolean;
   scope?: MemoryScopeChoice;
@@ -36,6 +54,7 @@ export interface MemoryView {
   injections: InjectionRecord[];
   counts: { profile: number; events: number; proposals: number };
   limits: typeof LIMITS;
+  pagination?: { events: MemoryPage; injections: MemoryPage; eventQuery: string };
   /** Only in the response to `export`. */
   exportJson?: string;
 }
@@ -216,10 +235,14 @@ export class MemoryService {
     return new Map(all.map(scope => [scopeId(scope), scope]));
   }
 
-  private view(store: MemoryStore, choice: MemoryScopeChoice, catalog: Map<string, MemoryScope>, extra: Partial<MemoryView> = {}): MemoryView {
+  private view(store: MemoryStore, choice: MemoryScopeChoice, catalog: Map<string, MemoryScope>, query: MemoryListQuery, extra: Partial<MemoryView> = {}): MemoryView {
     const profile = store.profile(), events = store.events(), proposals = store.proposals();
+    const needle = query.eventQuery.toLowerCase();
+    const matching = needle ? events.filter(event => event.text.toLowerCase().includes(needle) || event.tags?.some(tag => tag.toLowerCase().includes(needle))) : events;
+    const eventPage = memoryPage(matching, query.eventPage, 20), injectionPage = memoryPage(store.injections(), query.injectionPage, 10);
     return { scope: choice, scopes: [{ id: LEGACY_SCOPE, kind: 'legacy', label: '旧版未归类记忆（不注入）' }, ...[...catalog.values()].map(scopeChoice)],
-      policy: { remember: this.store.policy().remember, inject: this.store.policy().inject }, profile, events: events.slice(0, 200), proposals, injections: store.injections().slice(0, 20),
+      policy: { remember: this.store.policy().remember, inject: this.store.policy().inject }, profile, events: eventPage.items, proposals, injections: injectionPage.items,
+      pagination: { events: eventPage.info, injections: injectionPage.info, eventQuery: query.eventQuery },
       counts: { profile: profile.length, events: events.length, proposals: proposals.length }, limits: LIMITS, ...extra };
   }
 
@@ -227,13 +250,14 @@ export class MemoryService {
   async handle(method: string, payload: unknown = {}): Promise<MemoryView> {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new ChannelError('invalid_configuration');
     const input = payload as Record<string, unknown>;
+    const query = memoryListQuery(input);
     const catalog = await this.catalog();
     const selected = input.scopeId ?? scopeId(LOCAL_PREFERENCES);
     if (typeof selected !== 'string' || (selected !== LEGACY_SCOPE && !catalog.has(selected))) throw new ChannelError('memory_scope_unavailable');
     const isLegacy = selected === LEGACY_SCOPE;
     const choice: MemoryScopeChoice = isLegacy ? { id: LEGACY_SCOPE, kind: 'legacy', label: '旧版未归类记忆（不注入）' } : scopeChoice(catalog.get(selected)!);
     const store = isLegacy ? this.legacy : this.store.forScope(catalog.get(selected)!);
-    const view = (extra: Partial<MemoryView> = {}) => this.view(store, choice, catalog, extra);
+    const view = (extra: Partial<MemoryView> = {}) => this.view(store, choice, catalog, query, extra);
     if (method === 'list') return view();
     if (method === 'export') return view({ exportJson: JSON.stringify({ ...store.export(), scope: choice }, null, 2) });
     const text = (value: unknown) => typeof value === 'string' ? value : '';
