@@ -36,6 +36,8 @@ export interface CodersView {
   settings: CoderSettingsView;
   profileRoots: string[];
   effectiveRoots: string[];
+  /** Whether these roots restrict the native session workspace. */
+  restrictRoots?: boolean;
   managedRoot: string;
   claudeHome: string;
   claudeLogin?: ClaudeLoginInstructions;
@@ -67,8 +69,9 @@ export interface ManagerDeps {
   windowsSandbox?: typeof windowsSandbox;
   store: CoderSettingsStore;
   layout: ManagedLayout;
-  /** Roots from the profile, used when the settings leave roots empty. */
+  /** Profile defaults for embedded hosts; only explicit roots restrict native sessions. */
   profileRoots: string[];
+  restrictRoots?: boolean;
   installer: CoderInstaller;
   detect?: DetectOptions;
   /** Test seam for `codex login status`. */
@@ -342,6 +345,7 @@ export class CodersManager {
     return {
       platform: this.deps.detect?.host?.platform ?? process.platform,
       settings: redact(settings), profileRoots: [...this.deps.profileRoots], effectiveRoots: runtime.roots,
+      restrictRoots: !!settings.roots?.length || this.deps.restrictRoots === true,
       managedRoot: this.deps.layout.root, claudeHome: this.deps.layout.claudeHome, codex, claude,
       claudeLogin: this.claudeLogin(detection.claude, claudePick.active),
       ...(progress ? { install: progress } : {}),

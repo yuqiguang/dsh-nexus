@@ -30,6 +30,7 @@ test('retiring the project picker preserves legacy secrets and grants without re
   assert.equal('project' in view, false); assert.equal('workspaces' in view, false);
   assert.equal('projectRoot' in view.settings, false);
   assert.deepEqual(view.effectiveRoots, [f.allowed]);
+  assert.equal(view.restrictRoots, true);
   assert.doesNotMatch(JSON.stringify(view), /legacy-.*-secret|no-longer-exists/);
   await assert.rejects(f.manager.handle('project/select', { revision: 1, path: f.root, allow: true }), /unknown_action/);
   const after = await f.manager.handle('save', { revision: 1, config: { roots: [f.allowed], maxConcurrent: 2, codex: { model: saved.codex.model } } });
@@ -49,6 +50,7 @@ test('recent tasks include every workspace with original session links and a ten
   }));
   f.manager.attach({ list: () => tasks, rules: () => [] } as unknown as CoderStore);
   const view = await f.manager.handle('list', {});
+  assert.equal(view.restrictRoots, false);
   assert.deepEqual(view.recentTasks.map(task => [task.id, task.ownerSession, task.cwd]), tasks.slice(0, 10).map(task => [task.id, task.ownerSession, task.cwd]));
   assert.match(view.recentTasks[0]!.statusLabel!, /尚未独立验证/);
 });

@@ -617,7 +617,8 @@ import { defaultSettings } from '../src/coders/settings.js';
 import type { HabitRule } from '../src/coders/types.js';
 
 /** Just enough of the plugin context for `installCoders`: tables in memory, tools by name, one job run by hand. */
-function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: string; selected: string[]; custom?: string }[]) {
+function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: string; selected: string[]; custom?: string }[], sessionWorkspace?: string) {
+  const session = sessionWorkspace ? { header: { cwd: sessionWorkspace } } : {};
   const tables = { tasks: new Map<string, unknown>(), rules: new Map<string, unknown>(), briefs: new Map<string, unknown>() };
   const tableFor = (records: Map<string, unknown>) => ({
     get: (key: string) => records.get(key), entries: () => [...records.entries()][Symbol.iterator](), keys: () => [...records.keys()][Symbol.iterator](),
@@ -646,7 +647,7 @@ function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: st
     storageDomain: { async open() { return domain; } },
     tools: { register(tool: { name: string; execute(args: unknown, exec?: unknown): Promise<Record<string, string>> }) { tools.set(tool.name, tool); return () => {}; } },
     systemPrompt: { section() { return () => {}; }, getSectionOrder() { return 10; } },
-    sessionController: { async resolveAgent() { return reachUser ? { agent: { id: task().ownerSession } as unknown as Agent } : { error: new Error('not live') }; } },
+    sessionController: { async resolveAgent() { return reachUser || sessionWorkspace ? { agent: { id: task().ownerSession, session } as unknown as Agent } : { error: new Error('not live') }; } },
     userQuestions: { async ask(request: { questions: AskUserQuestionItem[] }) {
       if (!reachUser) throw new Error('nothing should reach the user');
       asked.push(request.questions);
@@ -660,9 +661,74 @@ function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: st
       return `job-${jobs.length}`;
     } },
   } as unknown as Context;
-  const run = (name: string, args: unknown, owner = task().ownerSession) => tools.get(name)!.execute(args, { agent: { id: owner, session: {} } });
-  return { ctx, run, jobs, panels, asked, tasks: tables.tasks as Map<string, TaskRecord>, rules: tables.rules as Map<string, HabitRule> };
+  const run = (name: string, args: unknown, owner = task().ownerSession) => tools.get(name)!.execute(args, { agent: { id: owner, session } });
+  return { ctx, run, jobs, panels, asked, session, tasks: tables.tasks as Map<string, TaskRecord>, rules: tables.rules as Map<string, HabitRule> };
 }
+
+test('dispatch defaults to its native session, reports the directory, and resumes in the original subdirectory', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-dispatch-workspace-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'desktop'), channel = join(root, 'channel');
+  await mkdir(workspace); await mkdir(channel);
+  const harness = coderHarness(undefined, workspace);
+  const query = scriptedQuery(async function* (options) {
+    yield { type: 'system', subtype: 'init', session_id: 'workspace-session' };
+    await writeFile(join(options.cwd!, 'hello.txt'), 'hello');
+    yield { type: 'result', subtype: 'success', result: 'Created hello.txt' };
+  });
+  await installCoders(harness.ctx, { roots: [channel], query, defaultCoder: 'claude' });
+  const first = await harness.run('coder_task', { description: 'create hello' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(first.cwd, workspace);
+  assert.equal(await readFile(join(workspace, 'hello.txt'), 'utf8'), 'hello');
+  await assert.rejects(readFile(join(channel, 'hello.txt')), { code: 'ENOENT' });
+  assert.deepEqual(harness.tasks.get(first.task_id!)!.permissions!.reviewRoots, [workspace]);
+  Object.assign(harness.ctx, { sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: harness.session.header!.cwd }) } });
+  assert.match((await harness.run('coder_package', { task_id: first.task_id, files: ['hello.txt'] })).path!, /\.zip$/);
+  await assert.rejects(harness.run('coder_task', { description: 'outside', cwd: channel }), /当前会话工作区/);
+  assert.equal(harness.jobs.length, 1);
+  const child = await harness.run('coder_task', { description: 'create child', cwd: 'app' });
+  await harness.jobs.at(-1)!.done;
+  const resumed = await harness.run('coder_task', { description: 'continue child', resume_task_id: child.task_id });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(resumed.cwd, join(workspace, 'app'));
+  assert.equal(harness.tasks.get(resumed.task_id!)!.resumedFrom, child.task_id);
+  harness.session.header!.cwd = channel;
+  await assert.rejects(harness.run('coder_package', { task_id: first.task_id, files: ['hello.txt'] }), /工作区/);
+  await assert.rejects(harness.run('coder_task', { description: 'continue elsewhere', resume_task_id: resumed.task_id }), /当前会话工作区/);
+});
+
+test('queued task rechecks its session workspace before starting the coder', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-queued-workspace-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  let finish!: () => void, runs = 0;
+  const query = scriptedQuery(async function* () {
+    runs++;
+    await new Promise<void>(resolve => { finish = resolve; });
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [workspace], query, defaultCoder: 'claude', maxConcurrent: 1 });
+  await harness.run('coder_task', { description: 'first' });
+  await until(() => runs === 1, 'first coder starts');
+  const queued = await harness.run('coder_task', { description: 'queued' });
+  harness.session.header!.cwd = join(workspace, 'different');
+  finish();
+  await Promise.all(harness.jobs.map(job => job.done));
+  assert.equal(runs, 1);
+  assert.equal(harness.tasks.get(queued.task_id!)!.status, 'failed');
+  assert.equal(harness.tasks.get(queued.task_id!)!.result!.verification, 'not-run');
+});
+
+test('configured directory restriction rejects dispatch before creating a project', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-dispatch-restricted-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  await installCoders(harness.ctx, { roots: [join(workspace, 'allowed')], restrictRoots: true, defaultCoder: 'claude' });
+  await assert.rejects(harness.run('coder_task', { description: 'restricted', cwd: 'outside' }), /允许范围/);
+  assert.equal(harness.jobs.length, 0);
+  await assert.rejects(readFile(join(workspace, 'outside')), { code: 'ENOENT' });
+});
 
 const until = async (check: () => boolean, what: string) => {
   for (let tries = 0; !check(); tries++) {
@@ -2146,9 +2212,9 @@ test('Codex native retries are visible and exhausted transient errors resume the
   assert.equal(harness.tasks.get(id)!.status, 'completed');
 });
 
-for (const action of ['cancel', 'boundary', 'quota', 'no-session'] as const) test(`${action} prevents automatic recovery without repeating work`, async t => {
+for (const action of ['cancel', 'boundary', 'workspace', 'quota', 'no-session'] as const) test(`${action} prevents automatic recovery without repeating work`, async t => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-retry-guard-')); t.after(() => rm(workdir, { recursive: true, force: true }));
-  const harness = coderHarness(); let attempts = 0;
+  const harness = coderHarness(undefined, action === 'workspace' ? workdir : undefined); let attempts = 0;
   const query: ClaudeQuery = async function* () {
     attempts++;
     if (action !== 'no-session') yield { type: 'system', subtype: 'init', session_id: 'retry-guard' };
@@ -2157,6 +2223,7 @@ for (const action of ['cancel', 'boundary', 'quota', 'no-session'] as const) tes
   await installCoders(harness.ctx, { roots: [workdir], query, defaultCoder: 'claude', retryWait: async () => {
     if (action === 'cancel') harness.jobs[0]!.cancel('user cancelled');
     if (action === 'boundary') await rm(workdir, { recursive: true, force: true });
+    if (action === 'workspace') harness.session.header!.cwd = join(workdir, 'different');
   } });
   const id = (await harness.run('coder_task', { cwd: workdir, description: 'work' })).task_id!;
   await harness.jobs[0]!.done;

@@ -132,7 +132,7 @@ export function endpointUrl(value: unknown): string | undefined {
   return url.href.replace(/\/+$/, '');
 }
 
-/** Roots come one per line or as an array; each must be an absolute path. Empty means "use the profile's roots". */
+/** Roots come one per line or as an array; each must be an absolute path. Empty means "follow the native session workspace". */
 export function rootsInput(value: unknown): string[] | undefined {
   const items = Array.isArray(value) ? value : typeof value === 'string' ? value.split('\n') : value === undefined || value === null ? [] : undefined;
   if (!items) throw new ChannelError('invalid_configuration');

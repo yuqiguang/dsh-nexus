@@ -10,8 +10,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
 import { SessionId } from '@deepseek-ai/dsh-session';
-import { access, mkdtemp, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { access, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { installCoders, type TaskDetailView } from '../src/coders/index.js';
 import type { ClaudeQuery, ClaudeStreamMessage } from '../src/coders/claude.js';
@@ -85,9 +84,10 @@ class FixtureModel extends LlmAdapter {
       ] });
     } else if (step === 2) {
       assert.match(toolResultText(options, 'plan'), /步骤计划/);
-      yield* this.toolCall('dispatch', 'coder_task', { coder: 'claude', description: '列出目录内容并报告', cwd: this.coderCwd, verify_network: 'ask', brief_id: this.briefId, brief_revision: 2, plan_step: 'inspect' });
+      yield* this.toolCall('dispatch', 'coder_task', { coder: 'claude', description: '列出目录内容并报告', verify_network: 'ask', brief_id: this.briefId, brief_revision: 2, plan_step: 'inspect' });
     } else if (step === 3) {
       const text = toolResultText(options, 'dispatch');
+      assert.ok(text.includes(`实际项目目录：${this.coderCwd}`));
       const match = /后台 job ([^，\s]+)，/.exec(text);
       assert.ok(match, text);
       this.jobId = match[1]!;
@@ -184,12 +184,12 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
   ctx.effect(() => () => clearInterval(timer));
 
   async function run() {
-    model.coderCwd = await mkdtemp(join(tmpdir(), 'nexus-coder-'));
+    model.coderCwd = config.workspace;
     await writeFile(join(model.coderCwd, 'README.md'), 'smoke\n');
     ctx.web.registerSearchProvider({ id: 'nexus-research-fixture', available: () => true, async search() { return { sources: [{ url: 'https://example.com', title: 'fixture source' }], truncated: false }; } });
     ctx.web.registerFetchProvider({ id: 'nexus-research-fixture', available: () => true, async fetch({ url }) { return { url, statusCode: 200, body: { kind: 'text', content: 'fixture page' }, truncated: false }; } });
     let readTask: ((method: string, payload: unknown) => Promise<unknown>) | undefined;
-    const store = await installCoders(ctx, { roots: [model.coderCwd], query, web: () => ctx.web,
+    const store = await installCoders(ctx, { roots: [join(config.workspace, 'channel-default')], query, web: () => ctx.web,
       registerRpc: (family, _methods, handle) => { if (family === 'nexus-coder-tasks') readTask = handle; } });
     await bridge.receive(inbound('dispatch', '帮我看看这个目录里有什么。'));
     const agent = ctx.agents.get(sessionId)!;

@@ -27,6 +27,8 @@ test('tool readiness needs no separate project choice and checks only the saved 
   assert.match(panel().textContent!, /DSH 新建会话时选择/);
   assert.equal(ui.field('nexus-project-path'), null);
   assert.equal(ui.field('nexus-known-project'), null);
+  assert.match(ui.text(), /默认跟随当前 DSH 会话工作区/);
+  assert.doesNotMatch(ui.text(), /当前生效：.*home\/dev\/project/);
   assert.doesNotMatch(ui.text(), /开始编码|完成以下准备|使用此项目|打开项目会话/);
   assert.match(ui.text(), /共用托管安装目录/);
   assert.match(ui.text(), /另一工具未完成的安装需单独重试/);
@@ -38,6 +40,15 @@ test('tool readiness needs no separate project choice and checks only the saved 
   assert.match(panel().textContent!, /默认工具待配置/);
   assert.match(panel().textContent!, /安装：尚未安装/);
   assert.match(panel().textContent!, /凭据：尚未确认/);
+});
+
+test('settings display explicit profile restrictions without presenting them as a project selection', async t => {
+  const view = initial();
+  view.restrictRoots = true;
+  const ui = await page(t, async () => structuredClone(view));
+  assert.match(ui.text(), /附加目录限制：\/home\/dev\/project/);
+  assert.match(ui.text(), /不会扩大工作区/);
+  assert.equal(ui.field('coders-roots').value, '');
 });
 
 test('readiness distinguishes missing credentials and preserves task navigation without project controls', async t => {

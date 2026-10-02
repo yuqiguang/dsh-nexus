@@ -3,6 +3,7 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import JSZip from 'jszip';
 import { randomBytes } from 'node:crypto';
+import type { Session } from '@deepseek-ai/dsh-session';
 import { lstat, mkdir, open } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { readDelivery, MAX_DELIVERY_BYTES } from '../channels/files.js';
@@ -76,7 +77,7 @@ export async function packageFiles(cwd: string, names: readonly string[], signal
 }
 
 /** Use public native policy hooks; only explicit present calls authorize channel delivery. */
-export function installCoderPackaging(ctx: Context, tasks: () => TaskRecord[], roots: () => readonly string[]): void {
+export function installCoderPackaging(ctx: Context, tasks: () => TaskRecord[], roots: (session: Session) => readonly string[] | Promise<readonly string[]>): void {
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_package', description: '将本会话已结束编码任务的明确文件列表打包，保留目录结构并核对静态资源引用。缺少依赖时返回要补入的文件；不自动发送，成功后对返回的 zip 调用 present。',
     parameters: { task_id: { type: 'string', required: true }, files: { type: 'array', items: { type: 'string' }, required: true } },
@@ -89,7 +90,7 @@ export function installCoderPackaging(ctx: Context, tasks: () => TaskRecord[], r
       const policy = ctx.sandboxPolicy.resolve({ session: exec.agent.session });
       if (policy.mode === 'read-only') throw new Error('只读会话不能生成归档。');
       const root = await canonical(task.cwd);
-      const allowed = await Promise.all(roots().map(canonical));
+      const allowed = await Promise.all((await roots(exec.agent.session)).map(canonical));
       if (root !== resolve(task.cwd) || !task.permissions?.writableRoots.includes(root) || !allowed.some(path => isInside(path, root))
         || (policy.mode === 'workspace-write' && !isInside(await canonical(policy.workspaceRoot), root))) throw new Error('任务目录不在当前允许的工作区内。');
       return packageFiles(task.cwd, args.files, exec.signal);

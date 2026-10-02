@@ -91,7 +91,7 @@ function ToolReadiness({ view, disabled, refresh }: { view: CodersView; disabled
       <li>凭据：{coder.credentialState === 'configured' ? '已检测到配置，实际可用性以任务结果为准' : coder.credentialState === 'missing' ? '尚未配置，请在下方登录或填写凭据' : '尚未确认，请检查下方登录状态'}</li>
       <li>运行配置：{coder.ready ? '检查通过' : coder.problem ?? '请先完成安装与平台配置'}</li>
     </ul>
-    <p className="nexus-channel-hint">打开 DSH 项目会话后即可提出编码需求。任务目录仍须在下方允许范围内。此处仅检查本机配置，不发起模型任务。</p>
+    <p className="nexus-channel-hint">打开 DSH 项目会话后即可提出编码需求。任务默认写入当前会话工作区；下方可额外限制目录。此处仅检查本机配置，不发起模型任务。</p>
     <button type="button" disabled={disabled} onClick={refresh}>重新检查</button>
   </article>;
 }
@@ -255,10 +255,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
         <select id="coders-security" value={draft.securityMode} disabled={busy} onChange={event => edit(d => ({ ...d, securityMode: event.target.value as Draft['securityMode'] }))}>
           <option value="standard">标准：由 DSH 审核命令和额外权限</option><option value="strict">严格：要求原生沙箱隔离</option></select>
         <p className="nexus-channel-hint">标准模式允许联网，由 DSH 判断具体操作是否安全；Claude 命令没有操作系统文件隔离。严格模式要求沙箱可用，Claude 在原生 Windows 下不可用。已有任务续接保持原模式。</p>
-        <label htmlFor="coders-roots">允许的工作目录（每行一个绝对路径，留空使用 profile 里的配置）</label>
-        <textarea id="coders-roots" rows={3} value={draft.roots} disabled={busy} placeholder={view.profileRoots.join('\n')}
+        <label htmlFor="coders-roots">限制可用的工作目录（每行一个绝对路径，留空跟随当前会话工作区）</label>
+        <textarea id="coders-roots" rows={3} value={draft.roots} disabled={busy} placeholder="留空即可使用新建会话时选择的工作区"
           onChange={event => edit(d => ({ ...d, roots: event.target.value }))} />
-        <p className="nexus-channel-hint">当前生效：{view.effectiveRoots.join('、')}。任务目录必须位于这些根目录内；每个任务默认只写自己的目录；目录外文件操作单独审核；自动审核范围限于已配置的工作目录。</p>
+        <p className="nexus-channel-hint">{view.settings.roots?.length || view.restrictRoots ? `附加目录限制：${view.effectiveRoots.join('、')}。` : '默认跟随当前 DSH 会话工作区。'}任务只能使用当前工作区及其子目录；这里的限制不会扩大工作区，也不会将文件改写到渠道目录。每个任务默认只写自己的目录。</p>
         <label htmlFor="coders-network">命令联网允许域名（每行一个，不含协议或通配符）</label>
         <textarea id="coders-network" rows={2} value={draft.allowedNetworkDomains} disabled={busy} onChange={event => edit(d => ({ ...d, allowedNetworkDomains: event.target.value }))} />
         <p className="nexus-channel-hint">网页搜索和读取优先通过 DSH 只读服务，不受命令域名名单限制；访问私网、携带网页认证等仍会被安全读取器拒绝。标准模式的命令允许联网，由 DSH 审核用途和影响，域名名单不构成网络隔离。严格模式下，Claude 命令仅能访问名单内域名，Codex 的具体域名请求可匹配名单；修改后新建任务生效，续接不会扩大权限。</p>

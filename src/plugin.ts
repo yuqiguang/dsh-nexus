@@ -100,7 +100,7 @@ export async function installChannels(ctx: Context, workspace: string, legacyFei
 
 /** Coder settings, managed installs, and their `/api/nexus-coders/*` routes; the settings live in native credentials under their own scope. */
 export async function installCoderSettings(ctx: Context, profileRoots: string[], managedRoot = dshHomePath('nexus-coders'),
-  seams: Pick<ManagerDeps, 'env' | 'detect' | 'loginStatus'> & { npm?: NpmRunner } = {}): Promise<CodersManager> {
+  seams: Pick<ManagerDeps, 'env' | 'detect' | 'loginStatus' | 'restrictRoots'> & { npm?: NpmRunner } = {}): Promise<CodersManager> {
   const layout = managedLayout(resolve(managedRoot));
   let manager: CodersManager;
   const installer = new CoderInstaller(layout, seams.npm, coder => manager.afterInstall(coder));
@@ -148,10 +148,10 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     enabled: false, moduleEnabled: () => ctx.get('nexusMemoryRuntime')?.enabled === true,
   });
   ctx.provide('nexusMemoryData', memorySettings);
-  // Coding tasks default to the channel workspace; the development profile widens this to the projects directory.
-  // Every channel directory is a root too, so a task the chat asks for can run where the chat works.
+  // Native sessions select their workspace. Explicit profile roots only restrict it.
+  // Keep the owner's configured channel workspaces in the profile allowlist.
   const profileRoots = [...new Set([...(config.coderRoots?.length ? config.coderRoots : [workspace]), ...await channels.workspaces()])].map(root => resolve(root));
-  const manager = await installCoderSettings(ctx, profileRoots);
+  const manager = await installCoderSettings(ctx, profileRoots, undefined, { restrictRoots: !!config.coderRoots?.length });
   const webForOwner = (ownerSession: string): ResearchWeb => {
     const run = <T>(operation: () => Promise<T>): Promise<T> => {
       const agent = ctx.agents.get(ownerSession as SessionId);
@@ -160,7 +160,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     };
     return { search: (request, signal) => run(() => ctx.web.search(request, signal)), fetch: (request, signal) => run(() => ctx.web.fetch(request, signal)) };
   };
-  const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, notifier: registry, manager,
+  const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, restrictRoots: !!config.coderRoots?.length, notifier: registry, manager,
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
   const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone });
   ctx.provide('nexusConnectors', connectors);
