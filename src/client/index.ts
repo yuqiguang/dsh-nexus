@@ -28,7 +28,7 @@ export const inject = ['slots'];
 export function apply(ctx: Context): void {
   ctx.effect(() => {
     const element = document.createElement('style');
-    element.dataset.plugin = 'nexus-next';
+    element.dataset.plugin = 'dsh-nexus';
     element.textContent = styles;
     document.head.append(element);
     applyChatFold(readChatFold());

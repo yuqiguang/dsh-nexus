@@ -16,7 +16,8 @@ import { until } from './helpers.js';
 export const name = 'nexus-plugin-package-smoke';
 export const inject = ['connection', 'clientModules', 'credentials', 'tools', 'pluginManager'];
 
-export function apply(ctx: Context, config: { phase: number; triggerFile: string; reportFile: string; packageDir: string }): void {
+export function apply(ctx: Context, config: { phase: number; triggerFile: string; reportFile: string; packageDir: string; packageName?: string; renamed?: boolean }): void {
+  const packageName = config.packageName ?? 'dsh-nexus';
   let running = false;
   const timer = setInterval(() => {
     void access(config.triggerFile).then(() => {
@@ -56,11 +57,11 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal((await request('list')).status, 404);
       assert.equal((await coderRequest('list')).status, 404);
       assert.equal((await carrier.fetch(new Request('dsh-app://dsh/api/nexus-modules/list', { method: 'POST' }))).status, 404);
-      assert.equal(ctx.clientModules.clientPath('nexus-next'), undefined);
+      assert.equal(ctx.clientModules.clientPath(packageName), undefined);
       assert.equal((await documentStatus()).status, 404);
       assert.ok(documentTools.every(name => !ctx.tools.get(name)));
       assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
-      assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName.startsWith('nexus-next')));
+      assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName.startsWith(packageName)));
       const saved = await ctx.credentials.readRecord(credentialKey('nexus-channels', 'feishu'));
       assert.ok(saved?.kind === 'grant' && (saved.payload as { enabled?: boolean }).enabled === false);
       checks.push('uninstall_removes_api', 'uninstall_removes_client', 'uninstall_preserves_credentials');
@@ -69,7 +70,7 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       checks.push('uninstall_preserves_module_settings');
     } else {
       await until(async () => (await request('list')).status === 200, 'installed bundle did not activate', 10_000);
-      const client = ctx.clientModules.clientPath('nexus-next');
+      const client = ctx.clientModules.clientPath(packageName);
       assert.ok(client);
       assert.ok(realpathSync(client).startsWith(realpathSync(config.packageDir) + sep), 'client must come from the installed tarball');
       const installed = createRequire(client);
@@ -77,7 +78,7 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       for (const name of ['@deepseek-ai/cordis', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-schedule', '@deepseek-ai/dsh-credentials', '@deepseek-ai/dsh-client-connection', 'react']) {
         assert.equal(realpathSync(installed.resolve(name)), realpathSync(host.resolve(name)), `${name} must use the host module instance`);
       }
-      const entry = ctx.clientModules.graph().entries.find(item => item.id === 'nexus-next');
+      const entry = ctx.clientModules.graph().entries.find(item => item.id === packageName);
       assert.ok(entry);
       const bundle = await ctx.clientModules.fetchBundle(new Request(new URL(entry.url, 'dsh-app://dsh')));
       assert.equal(bundle.status, 200);
@@ -89,15 +90,15 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: 'fixture' }));
       assert.equal(upload.status, 409, 'installed plugins cannot stage an import without a launcher');
       checks.push('installed_import_refused_without_launcher');
-      const rows = (await ctx.pluginManager.listPlugins()).filter(row => row.moduleName === 'nexus-next' || ['nexus-next/memory', 'nexus-next/mail', 'nexus-next/agenda'].includes(row.moduleName));
+      const rows = (await ctx.pluginManager.listPlugins()).filter(row => row.moduleName === packageName || [`${packageName}/memory`, `${packageName}/mail`, `${packageName}/agenda`].includes(row.moduleName));
       assert.equal(rows.length, 4, 'bundle exposes four native components');
-      const bundleInfo = (await ctx.pluginManager.listBundles()).find(item => item.name === 'nexus-next');
-      assert.deepEqual(bundleInfo?.rows.map(row => row.moduleName), ['nexus-next', 'nexus-next/memory', 'nexus-next/mail', 'nexus-next/agenda']);
-      const agendaRow = rows.find(row => row.moduleName === 'nexus-next/agenda')!;
+      const bundleInfo = (await ctx.pluginManager.listBundles()).find(item => item.name === packageName);
+      assert.deepEqual(bundleInfo?.rows.map(row => row.moduleName), [packageName, `${packageName}/memory`, `${packageName}/mail`, `${packageName}/agenda`]);
+      const agendaRow = rows.find(row => row.moduleName === `${packageName}/agenda`)!;
       assert.equal((agendaRow.meta?.title as { zh?: string })?.zh, '日历与待办');
-      const mailRow = rows.find(row => row.moduleName === 'nexus-next/mail')!;
+      const mailRow = rows.find(row => row.moduleName === `${packageName}/mail`)!;
       assert.equal((mailRow.meta?.title as { zh?: string })?.zh, '邮箱');
-      const memoryRow = rows.find(row => row.moduleName === 'nexus-next/memory')!;
+      const memoryRow = rows.find(row => row.moduleName === `${packageName}/memory`)!;
       assert.equal((memoryRow.meta?.title as { zh?: string })?.zh, '长期记忆');
       assert.doesNotMatch(await readFile(client, 'utf8'), /nexus-modules|Nexus 扩展|nexus-documents|文档兼容工具/);
       for (const method of ['list', 'save']) {
@@ -109,9 +110,17 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       for (const method of ['list', 'detect', 'pandoc/install']) {
         assert.equal((await carrier.fetch(new Request(`dsh-app://dsh/api/nexus-documents/${method}`, { method: 'POST' }))).status, 404);
       }
-      assert.throws(() => installed.resolve('nexus-next/documents'), /ERR_PACKAGE_PATH_NOT_EXPORTED|not defined/);
-      assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName === 'nexus-next/documents'));
+      assert.throws(() => installed.resolve(`${packageName}/documents`), /ERR_PACKAGE_PATH_NOT_EXPORTED|not defined/);
+      assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName === `${packageName}/documents`));
       checks.push('four_localized_native_components', 'retired_document_tools_ui_rpc_and_export_absent', 'old_document_override_does_not_recreate_component');
+      if (config.renamed) {
+        assert.equal(ctx.clientModules.clientPath('nexus-next'), undefined);
+        assert.ok(!(await ctx.pluginManager.listBundles()).some(row => row.name === 'nexus-next'));
+        assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName.startsWith('nexus-next')));
+        const saved = await ctx.credentials.readRecord(credentialKey('nexus-channels', 'feishu'));
+        assert.ok(saved?.kind === 'grant' && (saved.payload as { enabled?: boolean }).enabled === false);
+        checks.push('rename_removes_legacy_bundle_and_client', 'rename_keeps_channel_credentials');
+      }
       assert.ok(ctx.tools.get('coder_task'), 'coding core stays available');
       assert.ok(ctx.get('schedule'), 'native reminder service stays available');
       if (config.phase === 7) {

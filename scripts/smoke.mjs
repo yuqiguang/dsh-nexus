@@ -9,6 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parse } from 'yaml';
 import { assistantPlugins, projectRoot, scheduleBundle } from './setup.mjs';
+import { renameProfile } from './rename-profile.mjs';
 
 const exec = promisify(execFile);
 const root = join(projectRoot, '.nexus', 'smoke');
@@ -32,9 +33,14 @@ const summaries = [];
 let peakRssMiB = 0;
 let minimumAvailableMiB = Infinity;
 const pluginRuntime = join(runRoot, 'plugin-runtime');
-const pluginOnly = process.argv.includes('--plugin-only');
+const renameOnly = process.argv.includes('--rename-only');
+const legacyArgument = process.argv.indexOf('--legacy-package');
+const legacyPackage = legacyArgument === -1 ? undefined : process.argv[legacyArgument + 1];
+if (renameOnly && (!legacyPackage || legacyPackage.startsWith('--'))) throw new Error('--rename-only requires --legacy-package <0.2.31 tarball>');
+const pluginOnly = process.argv.includes('--plugin-only') || renameOnly;
+let currentPackage;
 const interactionOnly = process.argv.includes('--interaction-only');
-// A fixture inside this repo would itself activate nexus-next's client manifest after uninstall.
+// A fixture inside this repo would itself activate dsh-nexus's client manifest after uninstall.
 const packageFixture = join(runRoot, 'package-fixture');
 await mkdir(packageFixture);
 await writeFile(join(packageFixture, 'package.json'), JSON.stringify({ name: 'nexus-install-fixture', private: true, type: 'module' }));
@@ -72,6 +78,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
   const installedPlugin = phase >= 7 && phase <= 10;
   const activeRuntime = installedPlugin ? pluginRuntime : runtime;
   const activeProfile = installedPlugin ? join(activeRuntime, 'profiles', 'nexus') : profile;
+  const packageName = renameOnly && phase === 7 ? 'nexus-next' : 'dsh-nexus';
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     if (/(KEY|SECRET|TOKEN|PASSWORD)/i.test(key) || key.startsWith('NEXUS_FEISHU_') || key.startsWith('DSH_')) delete env[key];
@@ -79,29 +86,51 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
   Object.assign(env, { DSH_HOME: activeRuntime, DSH_TELEMETRY_DISABLED: '1', NEXUS_FEISHU_ENABLED: '0', NODE_OPTIONS: '--max-old-space-size=384' });
   if (phase === 7) {
     const packed = JSON.parse((await exec('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', runRoot], { cwd: projectRoot, env })).stdout)[0];
+    currentPackage = join(runRoot, packed.filename);
     assert.ok(packed.files.some(file => file.path === 'cordis.patch.yml'));
     assert.ok(packed.files.every(file => !/^(?:\.nexus|workspace|src|test|node_modules)\//.test(file.path)));
     await mkdir(activeProfile, { recursive: true });
     await writeFile(join(activeProfile, 'package.json'), JSON.stringify({ private: true,
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', scheduleBundle], patchReload: 'startup' } } }));
     await writeFile(join(activeProfile, 'pnpm-workspace.yaml'), 'autoInstallPeers: false\nnodeLinker: hoisted\n');
-    await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', join(runRoot, packed.filename),
+    await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', renameOnly ? legacyPackage : currentPackage,
       // The first run after a dependency change must fetch it into pnpm's store through a slow mirror; later runs reuse the store.
       '--ignore-scripts', '--network-concurrency=1', '--child-concurrency=1', ...(process.env.NEXUS_SMOKE_OFFLINE === '1' ? ['--offline'] : [])], { cwd: projectRoot, env, timeout: 900_000 });
     const installed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
-    assert.ok(installed.dsh.profile.bundles.includes('nexus-next'), 'official plugin add must activate the bundle');
+    assert.ok(installed.dsh.profile.bundles.includes(packageName), 'official plugin add must activate the bundle');
   }
-  if (phase === 10) {
+  if (renameOnly && phase === 8) {
+    const patchFile = join(activeProfile, 'cordis.patch.yml');
+    const oldPatch = parse(await readFile(patchFile, 'utf8'));
+    // Exercise name-qualified settings as well as the native manager's id-only overrides.
+    for (const row of oldPatch) {
+      const component = { 'nexus-memory': 'memory', 'nexus-mail': 'mail', 'nexus-agenda': 'agenda' }[row.id];
+      if (component && !row.insert) row.name = `nexus-next/${component}`;
+    }
+    oldPatch.push({ id: 'nexus-channels', name: 'nexus-next', config: { workspaceRoot: workspace } });
+    await writeFile(patchFile, JSON.stringify(oldPatch));
     await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'remove', 'nexus-next', '--config.ignore-scripts=true'],
       { cwd: projectRoot, env, timeout: 60_000 });
+    await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', currentPackage,
+      '--ignore-scripts', '--network-concurrency=1', '--child-concurrency=1', ...(process.env.NEXUS_SMOKE_OFFLINE === '1' ? ['--offline'] : [])],
+      { cwd: projectRoot, env, timeout: 900_000 });
+    assert.deepEqual(await renameProfile(activeProfile, true), { changed: 4, applied: true });
+    const migrated = parse(await readFile(patchFile, 'utf8'));
+    assert.deepEqual(migrated.find(row => row.id === 'nexus-channels'), { id: 'nexus-channels', name: 'dsh-nexus', config: { workspaceRoot: workspace } });
+    assert.deepEqual(await renameProfile(activeProfile, true), { changed: 0, applied: false });
+    console.log('Native package rename: qualified settings preserved; second migration is a no-op.');
+  }
+  if (phase === 10) {
+    await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'remove', 'dsh-nexus', '--config.ignore-scripts=true'],
+      { cwd: projectRoot, env, timeout: 60_000 });
     const removed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
-    assert.ok(!removed.dsh.profile.bundles.includes('nexus-next'));
+    assert.ok(!removed.dsh.profile.bundles.includes('dsh-nexus'));
   }
   const previousPatch = installedPlugin ? parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8').catch(() => '[]')) ?? [] : [];
-  const componentOverrides = previousPatch.filter(row => ['nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda'].includes(row.id) && !row.insert);
+  const componentOverrides = previousPatch.filter(row => ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda'].includes(row.id) && !row.insert);
   await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([
     ...componentOverrides,
-    ...(installedPlugin && phase !== 10 ? [{ id: 'nexus-documents', name: 'nexus-next/documents', disabled: phase === 8 }] : []),
+    ...(installedPlugin && phase !== 10 ? [{ id: 'nexus-documents', name: `${packageName}/documents`, disabled: phase === 8 }] : []),
     { id: 'session-title-llm', disabled: true },
     ...(phase === 12 ? [{ id: 'web', config: { searchProvider: 'nexus-research-fixture', fetchProvider: 'nexus-research-fixture' } }] : []),
     { id: 'agent-default-model', config: { provider: 'nexus-fixture', model: 'fixture' } },
@@ -111,7 +140,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
       name: pathToFileURL(installedPlugin ? join(packageFixture, 'pluginSmokePlugin.js') : join(projectRoot,
         phase >= 25 ? 'dist/test/dataSmokePlugin.js' : phase >= 23 ? 'dist/test/rebindSmokePlugin.js' : phase === 21 ? 'dist/test/mailSmokePlugin.js' : phase >= 19 ? 'dist/test/serviceSmokePlugin.js' : phase >= 17 ? 'dist/test/memorySmokePlugin.js' : phase >= 15 ? 'dist/test/mediaSmokePlugin.js' : phase >= 13 ? 'dist/test/reminderSmokePlugin.js' : phase === 12 ? 'dist/test/coderSmokePlugin.js' : phase === 11 ? 'dist/test/questionSmokePlugin.js' : phase < 3 ? 'dist/test/nativeSmokePlugin.js'
           : phase < 5 ? 'dist/test/settingsSmokePlugin.js' : 'dist/test/wechatSmokePlugin.js')).href,
-      config: { phase, workspace, triggerFile, reportFile, packageDir: join(activeProfile, 'node_modules/nexus-next') } }] },
+      config: { phase, workspace, triggerFile, reportFile, packageName, renamed: renameOnly && phase === 8, packageDir: join(activeProfile, 'node_modules', packageName) } }] },
     // Supplemental shared-Fetch-only host. Current Desktop uses an HTTP Host; this is not an Electron test.
     ...(phase === 9 ? ['web-startup', 'webserver', 'web-runtime', 'client-hmr', 'open-in-app', 'ui-open-in-app', 'directory-picker', 'hmr']
       .map(id => ({ id, disabled: true })).concat([{ id: 'connection', inject: ['credentials'], config: {} }]) : []),

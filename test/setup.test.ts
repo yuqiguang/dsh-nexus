@@ -55,7 +55,7 @@ test('a patch without a nexus-channels row is left alone', () => {
 });
 
 test('retired document insertions and enabled or disabled overrides are removed without touching other settings', () => {
-  for (const name of ['nexus-next/documents', 'file:///nexus/dist/src/documents/plugin.js']) {
+  for (const name of ['nexus-next/documents', 'dsh-nexus/documents', 'file:///nexus/dist/src/documents/plugin.js']) {
     for (const disabled of [true, false]) {
       const patch = original();
       patch[0]!.insert!.push({ id: 'nexus-documents', name, disabled });

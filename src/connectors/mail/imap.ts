@@ -80,7 +80,7 @@ export class ImapSmtpMail implements MailClient {
     if (this.closed) throw new Error('mail client closed');
     const client = new ImapFlow({ host: this.settings.imapHost, port: this.settings.imapPort, secure: this.settings.imapSecure && !this.options.insecure,
       ...(this.options.insecure ? { doSTARTTLS: false } : {}), auth: { user: this.user, pass: this.settings.password }, logger: false, tls: SOCKET_OPTIONS,
-      clientInfo: { name: 'nexus-next', version: '0.1.0' }, disableCompression: true, disableAutoEnable: true,
+      clientInfo: { name: 'dsh-nexus', version: '0.1.0' }, disableCompression: true, disableAutoEnable: true,
       connectionTimeout: this.options.timeoutMs ?? 20_000, greetingTimeout: this.options.timeoutMs ?? 20_000, socketTimeout: 5 * 60_000 } as ConstructorParameters<typeof ImapFlow>[0]);
     // Once connected, imapflow reports a dying socket (reset, timeout) as an 'error' event. Unheard, Node throws it out of the event
     // loop: five dropped connections exited the service that way on 2026-09-23. The event names the cause; one after the call settled

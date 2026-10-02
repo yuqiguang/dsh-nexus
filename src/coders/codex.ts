@@ -294,7 +294,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
     })();
     void reading.catch(() => finish({ status: 'failed', detail: 'Codex 输出连接中断，任务已停止。', providerFailure: { kind: 'network' }, result: lastAssistant }));
     const session = (async () => {
-      await send('initialize', { clientInfo: { name: 'nexus-next', version: '0.1.0' }, capabilities: {} });
+      await send('initialize', { clientInfo: { name: 'dsh-nexus', version: '0.1.0' }, capabilities: {} });
       notify('initialized');
       if (globalThis.process.platform === 'win32') {
         if (task.permissions?.securityMode !== 'standard') await requireWindowsFirewall();

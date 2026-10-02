@@ -1,6 +1,6 @@
 {
-  "name": "nexus-next",
-  "version": "0.2.31",
+  "name": "dsh-nexus",
+  "version": "0.2.32",
   "private": true,
   "type": "module",
   "exports": {
@@ -27,7 +27,10 @@
     "locale/agenda/*.json",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "RENAME.md",
+    "CONTRIBUTING.md",
+    "PUBLISHING.md"
   ],
   "dsh": {
     "bundle": {

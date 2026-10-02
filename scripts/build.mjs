@@ -27,7 +27,7 @@ const result = await build({ entryPoints: ['src/client/index.ts'], absWorkingDir
   format: 'cjs', platform: 'browser', target: 'es2022', external: ['react', 'react/jsx-runtime'],
   loader: { '.css': 'text' }, write: false });
 await writeFile(`${projectRoot}/${outName}/client.js`,
-  'window.__ModuleLoader__.load({ id: "nexus-next", factory(require) { const module = { exports: {} }; const exports = module.exports;\n' +
+  'window.__ModuleLoader__.load({ id: "dsh-nexus", factory(require) { const module = { exports: {} }; const exports = module.exports;\n' +
   result.outputFiles[0].text + '\nreturn module.exports; } });\n');
 // What this build was made from, so the running service and the updater can tell whether HEAD moved on.
 const git = args => { try { return execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return ''; } };

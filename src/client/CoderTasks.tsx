@@ -5,6 +5,7 @@ import type { TranscriptEntry } from '../coders/transcript.js';
 
 /** The right-sidebar resource a coding task opens as. */
 export const TASK_RESOURCE = 'dsh-resource://nexus-coder-task/';
+// Keep the native saved-tab identity across the package rename; it is not a module name.
 export const TASK_TAB_ID = 'nexus-next/coder-task';
 export const TASK_TAB_KIND = 'nexus-coder-task';
 

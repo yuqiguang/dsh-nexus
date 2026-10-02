@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse } from 'yaml';
+import { renamedModuleName } from './rename-profile.mjs';
 
 export const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 export const runtimeHome = join(projectRoot, '.nexus');
@@ -21,13 +22,16 @@ export const assistantPlugins = [
  */
 export function backfillProfilePatch(patch, coderRoots) {
   if (!Array.isArray(patch)) return patch;
+  for (const row of patch.flatMap(layer => layer.insert ?? [layer])) {
+    if (row.name) row.name = renamedModuleName(row.id, row.name);
+  }
   const inserts = patch.flatMap(layer => layer.insert ?? []);
   const entry = inserts.find(item => item.id === 'nexus-channels' || item.id === 'nexus-feishu');
   if (entry?.config && !entry.config.coderRoots) { entry.config.coderRoots = coderRoots; }
   if (entry) {
     // Retire our old development insertion and its overrides. Installed bundles no longer
     // insert this id; DSH ignores their unmatched overrides without loading a module.
-    const documentNames = ['nexus-next/documents', ...(entry.name?.startsWith('file:')
+    const documentNames = ['nexus-next/documents', 'dsh-nexus/documents', ...(entry.name?.startsWith('file:')
       ? [new URL('./documents/plugin.js', entry.name).href] : [])];
     const foreignDocument = inserts.some(row => row.id === 'nexus-documents' && row.name && !documentNames.includes(row.name));
     const retired = row => row.id === 'nexus-documents' && (row.name ? documentNames.includes(row.name) : !foreignDocument);
@@ -39,7 +43,7 @@ export function backfillProfilePatch(patch, coderRoots) {
       const id = `nexus-${component}`;
       if (inserts.some(item => item.id === id)) continue;
       const name = entry.name?.startsWith('file:')
-        ? new URL(`./${['mail', 'agenda'].includes(component) ? `connectors/${component}` : component}/plugin.js`, entry.name).href : `nexus-next/${component}`;
+        ? new URL(`./${['mail', 'agenda'].includes(component) ? `connectors/${component}` : component}/plugin.js`, entry.name).href : `dsh-nexus/${component}`;
       patch.find(layer => Array.isArray(layer.insert)).insert.push({ id, name, disabled: true });
     }
     // The official bundle now owns these rows. Keep explicit configuration/disable overrides.

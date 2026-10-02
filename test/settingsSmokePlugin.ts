@@ -84,7 +84,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(exchange.status, 303);
     const cookie = exchange.headers.getSetCookie().map(value => value.split(';')[0]).join('; ');
     const html = await (await fetch(origin, { headers: { cookie } })).text();
-    assert.ok(html.includes('nexus-next'), 'custom settings bundle must enter the official boot graph');
+    assert.ok(html.includes('dsh-nexus'), 'custom settings bundle must enter the official boot graph');
     const envelope = (method: string, payload = {}) => JSON.stringify({ type: 'client-request', rpcId: 'settings-smoke', method, payload });
     const anonymous = await fetch(`${origin}/api/nexus-channels/list`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: envelope('list'),

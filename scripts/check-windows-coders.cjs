@@ -13,7 +13,7 @@ async function main() {
   assert.equal(process.platform, 'win32');
   const runtime = path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', 'resources', 'app.asar', 'dsh', 'node_modules');
   const resolvers = [createRequire(path.join(runtime, '..', 'package.json')),
-    createRequire(path.join(process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'nexus-next', 'package.json'))];
+    createRequire(path.join(process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-nexus', 'package.json'))];
   let resolving = false;
   registerHooks({ resolve(specifier, context, next) {
     if (!resolving && !isBuiltin(specifier) && !specifier.startsWith('.') && !specifier.startsWith('/') && !specifier.includes(':')) {

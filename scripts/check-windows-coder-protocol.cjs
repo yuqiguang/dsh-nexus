@@ -11,7 +11,7 @@ async function main() {
   assert.equal(process.platform, 'win32');
   const runtime = path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', 'resources', 'app.asar', 'dsh');
   const runtimeRequire = createRequire(path.join(runtime, 'package.json'));
-  const pluginRequire = createRequire(path.join(process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'nexus-next', 'package.json'));
+  const pluginRequire = createRequire(path.join(process.env.USERPROFILE, '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-nexus', 'package.json'));
   let resolving = false;
   registerHooks({ resolve(specifier, context, next) {
     if (resolving || isBuiltin(specifier)) return next(specifier, context);
