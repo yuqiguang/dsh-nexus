@@ -3,6 +3,7 @@ import { createElement } from 'react';
 import type {} from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client';
+import { installTaskPlacement, type TaskSlots } from './CoderTaskPlacement.js';
 import { ChannelSettings } from './ChannelSettings.js';
 import { CoderSettings } from './CoderSettings.js';
 import { AssistantSettings } from './AssistantSettings.js';
@@ -20,7 +21,7 @@ import { TASK_RESOURCE, TASK_TAB_ID, TASK_TAB_KIND, coderTaskPanel, coderTaskRow
 interface TaskSeats {
   sidebarRight: { openResource(address: string): void };
   sidebarRightTabs: { register(definition: { id: string; kind: string; patterns: string[]; priority: 'extension'; title(address: string): string }): () => void };
-  slots: { inject(name: string, register: () => () => void): unknown; register(options: { name: string; key: string }, component: unknown): () => void };
+  slots: TaskSlots;
 }
 
 export const inject = ['slots'];
@@ -59,6 +60,7 @@ export function apply(ctx: Context): void {
     const seats = inner as unknown as TaskSeats;
     inner.effect(() => seats.sidebarRightTabs.register({ id: TASK_TAB_ID, kind: TASK_TAB_KIND, patterns: [`${TASK_RESOURCE}**`], priority: 'extension',
       title: address => `编码任务 ${taskIdOf(address)}` }));
+    installTaskPlacement(seats.slots, address => seats.sidebarRight.openResource(address));
     const openSession = (id: string) => {
       const ui = inner.get('uiWorkspace') as { openSession(id: string): void } | undefined;
       ui?.openSession(id);
@@ -66,6 +68,6 @@ export function apply(ctx: Context): void {
     seats.slots.inject('sidebar.right.pane.tab', () => seats.slots.register({ name: 'sidebar.right.pane.tab', key: TASK_TAB_ID },
       coderTaskPanel(undefined, openSession, id => seats.sidebarRight.openResource(taskAddress(id)))));
     seats.slots.inject('tool.call.toolview', () => seats.slots.register({ name: 'tool.call.toolview', key: 'coder_task' },
-      coderTaskRow(address => seats.sidebarRight.openResource(address))));
+      coderTaskRow(address => seats.sidebarRight.openResource(address), undefined, false)));
   });
 }

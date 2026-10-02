@@ -74,10 +74,10 @@ interface RowProps {
 }
 
 /** The `coder_task` row in the chat: which task, how it stands, and the way into its panel. */
-export function coderTaskRow(open: (address: string) => void, api: TaskApi = taskApi) {
+export function coderTaskRow(open: (address: string) => void, api: TaskApi = taskApi, live = true) {
   return function CoderTaskRow(props: RowProps) {
     const id = props.phase === 'result' && !props.block.isError ? dispatchedTaskId(props.block.content ?? []) : undefined;
-    const { view, problem } = useTask(id, true, 3000, true, api);
+    const { view, problem } = useTask(id, true, 3000, live, api);
     if (props.phase !== 'result') return <div className="nexus-coder-row" data-state="dispatching"><span className="nexus-coder-row-title">正在派发编码任务…</span></div>;
     if (!id) {
       const reason = (props.block.content ?? []).map(block => String((block as { text?: unknown } | null)?.text ?? '')).join(' ').trim();
@@ -86,7 +86,7 @@ export function coderTaskRow(open: (address: string) => void, api: TaskApi = tas
     return (
       <div className="nexus-coder-row" data-state={view?.status ?? 'loading'}>
         <span className="nexus-coder-row-title">{view ? `${view.coderName} 任务` : '编码任务'} {id}</span>
-        <span className="nexus-coder-row-status">{view?.statusLabel ?? '正在读取状态'}</span>
+        <span className="nexus-coder-row-status">{view?.statusLabel ?? (live ? '正在读取状态' : '已派发')}</span>
         {problem && <span className="nexus-coder-row-detail">{problem}</span>}
         {view?.activity && <span className="nexus-coder-row-detail">当前：{view.activity}</span>}
         {view?.pending && <span className="nexus-coder-row-detail">等你回答：{view.pending.summary}</span>}

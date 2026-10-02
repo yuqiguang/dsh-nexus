@@ -48,6 +48,7 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   status: z.enum(['queued', 'running', 'waiting-user', 'verifying', 'completed', 'failed', 'cancelled', 'interrupted']),
   ownerSession: z.string(),
   jobId: z.string().optional(),
+  completionNotice: z.object({ messageId: z.string(), seq: z.number().int().nonnegative(), at: z.number() }).optional(),
   coderSessionId: z.string().optional(),
   resumedFrom: z.string().optional(),
   replaces: z.string().optional(),
@@ -114,6 +115,11 @@ export class CoderStore {
   active(): TaskRecord[] { return this.list().filter(isActive); }
 
   put(task: TaskRecord): Promise<void> { return this.tasks.put(task.id, task); }
+
+  /** Linking UI placement must not change the task's last execution timestamp. */
+  async linkNotice(id: string, notice: NonNullable<TaskRecord['completionNotice']>): Promise<void> {
+    await this.tasks.update(id, current => current.completionNotice ? current : { ...current, completionNotice: notice });
+  }
 
   async auditReview(record: import('./review.js').ReviewAudit): Promise<void> {
     await this.update(record.taskId, current => ({ safetyReviews: [...(current.safetyReviews ?? []), { ...record, at: Date.now() }].slice(-100) }));

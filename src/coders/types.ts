@@ -114,6 +114,8 @@ export interface TaskRecord {
   /** DSH session that dispatched the task; escalations are asked on its live agent. */
   ownerSession: string;
   jobId?: string;
+  /** Presentation link only; never drives task execution or recovery. */
+  completionNotice?: { messageId: string; seq: number; at: number };
   /** The coder's own session id: set from the start when this task continues another, else once the coder reports it. */
   coderSessionId?: string;
   /** The task this one continues in the same coder session. */

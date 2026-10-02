@@ -1,3 +1,4 @@
+import { taskNotices, taskSummary } from './presentation.js';
 import { nativeSafetyReviewer, reviewEnvelope, reviewFingerprint, reviewUntilAborted, ReviewCache, REVIEW_TIMEOUT_MS, type SafetyReviewer } from './review.js';
 import { installCoderPackaging } from './package.js';
 import { hostInstructions } from './instructions.js';
@@ -242,6 +243,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   const store = await CoderStore.open(ctx.storageDomain);
   ctx.effect(() => () => { void store.close(); });
   config.manager?.attach(store);
+  const syncNotices = taskNotices(ctx, store);
   const briefs = await installBriefs(ctx, () => store.list(), async tasks => {
     for (const task of tasks) {
       if (!task.jobId) throw new Error('任务尚在受理，请稍后应用变更。');
@@ -827,7 +829,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         await store.put(task);
         let jobId: string;
         try {
-          jobId = ctx.jobs.start({ kind: 'coder', label: `${CODER_NAMES[coder]}: ${previous ? `续接 ${previous.id}：` : ''}${clip(args.description, 80)}`, owner: exec.agent.id,
+          jobId = ctx.jobs.start({ kind: 'coder', label: `${CODER_NAMES[coder]} [${task.id}]: ${previous ? `续接 ${previous.id}：` : ''}${clip(args.description, 80)}`, owner: exec.agent.id,
             outputLimitBytes: OUTPUT_LIMIT_BYTES, run: job => queuedJob(task, query, effective, roots, exec.agent!.session, job) });
         } catch (error) {
           projectRulesOf.delete(task.id);
@@ -955,7 +957,21 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     },
   })));
 
-  config.registerRpc?.('nexus-coder-tasks', ['get'], async (_method, payload) => {
+  config.registerRpc?.('nexus-coder-tasks', ['get', 'list', 'notice'], async (method, payload) => {
+    if (method === 'list' || method === 'notice') {
+      const { ownerSession, seq } = (payload && typeof payload === 'object' ? payload : {}) as { ownerSession?: unknown; seq?: unknown };
+      if (typeof ownerSession !== 'string' || !ownerSession || ownerSession.length > 200) throw new ChannelError('invalid_request');
+      if (method === 'notice' && (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0)) throw new ChannelError('invalid_request');
+      await syncNotices(ownerSession);
+      const tasks = store.list().filter(task => task.ownerSession === ownerSession);
+      if (method === 'notice') {
+        const task = tasks.find(task => task.completionNotice?.seq === seq);
+        return task ? taskSummary(task, currentActivity(task)) : null;
+      }
+      const active = tasks.filter(isActive);
+      const recent = tasks.filter(task => !isActive(task)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
+      return [...active, ...recent].map(task => taskSummary(task, currentActivity(task)));
+    }
     const { id, brief } = (payload && typeof payload === 'object' ? payload : {}) as { id?: unknown; brief?: unknown };
     const task = typeof id === 'string' ? store.get(id) : undefined;
     if (!task) throw new ChannelError('task_not_found');

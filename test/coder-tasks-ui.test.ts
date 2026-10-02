@@ -176,3 +176,113 @@ test('task panel displays retry source, attempt, scheduled time and stop reason 
   assert.match(panel.textContent!, /等待计入本次运行时限/);
   assert.equal(panel.querySelectorAll('button').length, 0);
 });
+
+import { taskFeeds, type TaskFeedApi } from '../src/client/CoderTaskFeed.js';
+import { coderTaskDock, coderTaskTrigger, installTaskPlacement, type TaskSlots, type TriggerProps } from '../src/client/CoderTaskPlacement.js';
+import type { TaskSummary } from '../src/coders/presentation.js';
+import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots';
+
+const summary = (extra: Partial<TaskSummary> = {}): TaskSummary => ({ id: 'ct-0000abcd', ownerSession: 'owner', coderName: 'Codex',
+  status: 'running', statusLabel: '运行中', active: true, description: '修复任务显示', updatedAt: 10, ...extra });
+const settleUI = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 35)); }); };
+
+test('the session dock keeps a finished task until its native notice card mounts; other tasks remain and navigation is shared', async t => {
+  let tasks = [summary(), summary({ id: 'ct-00000002', updatedAt: 9 })];
+  const opened: string[] = [], calls: string[] = [];
+  const api: TaskFeedApi = async <T,>(method: string) => { calls.push(method); return (method === 'list' ? tasks : null) as T; };
+  const feeds = taskFeeds(api, 10), Dock = coderTaskDock(address => opened.push(address), feeds);
+  const Native = () => createElement('section', { 'data-turn-trigger': true }, '后台任务状态更新');
+  const Trigger = coderTaskTrigger(Native, address => opened.push(address), feeds);
+  const App = ({ show }: { show: boolean }) => createElement('main', null,
+    show && createElement(Trigger, { sessionId: 'owner', node: { data: { seq: 40, source: { kind: 'tool-jobs', form: 'notice' } } } }),
+    createElement(Dock, { sessionId: 'owner' }));
+  const doc = await render(t, App as ComponentType<never>, { show: false });
+  assert.match(doc.body.textContent!, /2 个任务进行中/);
+  await act(async () => [...doc.querySelectorAll('button')].find(button => button.textContent === '查看全部 2 个任务')!.click());
+  tasks = [summary({ status: 'completed', statusLabel: '执行结束，尚未独立验证', active: false }), tasks[1]!]; await settleUI();
+  assert.equal(doc.querySelectorAll('.nexus-coder-dock [data-task-id]').length, 2);
+  tasks = [{ ...tasks[0]!, completionNotice: { seq: 40, at: 30, messageId: 'message-40' } }, tasks[1]!]; await settleUI();
+  assert.equal(doc.querySelectorAll('.nexus-coder-dock [data-task-id]').length, 2, 'a delayed renderer must not lose the finished card');
+  await doc.rerender({ show: true }); await settleUI();
+  assert.equal(doc.querySelector('[data-turn-trigger]')!.previousElementSibling?.getAttribute('data-task-id'), 'ct-0000abcd');
+  assert.match(doc.querySelector('[data-turn-trigger]')!.previousElementSibling!.textContent!, /尚未独立验证/);
+  assert.deepEqual([...doc.querySelectorAll('.nexus-coder-dock [data-task-id]')].map(row => row.getAttribute('data-task-id')), ['ct-00000002']);
+  await act(async () => (doc.querySelector('[data-task-id="ct-0000abcd"] button') as HTMLButtonElement).click());
+  assert.deepEqual(opened, [taskAddress('ct-0000abcd')]);
+  assert.equal(calls.filter(call => call === 'notice').length, 0, 'a known notice reuses the shared list');
+  await doc.rerender({ show: false });
+  assert.equal(doc.querySelector('.nexus-coder-dock [data-task-id="ct-0000abcd"]'), null, 'scrolling an archived card out of view does not re-pin it');
+});
+
+test('reload restores archived placement and leaves an interrupted task available as a dismissible bottom result', async t => {
+  const finished = summary({ active: false, status: 'failed', statusLabel: '执行结束，验证失败', completionNotice: { seq: 4, at: 30, messageId: 'm' } });
+  const interrupted = summary({ id: 'ct-00000002', active: false, status: 'interrupted', statusLabel: '已中断' });
+  const api: TaskFeedApi = async <T,>(method: string) => (method === 'list' ? [finished, interrupted] : finished) as T;
+  const feeds = taskFeeds(api, 1000), Dock = coderTaskDock(() => {}, feeds), Trigger = coderTaskTrigger(() => createElement('div', { 'data-turn-trigger': true }), () => {}, feeds);
+  const App = () => createElement('main', null, createElement(Trigger, { sessionId: 'owner', node: { data: { seq: 4, source: { kind: 'tool-jobs', form: 'notice' } } } }), createElement(Dock, { sessionId: 'owner' }));
+  const doc = await render(t, App as ComponentType<never>, {});
+  assert.match(doc.querySelector('[data-turn-trigger]')!.previousElementSibling!.textContent!, /验证失败/);
+  assert.match(doc.querySelector('.nexus-coder-dock')!.textContent!, /已中断/);
+  assert.equal(doc.querySelectorAll('[data-task-id="ct-0000abcd"]').length, 1);
+  await act(async () => [...doc.querySelectorAll('button')].find(button => button.textContent === '收起结果')!.click());
+  assert.equal(doc.querySelector('.nexus-coder-dock'), null);
+});
+
+test('changing sessions aborts the old feed and ignores its late response', async t => {
+  let oldSignal!: AbortSignal, finish!: (value: TaskSummary[]) => void;
+  const api: TaskFeedApi = async <T,>(_method: string, payload: Record<string, unknown>, signal: AbortSignal) => {
+    if (payload.ownerSession === 'owner') { oldSignal = signal; return new Promise<TaskSummary[]>(resolve => { finish = resolve; }) as Promise<T>; }
+    return [summary({ id: 'ct-00000002', ownerSession: 'new-owner', pending: '确认本次命令' })] as T;
+  };
+  const doc = await render(t, coderTaskDock(() => {}, taskFeeds(api)) as ComponentType<never>, { sessionId: 'owner' });
+  await doc.rerender({ sessionId: 'new-owner' });
+  assert.equal(oldSignal.aborted, true);
+  await act(async () => finish([summary()]));
+  assert.doesNotMatch(doc.body.textContent!, /ct-0000abcd/);
+  assert.match(doc.body.textContent!, /等你回答：确认本次命令/);
+});
+
+test('the tool receipt does not poll or claim completion once the dock owns live status', async t => {
+  const doc = await render(t, coderTaskRow(() => {}, async () => { throw new Error('must not read'); }, false) as ComponentType<never>,
+    { phase: 'result', block: { content: [{ type: 'text', text: '已派发编码任务 ct-0000abcd，运行中' }] } });
+  assert.match(doc.body.textContent!, /已派发/); assert.doesNotMatch(doc.body.textContent!, /读取失败|已完成/);
+});
+
+test('notification decoration preserves native props, locale, unrelated notices and plugin registration lifecycle', async t => {
+  const core = new SlotCore();
+  const registerFactory = core.registerFactory as unknown as (options: object, component: unknown) => () => void;
+  const releaseRoot = registerFactory({ name: 'fixture', scope: 'root', children: {
+    'conversation.chat.node': { kind: 'keyed', scope: 'session' }, 'conversation.input.dock': { kind: 'list', scope: 'session' },
+  } }, () => null);
+  const releases: (() => void)[] = [];
+  const slots: TaskSlots = { inject(_name, callback) { releases.push(callback()); }, register: core.register.bind(core) as TaskSlots['register'], entries: core.entries.bind(core), subscribe: core.subscribe.bind(core) };
+  t.after(() => { for (const release of releases) release(); releaseRoot(); });
+  installTaskPlacement(slots, () => {}, taskFeeds(async () => { throw new Error('unrelated notice must not read tasks'); }));
+  assert.equal(core.entries('conversation.input.dock').length, 1);
+  const props = { sessionId: 'owner', node: { data: { seq: 1, source: { kind: 'schedule', form: 'notice' } } }, t: 'native translator', extra: 'kept' };
+  let received: unknown;
+  const Native = (value: TriggerProps) => { received = value; return createElement('button', { 'data-turn-trigger': true }, '原生通知'); };
+  let unload = slots.register({ name: 'conversation.chat.node', key: 'turn-trigger', locale: 'chat' }, Native);
+  await Promise.resolve(); await Promise.resolve();
+  const winner = core.entriesOfSlot('conversation.chat.node')[0]!;
+  assert.equal(winner.options.priority, -1); assert.equal(winner.locale, 'chat');
+  const doc = await render(t, winner.component as ComponentType<never>, props);
+  assert.deepEqual(received, props); assert.match(doc.body.textContent!, /原生通知/);
+  assert.equal(doc.querySelector('[data-task-id]'), null);
+  unload(); await Promise.resolve(); await Promise.resolve();
+  assert.equal(core.entriesOfSlot('conversation.chat.node').length, 0);
+  unload = slots.register({ name: 'conversation.chat.node', key: 'turn-trigger', locale: 'chat' }, Native);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(core.entriesOfSlot('conversation.chat.node')[0]!.options.priority, -1);
+  for (const release of releases) release();
+  assert.equal(core.entriesOfSlot('conversation.chat.node')[0]!.component, Native, 'unloading Nexus restores the native entry');
+  unload();
+});
+
+test('a mapped notice that is folded as native context still leaves a bottom result after reload', async t => {
+  const task = summary({ active: false, status: 'completed', statusLabel: '执行结束，尚未独立验证', completionNotice: { seq: 4, at: 30, messageId: 'm' } });
+  const api: TaskFeedApi = async <T,>() => [task] as T;
+  const doc = await render(t, coderTaskDock(() => {}, taskFeeds(api)) as ComponentType<never>, { sessionId: 'owner' });
+  assert.match(doc.querySelector('.nexus-coder-dock')!.textContent!, /尚未独立验证/);
+  assert.equal(doc.querySelectorAll('[data-task-id]').length, 1);
+});

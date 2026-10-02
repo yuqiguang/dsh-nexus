@@ -2261,3 +2261,23 @@ test('the original runtime budget expires during retry backoff without starting 
   assert.match(harness.tasks.get(id)!.stopReason!, /时间预算/);
   assert.equal(harness.tasks.get(id)!.retry?.phase, 'stopped');
 });
+
+test('task list and notice routes require an owner, bound completed summaries and exclude private process records', async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-task-list-'));
+  t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness();
+  let rpc!: (method: string, payload: unknown) => Promise<unknown>;
+  await installCoders(harness.ctx, { roots: [workdir], registerRpc: (_family, _methods, handle) => { rpc = handle; } });
+  const own = task().ownerSession;
+  for (let i = 1; i <= 25; i++) harness.tasks.set(`ct-${i}`, task({ id: `ct-${i}`, status: 'completed', createdAt: i, updatedAt: i,
+    ...(i === 1 ? { completionNotice: { seq: 4, at: 30, messageId: 'm' } } : {}), trace: [{ at: 1, text: 'process detail' }] }));
+  harness.tasks.set('active', task({ id: 'active', status: 'waiting-user', pending: { kind: 'command', at: 1, summary: 'allow' } }));
+  harness.tasks.set('foreign', task({ id: 'foreign', ownerSession: 'foreign', status: 'running' }));
+  const list = await rpc('list', { ownerSession: own }) as import('../src/coders/presentation.js').TaskSummary[];
+  assert.equal(list.length, 21); assert.equal(list[0]!.id, 'active'); assert.equal(list[0]!.pending, 'allow');
+  assert.ok(list.every(item => item.ownerSession === own && !('trace' in item) && !('transcript' in item) && !('decisions' in item)));
+  assert.equal((await rpc('notice', { ownerSession: own, seq: 4 }) as { id: string }).id, 'ct-1', 'old results can resolve outside the recent-list limit');
+  assert.equal(await rpc('notice', { ownerSession: 'foreign', seq: 4 }), null);
+  await assert.rejects(rpc('list', {}), /invalid_request/);
+  await assert.rejects(rpc('notice', { ownerSession: own, seq: -1 }), /invalid_request/);
+});

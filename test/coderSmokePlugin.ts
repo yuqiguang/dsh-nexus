@@ -1,3 +1,4 @@
+import type { TaskSummary } from '../src/coders/presentation.js';
 import { localCheck } from '../src/coders/local-check.js';
 import { nativeSafetyReviewer, reviewEnvelope } from '../src/coders/review.js';
 import { normalizeClaudeRequest } from '../src/coders/normalize.js';
@@ -262,6 +263,17 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.match(detail.goal!.recovery!, /保留已通过的结果/);
     assert.ok(detail.result!.verifyChecks?.every(check => check.ok && check.executed));
     assert.equal((await readTask('get', { id: done.id, brief: true }) as TaskDetailView).goal, undefined);
+    const taskList = await readTask('list', { ownerSession: sessionId }) as TaskSummary[];
+    const placed = taskList.find(item => item.id === done.id)!;
+    assert.ok(placed.completionNotice, 'native completion event links the task card');
+    const nativeHistory = await ctx.sessionController.inspect(sessionId);
+    const nativeNotice = nativeHistory.events.find(event => event.seq === placed.completionNotice!.seq)!;
+    assert.equal(nativeNotice.type, 'user/message');
+    assert.equal((await readTask('notice', { ownerSession: sessionId, seq: nativeNotice.seq }) as TaskSummary).id, done.id);
+    assert.equal(await readTask('notice', { ownerSession: 'foreign-session', seq: nativeNotice.seq }), null);
+    assert.equal(store.get(done.id)!.updatedAt, done.updatedAt, 'UI placement does not change execution timestamps');
+    assert.equal(claude.started, 2, 'presentation reads do not restart the coder');
+    assert.equal(prompts().length, 1, 'presentation reads do not replay approval prompts');
     assert.equal(done.pending, undefined);
     assert.ok(texts.includes('Claude Code 已完成：目录里有 1 个文件，验证通过。它想读取 SSH 私钥被监工拒绝，ls 自动放行，git push 由你批准。'));
     const events = agent.session.snapshotEvents();
@@ -287,10 +299,11 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     await store.close();
     const reopened = await CoderStore.open(ctx.storageDomain);
     try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage');
-      assert.deepEqual(reopened.get(done.id)!.retry, done.retry, 'retry state survives native storage reopening'); }
+      assert.deepEqual(reopened.get(done.id)!.retry, done.retry, 'retry state survives native storage reopening');
+      assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }
