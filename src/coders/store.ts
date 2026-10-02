@@ -1,3 +1,4 @@
+import { REVIEW_FAILURES } from './review.js';
 import { briefSnapshotSchema } from './brief.js';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
 import { randomBytes } from 'node:crypto';
@@ -58,9 +59,11 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   updatedAt: z.number(),
   escalations: z.number(),
   decisions: z.array(decisionSchema),
-  safetyReviews: z.array(z.object({ at: z.number(), id: z.string(), taskId: z.string(), phase: z.enum(['request', 'result']), provider: z.string().optional(), model: z.string().optional(), system: z.string().optional(), input: z.string().optional(), output: z.string().optional(), reason: z.string().optional() })).optional(),
+  safetyReviews: z.array(z.object({ at: z.number(), id: z.string(), taskId: z.string(), phase: z.enum(['request', 'result']), provider: z.string().optional(), model: z.string().optional(), system: z.string().optional(), input: z.string().optional(), output: z.string().optional(), reason: z.string().optional(),
+    attempt: z.number().int().positive().optional(), maxTokens: z.number().int().positive().optional(), finishReason: z.string().optional(), failure: z.enum(REVIEW_FAILURES).optional(),
+    usage: z.object({ inputTokens: z.number(), outputTokens: z.number(), reasoningTokens: z.number().optional(), totalTokens: z.number().optional() }).optional() })).optional(),
   autoAllowed: z.number().optional(),
-  pending: z.object({ at: z.number(), kind: decisionSchema.shape.kind, summary: z.string(), detail: z.string().optional() }).optional(),
+  pending: z.object({ at: z.number(), kind: decisionSchema.shape.kind, summary: z.string(), detail: z.string().optional(), reason: z.string().optional() }).optional(),
   result: resultSchema.optional(),
   activity: z.string().optional(),
   trace: z.array(z.object({ at: z.number(), text: z.string() })).optional(),

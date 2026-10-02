@@ -16,6 +16,7 @@ export interface TaskSummary {
   updatedAt: number;
   activity?: string;
   pending?: string;
+  pendingReason?: string;
   completionNotice?: TaskRecord['completionNotice'];
 }
 
@@ -23,7 +24,7 @@ export function taskSummary(task: TaskRecord, activity?: string): TaskSummary {
   return { id: task.id, ownerSession: task.ownerSession, coderName: CODER_NAMES[task.coder], status: task.status,
     statusLabel: taskStatusLabel(task), active: isActive(task), description: task.description.slice(0, 240),
     updatedAt: task.updatedAt, ...(activity ? { activity: activity.slice(0, 240) } : {}),
-    ...(task.status === 'waiting-user' && task.pending ? { pending: task.pending.summary.slice(0, 240) } : {}),
+    ...(task.status === 'waiting-user' && task.pending ? { pending: task.pending.summary.slice(0, 240), ...(task.pending.reason ? { pendingReason: task.pending.reason.slice(0, 500) } : {}) } : {}),
     ...(task.completionNotice ? { completionNotice: task.completionNotice } : {}) };
 }
 

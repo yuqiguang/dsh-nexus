@@ -141,6 +141,8 @@ export interface TaskRecord {
 }
 
 export interface PendingEscalation {
+  /** Why automatic review could not authorize this operation. */
+  reason?: string;
   at: number;
   kind: CoderRequestKind;
   summary: string;

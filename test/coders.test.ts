@@ -2281,3 +2281,37 @@ test('task list and notice routes require an owner, bound completed summaries an
   await assert.rejects(rpc('list', {}), /invalid_request/);
   await assert.rejects(rpc('notice', { ownerSession: own, seq: -1 }), /invalid_request/);
 });
+
+test('automatic-review fallback reasons reach native questions, pending task records and the recorded user decision', async t => {
+ for(const scenario of ['too-large','rejected','failed'] as const)await t.test(scenario,async()=>{
+  const cwd=await mkdtemp(join(tmpdir(),'nexus-review-prompt-'));
+  try {
+   await writeFile(join(cwd,'check.cjs'),'console.log("local fixture")');
+   let pendingReason:string|undefined, calls=0;
+   const harness=coderHarness(questions=>{
+    pendingReason=[...harness.tasks.values()][0]!.pending?.reason;
+    assert.ok(pendingReason);
+    assert.ok(questions[0]!.detail?.includes(pendingReason),'native approval must include the actual fallback reason');
+    return questions.map(q=>({id:q.id,selected:[scenario==='failed'?'允许':'拒绝']}));
+   });
+   const query=scriptedQuery(async function*(options){
+    const decision=await options.canUseTool('Bash',{command:'node check.cjs',...(scenario==='too-large'?{unknownPermission:'x'.repeat(16001)}:{})},{signal:options.abortController.signal});
+    assert.equal(decision.behavior,scenario==='failed'?'allow':'deny');
+    yield {type:'result',subtype:'success',result:'fixture finished without running the denied command'};
+   });
+   await installCoders(harness.ctx,{roots:[cwd],defaultCoder:'claude',query,safetyReviewer:async()=>{
+    calls++;if(scenario==='failed')throw new Error('fixture failed');
+    return {safe:false,reason:'本次脚本的副作用无法确认'};
+   }});
+   const id=(await harness.run('coder_task',{cwd,description:'check local fixture'})).task_id!;
+   await harness.jobs[0]!.done;
+   const record=harness.tasks.get(id)!;
+   assert.equal(record.escalations,1);assert.equal(calls,scenario==='too-large'?0:1);
+   assert.match(pendingReason!,scenario==='too-large'?/16000/:scenario==='failed'?/调用或证据核验失败/:/副作用无法确认/);
+   assert.equal(record.decisions.find(d=>d.layer==='supervisor'&&d.outcome==='ask')?.reason,pendingReason);
+   if(scenario==='failed')assert.equal(record.decisions.find(d=>d.layer==='user'&&d.outcome==='allow')?.reason,pendingReason);
+   assert.equal(record.pending,undefined,'answered prompts are not resurrected');
+   assert.ok(record.trace?.some(step=>step.text.includes(pendingReason!.slice(0,40))));
+  }finally{await rm(cwd,{recursive:true,force:true});}
+ });
+});

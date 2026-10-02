@@ -1,5 +1,5 @@
 import { taskNotices, taskSummary } from './presentation.js';
-import { nativeSafetyReviewer, reviewEnvelope, reviewFingerprint, reviewUntilAborted, ReviewCache, REVIEW_TIMEOUT_MS, type SafetyReviewer } from './review.js';
+import { nativeSafetyReviewer, prepareReview, reviewFingerprint, reviewUntilAborted, ReviewCache, REVIEW_TIMEOUT_MS, type SafetyReviewer } from './review.js';
 import { installCoderPackaging } from './package.js';
 import { hostInstructions } from './instructions.js';
 import { localCheck } from './local-check.js';
@@ -110,7 +110,7 @@ export interface TaskDetailView {
   permissionDescription?: string;
   stopReason?: string;
   retry?: TaskRetry;
-  pending?: { at: number; summary: string; detail?: string };
+  pending?: { at: number; summary: string; detail?: string; reason?: string };
   escalations: number;
   autoAllowed: number;
   decisions: string[];
@@ -360,19 +360,24 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(taskId, current => ({ autoAllowed: (current.autoAllowed ?? 0) + 1 }));
       return { behavior: 'allow' };
     }
+    let escalationReason = verdict.reason;
     if (!verdict.manualOnly && task.permissions?.autoApproveSafe && request.kind !== 'question' && config.manager?.current()?.autoApproveSafe !== false) {
       let release: (() => void) | undefined;
+      let recorded = false;
+      let reviewSignal: AbortSignal | undefined;
       try {
-        const reviewSignal = AbortSignal.any([signal, shutdown.signal, AbortSignal.timeout(REVIEW_TIMEOUT_MS)]);
+        reviewSignal = AbortSignal.any([signal, shutdown.signal, AbortSignal.timeout(REVIEW_TIMEOUT_MS)]);
         release = await reviewQueue.acquire(reviewSignal);
         for (let attempt = 0; attempt < 2; attempt++) {
-          const envelope = await reviewEnvelope(task, request, reviewEnvs.get(taskId));
-          if (!envelope) break;
+          const preparation = await prepareReview(task, request, reviewEnvs.get(taskId));
+          const envelope = preparation.input;
+          if (!envelope) { escalationReason = preparation.reason; break; }
           const cached = reviewCache.get(task, envelope);
           step(`${cached ? 'DSH 正在核验已有安全结论' : 'DSH 正在审核'}：${oneLine(request.summary, 100)}`);
           const result = cached ?? await reviewUntilAborted(safetyReviewer(task, envelope, reviewSignal), reviewSignal);
           reviewSignal.throwIfAborted();
-          const after = await reviewEnvelope(task, request, reviewEnvs.get(taskId));
+          const rechecked = await prepareReview(task, request, reviewEnvs.get(taskId));
+          const after = rechecked.input;
           const current = store.get(taskId);
           const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard');
           // A newly added deny must still win, even if the reviewer was already in flight.
@@ -383,16 +388,25 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           }
           const allowed = result.safe && !!after && reviewFingerprint(after) === reviewFingerprint(envelope)
             && !!current && isActive(current) && !current.stopReason && config.manager?.current()?.autoApproveSafe !== false;
-          const reason = result.safe && !allowed ? '审核期间操作内容、目标路径或任务状态已变化' : cached ? `复用本任务 60 秒内的安全审核（命令、权限和文件证据未变）：${result.reason}` : result.reason;
+          const reason = result.safe && !allowed ? rechecked.reason ?? '审核期间操作内容、目标路径或任务状态已变化' : cached ? `复用本任务 60 秒内的安全审核（命令、权限和文件证据未变）：${result.reason}` : result.reason;
           await store.update(taskId, current => ({ decisions: [...current.decisions, { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'supervisor', outcome: allowed ? 'allow' : 'ask', reason }] }));
+          recorded = true;
           reviewSignal.throwIfAborted();
           if (allowed) { if (!cached) reviewCache.set(task, envelope, result); step(`DSH 自动授权：${oneLine(request.summary, 100)}（${oneLine(reason, 100)}）`); return { behavior: 'allow' }; }
+          escalationReason = reason;
           step(`DSH 转交用户确认：${oneLine(reason, 100)}`);
           break;
         }
-      } catch { step('DSH 自动审核未完成，转交用户确认。'); }
+      } catch { escalationReason = reviewSignal?.aborted && reviewSignal.reason?.name === 'TimeoutError'
+        ? '自动审核超过等待时限，交给你确认' : '自动审核调用或证据核验失败，交给你确认'; }
       finally { release?.(); }
       if (signal.aborted || shutdown.signal.aborted) return { behavior: 'deny', message: '任务已取消。', interrupt: true };
+      if (!recorded) {
+        await store.update(taskId, current => ({ decisions: [...current.decisions, { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'supervisor', outcome: 'ask', reason: escalationReason }] }));
+        step(`DSH 转交用户确认：${oneLine(escalationReason ?? '自动审核未完成', 100)}`);
+      }
+    } else if (!verdict.manualOnly && request.kind !== 'question') {
+      escalationReason = task.permissions?.autoApproveSafe ? '安全操作自动审核已关闭，需要你确认本次操作' : '本次任务未启用安全操作自动审核，需要你确认';
     }
     const key = task.brief && request.kind === 'question' && !task.verify ? createHash('sha256').update(JSON.stringify(request.questions ?? [])).digest('hex') : undefined;
     const cached = key && task.brief ? briefs.answer(task.brief.id, task.ownerSession, task.brief.revision, key) : undefined;
@@ -401,7 +415,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(taskId, current => ({ decisions: [...current.decisions, { at, kind: request.kind, summary: request.summary, layer: 'user', outcome: 'answer', reason: '同一目标版本下相同澄清问题，沿用已有回答' }] }));
       return { behavior: 'allow', updatedInput: { ...request.raw, answers: cached } };
     }
-    await store.update(taskId, () => ({ status: 'waiting-user', pending: { at, kind: request.kind, summary: request.summary,
+    await store.update(taskId, () => ({ status: 'waiting-user', pending: { at, kind: request.kind, summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
       ...(request.detail ? { detail: clip(request.detail, 500) } : {}) } }));
     step(`等待用户：${oneLine(request.summary, 100)}`);
     const resumeBudget = budgets.get(taskId)?.pause();
@@ -416,7 +430,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       const reused = key && task.brief ? briefs.answer(task.brief.id, task.ownerSession, task.brief.revision, key) : undefined;
       didAsk = !reused;
       outcome = reused ? { decision: { behavior: 'allow', updatedInput: { ...request.raw, answers: reused } }, record: { at, kind: request.kind, summary: request.summary, layer: 'user', outcome: 'answer', reason: '沿用同一目标版本的已有回答' } }
-        : await escalateToUser(host, task, request, waitSignal, verdict.reason);
+        : await escalateToUser(host, task, request, waitSignal, escalationReason);
       if (!waitSignal.aborted && key && task.brief && outcome.record.outcome === 'answer' && outcome.decision.behavior === 'allow') {
         const answers = outcome.decision.updatedInput?.answers as Record<string, string> | undefined;
         if (answers && Object.values(answers).every(value => typeof value === 'string' && value.trim())) await briefs.rememberAnswer(task.brief.id, task.ownerSession, task.brief.revision, key, answers);
@@ -996,7 +1010,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       ...(task.resumedFrom ? { resumedFrom: task.resumedFrom } : {}), ...(isActive(task) ? { runningFor: runningFor(task) } : {}),
       ...(currentActivity(task) ? { activity: currentActivity(task)! } : {}),
       ...(task.retry ? { retry: task.retry } : {}),
-      ...(task.status === 'waiting-user' && task.pending ? { pending: { at: task.pending.at, summary: task.pending.summary, ...(task.pending.detail ? { detail: task.pending.detail } : {}) } } : {}),
+      ...(task.status === 'waiting-user' && task.pending ? { pending: { at: task.pending.at, summary: task.pending.summary, ...(task.pending.reason ? { reason: task.pending.reason } : {}), ...(task.pending.detail ? { detail: task.pending.detail } : {}) } } : {}),
       escalations: task.escalations, autoAllowed: task.autoAllowed ?? 0, decisions: task.decisions.map(describeDecision), trace: task.trace ?? [],
       ...(task.result ? { result: task.result } : {}),
       // The task card polls for status only; the panel asks for the coder's own log too.

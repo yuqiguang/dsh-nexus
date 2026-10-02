@@ -89,7 +89,7 @@ export function coderTaskRow(open: (address: string) => void, api: TaskApi = tas
         <span className="nexus-coder-row-status">{view?.statusLabel ?? (live ? '正在读取状态' : '已派发')}</span>
         {problem && <span className="nexus-coder-row-detail">{problem}</span>}
         {view?.activity && <span className="nexus-coder-row-detail">当前：{view.activity}</span>}
-        {view?.pending && <span className="nexus-coder-row-detail">等你回答：{view.pending.summary}</span>}
+        {view?.pending && <span className="nexus-coder-row-detail">等你回答：{view.pending.summary}{view.pending.reason ? `。原因：${view.pending.reason}` : ''}</span>}
         <button type="button" className="nexus-coder-row-open" onClick={() => open(taskAddress(id))}>查看过程</button>
       </div>
     );
@@ -151,6 +151,7 @@ export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string
         </section>}
         {view.stopReason && <p className="nexus-coder-panel-pending">{view.stopReason}</p>}
         {view.pending && <p className="nexus-coder-panel-pending">等你回答：{view.pending.summary}（{clock(view.pending.at)} 提出，在聊天里回复）</p>}
+        {view.pending?.reason && <p className="nexus-coder-panel-pending">需要你确认的原因：{view.pending.reason}</p>}
         {view.recovery && <section className="nexus-coder-panel-result" aria-label="恢复建议">
           <strong>{view.recovery.title}</strong>
           <p>{view.recovery.nextStep}</p>

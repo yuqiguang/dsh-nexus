@@ -286,3 +286,14 @@ test('a mapped notice that is folded as native context still leaves a bottom res
   assert.match(doc.querySelector('.nexus-coder-dock')!.textContent!, /尚未独立验证/);
   assert.equal(doc.querySelectorAll('[data-task-id]').length, 1);
 });
+
+test('pending task cards and the detail panel show the actual automatic-review fallback reason', async t => {
+ const reason='审核模型返回空响应；已重试一次，交给你确认';
+ const api:TaskFeedApi=async <T,>()=>[summary({status:'waiting-user',pending:'运行本地测试',pendingReason:reason})] as T;
+ const Dock=coderTaskDock(()=>{},taskFeeds(api));
+ const Panel=coderTaskPanel(async()=>detail({status:'waiting-user',pending:{at:1,summary:'运行本地测试',reason}}));
+ const App=()=>createElement('main',null,createElement(Dock,{sessionId:'owner'}),createElement(Panel,{useTabInfo:()=>({tab:{contentId:taskAddress('ct-0000abcd'),visible:true}})}));
+ const doc=await render(t,App as ComponentType<never>,{});
+ assert.ok(doc.querySelector('.nexus-coder-dock')!.textContent!.includes(reason));
+ assert.ok(doc.querySelector('.nexus-coder-panel')!.textContent!.includes(reason));
+});

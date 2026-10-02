@@ -12,6 +12,7 @@ export function TaskCard({ task, open, dismiss }: { task: TaskSummary; open: Ope
     <span className="nexus-coder-row-detail nexus-coder-card-description" title={task.description}>{task.description}</span>
     {task.pending ? <span className="nexus-coder-card-pending">等你回答：{task.pending}</span>
       : task.active && task.activity ? <span className="nexus-coder-row-detail">{task.activity}</span> : null}
+    {task.pending && task.pendingReason && <span className="nexus-coder-row-detail">需要你确认的原因：{task.pendingReason}</span>}
     {dismiss && <button type="button" className="nexus-coder-card-dismiss" onClick={dismiss}>收起结果</button>}
   </article>;
 }

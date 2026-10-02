@@ -54,6 +54,7 @@ class FixtureModel extends LlmAdapter {
     yield { type: 'block-end', index: 0, block: { type: 'text', text } };
     yield { type: 'finish', reason: { kind: 'stop' } };
   }
+  emptyReviewNext = false;
   errors: string[] = [];
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     try { yield* this.script(options); }
@@ -63,6 +64,12 @@ class FixtureModel extends LlmAdapter {
     options.signal?.throwIfAborted();
     if (options.system?.includes('你是 DSH 的安全授权审核器')) {
       assert.deepEqual(options.tools, []);
+      if (this.emptyReviewNext) {
+        this.emptyReviewNext = false;
+        yield { type: 'usage', usage: { inputTokens: 20, outputTokens: 2048, reasoningTokens: 2048 } };
+        yield { type: 'finish', reason: { kind: 'max-tokens' } };
+        return;
+      }
       yield* this.text('{"safe":true,"reason":"本次仅读取项目文档"}');
       return;
     }
@@ -281,9 +288,14 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.equal(events.filter(event => event.type === 'turn/end' && event.data.reason.kind === 'completed').length, 2);
     const input = await reviewEnvelope(done, normalizeClaudeRequest('Read', { file_path: join(model.coderCwd, 'README.md') }, {}, model.coderCwd));
     assert.ok(input);
+    model.emptyReviewNext = true;
     assert.equal((await nativeSafetyReviewer(ctx, record => store.auditReview(record))(done, input, new AbortController().signal)).safe, true);
     const audits = store.get(done.id)!.safetyReviews!;
-    assert.equal(audits.length, 6);
+    assert.equal(audits.length, 8);
+    assert.equal(audits[5]!.failure, 'truncated');
+    assert.equal(audits[5]!.usage?.reasoningTokens, 2048);
+    assert.equal(audits[6]!.attempt, 2);
+    assert.equal(audits[6]!.input, audits[4]!.input, 'retry uses identical evidence without dispatching work');
     assert.equal(audits[4]!.input, JSON.stringify(input));
     assert.match(audits[1]!.output!, /"safe":true/);
     assert.equal(agent.session.snapshotEvents().length, events.length, 'auxiliary review does not change the conversation log');
@@ -303,7 +315,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
       assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

@@ -211,3 +211,112 @@ test('unrelated directory output does not invalidate review, but source edits an
   assert.notEqual(reviewFingerprint(modified),reviewFingerprint((await reviewEnvelope(t,request))!));
  } finally { await rm(root,{recursive:true,force:true}); }
 });
+
+import { prepareReview, type ReviewAudit } from '../src/coders/review.js';
+import { taskSchema } from '../src/coders/store.js';
+
+test('long native commands are reviewed once in full while actual permissions and unknown fields remain visible', async () => {
+ const cwd=await mkdtemp(join(tmpdir(),'nexus-review-dedupe-'));
+ try {
+  await writeFile(join(cwd,'logic.js'),'module.exports = 1;');
+  const t=task(cwd);t.permissions=await taskPermissions(cwd,[cwd],'codex',undefined,60,[],true,'standard');
+  const script=`require('./logic.js'); /*${'x'.repeat(5394)}*/`, command=`node -e "${script}"`;
+  const raw={command,cwd,kind:'shell',reason:'test the local project',commandActions:[{type:'unknown',command:script}],
+    proposedExecpolicyAmendment:['node','-e',script],availableDecisions:['accept',{acceptWithExecpolicyAmendment:{execpolicy_amendment:['node','-e',script]}}],
+    additionalPermissions:{network:true},sandboxPermissions:'require_escalated',futureSecurityRequirement:{scope:'specific task only'}};
+  const request=codexCommandRequest(raw,cwd), before=structuredClone(raw);
+  assert.ok(JSON.stringify({command,request:raw}).length>16000,'reproduces the oversized native approval shape');
+  const prepared=await prepareReview(t,request);assert.ok(prepared.input,prepared.reason);
+  const operation=JSON.parse(prepared.input.operation);
+  assert.equal(operation.command,command,'never clip the executable command');
+  assert.equal(operation.request.command,undefined);
+  assert.equal(operation.request.commandActions,undefined);
+  assert.equal(operation.request.availableDecisions,undefined);
+  assert.equal(operation.request.proposedExecpolicyAmendment,undefined);
+  assert.deepEqual(operation.request.additionalPermissions,raw.additionalPermissions);
+  assert.deepEqual(operation.request.futureSecurityRequirement,raw.futureSecurityRequirement);
+  assert.equal(operation.request.sandboxPermissions,'require_escalated');
+  assert.equal(operation.request.reason,raw.reason);
+  assert.ok(prepared.input.evidence.some(line=>line.includes('module.exports = 1;')));
+  assert.ok(prepared.input.operation.length<16000);
+  assert.deepEqual(raw,before,'only the model projection is reduced; the native request stays intact');
+  const changed=await reviewEnvelope(t,codexCommandRequest({...raw,additionalPermissions:{network:false}},cwd));
+  assert.notEqual(reviewFingerprint(prepared.input),reviewFingerprint(changed!));
+  const conflict=await reviewEnvelope(t,{...request,raw:{...raw,command:'a different raw command'}});
+  assert.equal(JSON.parse(conflict!.operation).request.command,'a different raw command','mismatched fields are retained for review');
+ }finally{await rm(cwd,{recursive:true,force:true});}
+});
+
+test('ineligible review requests report the actual size, environment and scope constraint', async () => {
+ const cwd=await mkdtemp(join(tmpdir(),'nexus-review-skip-'));
+ try {
+  const t=task(cwd);t.permissions=await taskPermissions(cwd,[cwd],'codex',undefined,60,[],true,'standard');
+  const prepare=(raw:Record<string,unknown>)=>prepareReview(t,codexCommandRequest({command:'node --version',cwd,...raw},cwd));
+  assert.match((await prepare({command:'x'.repeat(12001)})).reason!,/命令.*12000/);
+  assert.match((await prepare({unknownPermission:'x'.repeat(16001)})).reason!,/去重.*16000/);
+  assert.match((await prepare({env:{CUSTOM:'fixture'}})).reason!,/环境变量/);
+  assert.match((await prepare({cwd:join(cwd,'missing')})).reason!,/目标不存在/);
+  assert.match((await prepare({cwd:tmpdir()})).reason!,/审核边界之外/);
+  assert.match((await prepare({grantRoot:cwd})).reason!,/额外权限/);
+  const strict={...t,permissions:{...t.permissions,securityMode:'strict' as const}};
+  assert.match((await prepareReview(strict,codexCommandRequest({command:'node --version',cwd},cwd))).reason!,/严格模式/);
+ }finally{await rm(cwd,{recursive:true,force:true});}
+});
+
+test('empty and truncated reviewer outputs retry once with a larger bounded allowance and retain diagnostics', async () => {
+ for(const first of ['stop','max-tokens']) {
+  const audits:ReviewAudit[]=[], budgets:number[]=[], inputs:string[]=[], signals:AbortSignal[]=[];
+  let calls=0;
+  const ctx={sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'owner-model'}})}}};}},llm:{async *stream(options:{maxTokens:number;messages:{content:{text:string}[]}[];signal:AbortSignal;tools:unknown[]}){
+   budgets.push(options.maxTokens);inputs.push(options.messages[0]!.content[0]!.text);signals.push(options.signal);assert.deepEqual(options.tools,[]);
+   calls++;
+   if(calls===1){yield {type:'reasoning-delta',text:'not an approval result'};yield {type:'usage',usage:{inputTokens:20,outputTokens:800,reasoningTokens:800}};yield {type:'finish',reason:{kind:first}};}
+   else{yield {type:'text-delta',text:'{"safe":true,"reason":"local test is bounded","repeatable":true}'};yield {type:'finish',reason:{kind:'stop'}};}
+  }}} as unknown as Context;
+  const input={task:'run tests',scope:'this command only',operation:'node test.cjs',evidence:['original evidence']};
+  const result=await nativeSafetyReviewer(ctx,async event=>{audits.push(event);})(task('/tmp'),input,new AbortController().signal);
+  assert.equal(result.safe,true);assert.equal(calls,2);assert.ok(budgets[0]!<budgets[1]!&&budgets[1]!<=4096);
+  assert.equal(inputs[0],inputs[1]);assert.ok(signals.every(signal=>signal.aborted),'finished attempt streams are released');
+  assert.equal(audits[1]!.failure,first==='stop'?'empty':'truncated');assert.equal(audits[1]!.finishReason,first);
+  assert.equal(audits[1]!.usage?.reasoningTokens,800);assert.equal(audits[2]!.attempt,2);
+  assert.doesNotMatch(JSON.stringify(audits),/not an approval result/,'reasoning text is not recorded');
+  const persisted=taskSchema.parse({...task('/tmp'),safetyReviews:audits.map(event=>({...event,at:1}))});
+  assert.deepEqual(persisted.safetyReviews?.[1]?.usage,audits[1]!.usage);
+  assert.equal(persisted.safetyReviews?.[2]?.attempt,2);
+ }
+});
+
+test('repeated emptiness stops at two calls; explicit denials, invalid JSON and provider errors do not retry', async () => {
+ for(const scenario of ['empty','deny','invalid','error','incomplete','truncated-allow','truncated-deny']) {
+  const audits:ReviewAudit[]=[];let calls=0;
+  const ctx={sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'owner-model'}})}}};}},llm:{async *stream(){
+   calls++;
+   if(scenario==='deny'||scenario==='truncated-deny')yield {type:'text-delta',text:'{"safe":false,"reason":"requires a person"}'};
+   if(scenario==='invalid')yield {type:'text-delta',text:'{"safe":"true","reason":"not boolean"}'};
+   if(scenario==='truncated-allow')yield {type:'text-delta',text:'{"safe":true,"reason":"looks valid but incomplete stream"}'};
+   if(scenario!=='incomplete')yield {type:'finish',reason:{kind:scenario==='error'?'error':scenario.startsWith('truncated-')?'max-tokens':'stop'}};
+  }}} as unknown as Context;
+  const result=await nativeSafetyReviewer(ctx,async event=>{audits.push(event);})(task('/tmp'),{task:'check',scope:'scoped',operation:'x',evidence:[]},new AbortController().signal);
+  assert.equal(result.safe,false,scenario);
+  assert.equal(calls,['empty','truncated-allow'].includes(scenario)?2:1,scenario);
+  if(scenario==='empty')assert.match(result.reason,/空响应.*已重试一次/);
+  if(scenario==='deny')assert.equal(result.reason,'requires a person');
+  if(scenario==='error')assert.equal(audits.at(-1)!.failure,'error');
+ }
+});
+
+test('review cancellation between attempts prevents a new call, and an unresponsive provider obeys the shared deadline', async () => {
+ const make=(stream:unknown)=>({sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'owner-model'}})}}};}},llm:{stream}} as unknown as Context);
+ const controller=new AbortController();let calls=0;
+ const ctx=make(async function*(){calls++;yield {type:'finish',reason:{kind:'stop'}};});
+ await assert.rejects(nativeSafetyReviewer(ctx,async event=>{if(event.phase==='result')controller.abort();})(task('/tmp'),{task:'x',scope:'s',operation:'c',evidence:[]},controller.signal),/abort/i);
+ assert.equal(calls,1);
+ const audits:ReviewAudit[]=[];calls=0;
+ const stuck=make(()=>{calls++;return {[Symbol.asyncIterator](){return this;},next:()=>new Promise(()=>{}),return:async()=>({done:true})};});
+ // Keep the test runner alive while the timeout's unref'ed timer is the only pending work.
+ const keepAlive=setTimeout(()=>{},1000);
+ try {
+  const result=await nativeSafetyReviewer(stuck,async event=>{audits.push(event);})(task('/tmp'),{task:'x',scope:'s',operation:'c',evidence:[]},AbortSignal.timeout(20));
+  assert.equal(result.safe,false);assert.match(result.reason,/等待时限/);assert.equal(calls,1);assert.equal(audits.at(-1)!.failure,'timeout');
+ }finally{clearTimeout(keepAlive);}
+});
