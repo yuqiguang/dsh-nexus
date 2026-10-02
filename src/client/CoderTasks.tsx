@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { TaskDetailView } from '../coders/index.js';
+import { retryText } from '../coders/retry-view.js';
 import type { TranscriptEntry } from '../coders/transcript.js';
 
 /** The right-sidebar resource a coding task opens as. */
@@ -143,6 +144,11 @@ export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string
         {view.brief && <div className="nexus-channel-hint"><p>总体目标：{view.brief.objective}（{view.brief.id} v{view.brief.revision}）</p><p>共同约束：{view.brief.constraints || "无补充"}</p><p>本任务验收项：{view.brief.acceptance.map(item => `${item.id} ${item.text}`).join("；")}</p></div>}
         {!!view.dependsOn?.length && <p className="nexus-channel-hint">前置任务（均需独立验证通过）：{view.dependsOn.join("、")}</p>}
         {view.permissionDescription && <p className="nexus-channel-hint">{view.permissionDescription}</p>}
+        {view.retry && <section className="nexus-coder-panel-result" aria-label="请求恢复状态" role="status">
+          <strong>{retryText(view.retry)}</strong>
+          {view.retry.phase === 'waiting' && view.retry.retryAt !== undefined && <p>预计重试时间：{clock(view.retry.retryAt)}。等待期间可在所属会话取消任务。</p>}
+          <p className="nexus-channel-hint">自动续接最多两次，沿用原会话、工作目录和权限；等待计入本次运行时限。额度或认证问题需先处理。</p>
+        </section>}
         {view.stopReason && <p className="nexus-coder-panel-pending">{view.stopReason}</p>}
         {view.pending && <p className="nexus-coder-panel-pending">等你回答：{view.pending.summary}（{clock(view.pending.at)} 提出，在聊天里回复）</p>}
         {view.recovery && <section className="nexus-coder-panel-result" aria-label="恢复建议">

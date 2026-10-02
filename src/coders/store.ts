@@ -41,6 +41,8 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   verifyNetwork: z.enum(['offline', 'loopback', 'ask']).optional(),
   verificationSkipped: z.object({ at: z.number(), command: z.string() }).optional(),
   stopReason: z.string().optional(),
+  retry: z.object({ source: z.enum(['tool', 'nexus']), phase: z.enum(['waiting', 'resuming', 'recovered', 'stopped']), reason: z.string(),
+    attempt: z.number().int().nonnegative().optional(), maxAttempts: z.number().int().nonnegative().optional(), retryAt: z.number().optional() }).optional(),
   permissions: z.object({ version: z.literal(1), mode: z.literal('unattended'), securityMode: z.enum(['standard', 'strict']).optional(), writableRoots: z.array(z.string()), network: z.literal('ask'), webResearch: z.boolean().optional(), autoApproveSafe: z.boolean().optional(), reviewRoots: z.array(z.string()).optional(), allowedNetworkDomains: z.array(z.string()).default([]),
     maxDurationMs: z.number().positive(), maxRepeatedDenials: z.number().int().positive(), isolation: z.enum(['codex-workspace', 'claude-sandbox', 'dsh-supervised']) }).optional(),
   status: z.enum(['queued', 'running', 'waiting-user', 'verifying', 'completed', 'failed', 'cancelled', 'interrupted']),
@@ -129,7 +131,7 @@ export class CoderStore {
   async markInterrupted(): Promise<string[]> {
     const interrupted = this.active();
     for (const task of interrupted) {
-      await this.update(task.id, () => ({ status: 'interrupted', pending: undefined, result: {
+      await this.update(task.id, () => ({ status: 'interrupted', pending: undefined, ...(task.retry ? { retry: { ...task.retry, phase: 'stopped' as const, retryAt: undefined, reason: 'DSH 已重启，自动续接已停止；请在所属会话检查后继续' } } : {}), result: {
         summary: task.status === 'queued' ? '进程重启，排队任务未自动启动；请确认后重新派发。' : '进程重启，任务中断；编码工具的会话 ID 已保留，可以续接。', changedFiles: [], outsideRoots: [],
         ...(task.result ?? {}),
       } }));

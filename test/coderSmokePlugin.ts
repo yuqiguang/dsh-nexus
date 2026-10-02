@@ -131,10 +131,15 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
   // The fake Claude only asks after the dispatching turn has ended, so escalation must find the idle agent on its own.
   const query: ClaudeQuery = ({ prompt, options }) => (async function* (): AsyncIterable<ClaudeStreamMessage> {
     claude.started++;
-    assert.ok(prompt.startsWith('列出目录内容并报告'));
+    assert.ok(options.resume ? prompt.includes('不要重复已成功') : prompt.startsWith('列出目录内容并报告'));
     assert.match(prompt, /nexus_web/);
     assert.equal(options.cwd, model.coderCwd);
     yield { type: 'system', subtype: 'init', session_id: 'claude-smoke-session' };
+    if (options.resume) {
+      assert.equal(options.resume, 'claude-smoke-session');
+      yield { type: 'result', subtype: 'success', result: '目录里有 1 个文件。' };
+      return;
+    }
     await claude.gate;
     // A credential read is denied by the hard rules without asking anyone.
     const secret = await options.canUseTool('Bash', { command: 'cat ~/.ssh/id_rsa' }, { signal: options.abortController.signal });
@@ -159,7 +164,8 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
       assert.match(JSON.stringify(await client.callTool({ name: 'search', arguments: { query: 'fixture docs' } })), /fixture source/);
       assert.match(JSON.stringify(await client.callTool({ name: 'fetch', arguments: { url: 'https://example.com' } })), /fixture page/);
     } finally { await client.close(); }
-    yield { type: 'result', subtype: 'success', result: '目录里有 1 个文件。' };
+    yield { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 1, retry_delay_ms: 0, error_status: 503, error: 'server_error' };
+    yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['provider unavailable'] };
   })();
   let running = false;
   const timer = setInterval(() => {
@@ -236,6 +242,9 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     for (const line of [`Claude Code 编码任务 ${task.id}`, '监工拒绝：Bash: cat ~/.ssh/id_rsa', '执行：ls -la', '等待用户：Claude wants to run git push',
       '用户允许：Claude wants to run git push', '说明：看了一下目录。', '结束：执行结束，改动文件 0 个，验证通过']) assert.ok(panelText.includes(line), `${line} missing from the job panel:\n${panelText}`);
     assert.equal(done.status, 'completed');
+    assert.equal(claude.started, 2);
+    assert.equal(done.retry?.phase, 'recovered');
+    assert.match(panelText, /自动续接（第 1\/2 次）/);
     assert.equal(done.escalations, 1);
     assert.equal(prompts().length, 1, 'safe commands and verification must not ask the owner');
     assert.equal(done.permissions?.securityMode, 'standard');
@@ -277,10 +286,11 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.match(await localCheck(ctx, model.coderCwd, sessionId, 'node local-check.cjs', undefined, new AbortController().signal), /native-local/);
     await store.close();
     const reopened = await CoderStore.open(ctx.storageDomain);
-    try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage'); }
+    try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage');
+      assert.deepEqual(reopened.get(done.id)!.retry, done.retry, 'retry state survives native storage reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

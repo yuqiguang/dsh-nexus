@@ -6,6 +6,7 @@ import { loadCoderRuntime, verificationEnvironment, verificationReviewCommand } 
 import { coderConcurrency } from './settings.js';
 import { taskProcessArgv } from './process.js';
 import { ActiveBudget } from './budget.js';
+import { failureLabel, resumeTransient, retryText, type CoderRun, type RetryNotice, type TaskRetry, type waitForRetry } from './retry.js';
 import { assertRetry, recoveryReport, taskRecovery, type TaskRecoveryView } from './recovery.js';
 import { resolvePlanStep, VERIFY_SHELL_SYNTAX } from './plan.js';
 import { installBriefs, type CoderBrief } from './brief.js';
@@ -64,6 +65,8 @@ export interface CodersConfig {
   maxQueued?: number;
   /** One user wait (including prompt queue), default 10 minutes. */
   maxUserWaitMs?: number;
+  /** Test seam for cancellable retry waits; production uses bounded backoff. */
+  retryWait?: typeof waitForRetry;
   /** Coder used when the model does not choose one. Defaults to codex; overridden by the manager's settings when present. */
   defaultCoder?: CoderKind;
   /** Settings, installs, and per-coder runtime; without it the coders on PATH and in the plugin's node_modules are used as-is. */
@@ -101,6 +104,7 @@ export interface TaskDetailView {
   activity?: string;
   permissionDescription?: string;
   stopReason?: string;
+  retry?: TaskRetry;
   pending?: { at: number; summary: string; detail?: string };
   escalations: number;
   autoAllowed: number;
@@ -451,7 +455,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     // only touches the progress line and `activity`, never `trace`: these are liveness pings, not steps, and must not push real
     // work out of the review window or be counted as one.
     const beat = setInterval(() => {
-      if (closed) return;
+      if (closed || store.get(taskId)?.retry?.phase === 'waiting') return;
       const quiet = Date.now() - lastStepAt;
       if (quiet < IDLE_NOTE_MS) return;
       const text = `尚未收到新动作：已 ${duration(quiet)}；任务仍未结束，无法据此判断正在思考或阻塞`;
@@ -492,13 +496,38 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   function runJob(task: TaskRecord, query: ClaudeQuery | undefined, effective: EffectiveRuntime, roots: string[], job?: JobHandle): JobHooks {
     const activity = activityRecorder(task.id, job);
     const cancellation = new AbortController();
+    const runSignal = AbortSignal.any([cancellation.signal, shutdown.signal]);
     let stopped: string | undefined;
     job?.append(`${CODER_NAMES[task.coder]} 编码任务 ${task.id}${task.resumedFrom ? `（续接 ${task.resumedFrom}）` : ''}，目录 ${task.cwd}\n`
       + `任务：${oneLine(task.description, 300)}\n`, { channel: 'log' });
     let failure: { key: string; count: number } | undefined;
+    let currentSessionId = task.coderSessionId;
+    let writes = Promise.resolve();
+    let retryState: TaskRetry | undefined;
+    const persist = (write: () => Promise<unknown>) => {
+      writes = writes.then(async () => { await write(); });
+      void writes.catch(() => {});
+      return writes;
+    };
+    const setRetry = (retry: TaskRetry | undefined) => {
+      if (JSON.stringify(retryState) === JSON.stringify(retry)) return writes;
+      retryState = retry;
+      if (retry) activity.record(retryText(retry));
+      return persist(() => store.update(task.id, () => ({ retry })));
+    };
     const shared = {
       decide: (request: CoderRequest, signal: AbortSignal) => decide(task.id, request, signal),
-      onSession: (coderSessionId: string) => { void store.update(task.id, () => ({ coderSessionId })); },
+      onSession: (coderSessionId: string) => {
+        currentSessionId = coderSessionId;
+        void persist(() => store.update(task.id, () => ({ coderSessionId })));
+      },
+      onRetry: (notice: RetryNotice | undefined) => {
+        if (runSignal.aborted) return;
+        if (!notice) { if (retryState?.source === 'tool' || retryState?.phase === 'resuming') void setRetry(undefined); return; }
+        void setRetry({ source: 'tool', phase: notice.retrying === false ? 'stopped' : 'waiting', reason: `${failureLabel(notice.failure)}；${notice.retrying === false ? '等待编码工具返回最终结果' : '正在等待编码工具重试'}`,
+          ...(notice.attempt !== undefined ? { attempt: notice.attempt } : {}), ...(notice.maxAttempts !== undefined ? { maxAttempts: notice.maxAttempts } : {}),
+          ...(notice.delayMs !== undefined ? { retryAt: Date.now() + notice.delayMs } : {}) });
+      },
       onActivity: (text: string) => activity.record(text),
       onLog: (text: string) => activity.log(text),
       onFailure: (key: string) => {
@@ -515,24 +544,45 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const codex = 'error' in effective.codex ? undefined : effective.codex;
     const claude = 'error' in effective.claude ? undefined : effective.claude;
     const executionEnv = (task.coder === 'codex' ? codex : claude)?.env ?? process.env;
-    let runner: JobHooks | undefined;
+    let runner: CoderRun | undefined;
     let research: ResearchBridge | undefined;
     const hooks: JobHooks = {
       done: (async (): Promise<JobOutcome> => {
         try {
-          if (task.permissions?.webResearch && config.web || process.platform === 'linux' && task.permissions && ctx.sandbox) research = await createResearchBridge(task.permissions?.webResearch ? config.web?.(task.ownerSession) : undefined, shared.decide, task.cwd, cancellation.signal, shared.onActivity,
+          if (task.permissions?.webResearch && config.web || process.platform === 'linux' && task.permissions && ctx.sandbox) research = await createResearchBridge(task.permissions?.webResearch ? config.web?.(task.ownerSession) : undefined, shared.decide, task.cwd, runSignal, shared.onActivity,
             process.platform === 'linux' && task.permissions && ctx.sandbox ? (command, directory, signal) => localCheck(ctx, task.cwd, task.ownerSession, command, directory, signal) : undefined);
           const instructions = await hostInstructions(task.cwd);
-          cancellation.signal.throwIfAborted();
-          const codexHooks = task.coder === 'codex' ? runCodexTask(task, { instructions, ...shared, research,
-            ...(config.spawnCodex ? { spawn: config.spawnCodex } : {}),
-            ...(codex ? { launch: { command: codex.command, env: codex.env }, ...(codex.model ? { model: codex.model } : {}) } : {}) }) : undefined;
-          runner = codexHooks ?? runClaudeTask(task, { instructions, ...shared, research, query: query!, ...(claude ? { env: claude.env,
-            ...(claude.model ? { model: claude.model } : {}), ...(claude.executable ? { executable: claude.executable } : {}) } : {}) });
-          liveOf.set(task.id, { record: text => activity.record(text), ...(codexHooks ? { steer: codexHooks.steer } : {}) });
-          return await runner.done;
+          runSignal.throwIfAborted();
+          const originalScope = await workspaceScope(task.cwd, runSignal);
+          const originalDirectory = await stat(task.cwd);
+          return await resumeTransient({ signal: runSignal, sessionId: () => currentSessionId,
+            checkpoint: () => writes, state: setRetry, wait: config.retryWait,
+            beforeResume: async () => {
+              const current = store.get(task.id);
+              const directory = await stat(task.cwd);
+              if (directory.dev !== originalDirectory.dev || directory.ino !== originalDirectory.ino || !current || !isActive(current) || current.stopReason || current.ownerSession !== task.ownerSession
+                || JSON.stringify(current.permissions) !== JSON.stringify(task.permissions)
+                || await canonical(task.cwd) !== task.cwd || !(await stat(task.cwd)).isDirectory()
+                || !currentRoots().some(root => isInside(root, task.cwd)) || await workspaceScope(task.cwd, runSignal) !== originalScope) throw new Error('retry_boundary_changed');
+              if (task.brief && (briefs.isChanging(task.brief.id) || briefs.get(task.brief.id, task.ownerSession).revision !== task.brief.revision)) throw new Error('retry_goal_changed');
+              if (ctx.sandboxPolicy) {
+                const resolved = await ctx.sessionController.resolveAgent(task.ownerSession as SessionId);
+                if ('error' in resolved || ctx.sandboxPolicy.resolve({ session: resolved.agent.session }).mode === 'read-only') throw new Error('retry_session_unavailable');
+              }
+            },
+            run: (sessionId, attempt) => {
+              const continued = { ...task, ...(sessionId ? { coderSessionId: sessionId } : {}) };
+              const codexHooks = task.coder === 'codex' ? runCodexTask(continued, { instructions, continuation: attempt > 0, ...shared, research,
+                ...(config.spawnCodex ? { spawn: config.spawnCodex } : {}),
+                ...(codex ? { launch: { command: codex.command, env: codex.env }, ...(codex.model ? { model: codex.model } : {}) } : {}) }) : undefined;
+              runner = codexHooks ?? runClaudeTask(continued, { instructions, continuation: attempt > 0, ...shared, research, query: query!, ...(claude ? { env: claude.env,
+                ...(claude.model ? { model: claude.model } : {}), ...(claude.executable ? { executable: claude.executable } : {}) } : {}) });
+              liveOf.set(task.id, { record: text => activity.record(text), ...(codexHooks ? { steer: codexHooks.steer } : {}) });
+              return { cancel: reason => runner?.cancel(reason), done: runner.done.finally(() => { liveOf.delete(task.id); }) };
+            },
+          });
         } catch {
-          return { status: cancellation.signal.aborted ? 'killed' : 'failed', detail: '编码任务启动已取消或 DSH 网页服务连接失败。' };
+          return { status: runSignal.aborted ? 'killed' : 'failed', detail: '编码任务启动已取消或 DSH 网页服务连接失败。' };
         } finally { await research?.close(); }
       })(),
       cancel(reason) { cancellation.abort(); runner?.cancel(reason); },
@@ -549,15 +599,15 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const budget = new ActiveBudget(task.permissions?.maxDurationMs ?? 60 * 60_000, () => stop('达到本次运行时间预算，已暂停；进度和编码会话保留，确认后可续接。'));
     budgets.set(task.id, budget);
     const done = hooks.done.then(async outcome => {
-      if (outcome.status === 'failed' && /rate[ _-]?limit|too many requests|\b429\b/i.test(outcome.detail ?? '')) {
-        stopped = '模型服务限流，任务已暂停；已保留文件和编码会话，额度恢复后显式重试当前步骤，无需重做已通过步骤。';
+      if (outcome.status === 'failed' && retryState?.phase === 'stopped') {
+        stopped = retryState.reason;
         await store.update(task.id, () => ({ stopReason: stopped }));
       }
       await store.update(task.id, current => ({ activity: undefined, ...(outcome.status !== 'killed' ? { status: 'verifying' as const } : {}) }));
       const settledTask = store.get(task.id) ?? task;
       if (outcome.status !== 'killed') job?.updateProgress(settledTask.verificationSkipped ? '收集改动（按用户要求不运行验证）' : '验证中');
       const verify = await verifyTask({ ...settledTask, ...(outcome.status !== 'completed' || stopped || settledTask.verificationSkipped ? { verify: undefined } : {}) },
-        task.permissions?.writableRoots ?? [task.cwd], baselineOf.get(task.id), stopped || outcome.status === 'killed' ? undefined : cancellation.signal,
+        task.permissions?.writableRoots ?? [task.cwd], baselineOf.get(task.id), stopped || outcome.status === 'killed' ? undefined : runSignal,
         async (argv, command) => {
           const windows = process.platform === 'win32';
           const standard = task.permissions?.securityMode === 'standard';
@@ -572,16 +622,16 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
             const reviewCommand = await verificationReviewCommand(command, argv, effective.runtimeExecutables);
             const decision = await decide(task.id, { kind: 'command', tool: 'verify.command', command: reviewCommand,
               summary: `审核独立验证命令：${command}`, detail: `仅这次验证命令可访问任意网络目标：${reviewCommand}。${supervised && !nativeCodex ? '以当前用户权限运行，不提供操作系统文件隔离。' : '文件写入限制在任务目录。'}不传入密钥环境变量。拒绝后不执行本次验证。`, paths: [],
-              raw: { cwd: task.verifyCwd ?? task.cwd, additionalPermissions: { network: true }, ...(reviewCommand !== command ? { hostRuntimeExecutable: argv[0], runtimeSource: 'load_workspace_dependencies', executionCommand: command } : {}) } }, cancellation.signal);
+              raw: { cwd: task.verifyCwd ?? task.cwd, additionalPermissions: { network: true }, ...(reviewCommand !== command ? { hostRuntimeExecutable: argv[0], runtimeSource: 'load_workspace_dependencies', executionCommand: command } : {}) } }, runSignal);
             if (decision.behavior !== 'allow') throw new Error(decision.message || '本次验证未获授权。');
-            cancellation.signal.throwIfAborted();
+            runSignal.throwIfAborted();
             await store.update(task.id, () => ({ status: 'verifying', pending: undefined }));
             job?.updateProgress('验证中（DSH 已授权本次命令）');
           }
           if (nativeCodex) return windowsVerifyArgv(codex!.command, await windowsVerifyExecutable(argv, task.verifyCwd ?? task.cwd, codex!.env), task.cwd, task.verifyCwd ?? task.cwd, task.verifyNetwork);
           if (supervised) return windows ? windowsVerifyExecutable(argv, task.verifyCwd ?? task.cwd, executionEnv) : argv;
           if (!ctx.sandbox) throw new Error('严格验证需要 DSH 沙箱服务。');
-          const confined = await ctx.sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: task.cwd, sessionId: task.ownerSession as SessionId }, cancellation.signal);
+          const confined = await ctx.sandbox.confine(argv, { mode: 'workspace-write', workspaceRoot: task.cwd, sessionId: task.ownerSession as SessionId }, runSignal);
           if (confined.enforcement !== 'full') throw new Error('独立验证需要完整的文件写入隔离。');
           if (task.verifyNetwork === 'ask') return confined.argv;
           if (process.platform !== 'linux') throw new Error('当前平台尚未提供独立验证的网络隔离，验证未执行。');
@@ -664,7 +714,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_task',
-    description: '任务使用派发时固定的权限和时间预算，三次重复拒绝或失败会暂停；续接不扩大权限。把一个编码任务交给本机的编码工具（Codex 或 Claude Code）在后台执行。监工替用户把关：凭据和硬规则禁止的破坏性操作直接拒绝；标准模式命令可联网，命令与额外权限按具体内容安全审核，不确定时询问用户；严格模式保留文件和网络沙箱。文件工具默认限任务目录，提问发给任务所属用户。你不需要参与审批。任务结束后你会收到 background job 完成通知，用 job_output 读取汇报后向用户总结。运行期间用户问进展时，用 coder_status 看它当前在做什么和最近几步再回答。要调整一个已经停下或结束的任务时，带 resume_task_id 续接它：编码工具接着原来的会话，记得之前做过什么。默认最多同时运行两个独立工作区的任务，可在编码工具设置中调整为 1–4 个，Codex 和 Claude Code 共用上限；同一目录、包含关系的目录或同一 Git 工作树串行，其他可执行任务按入队顺序调度（另有最多 10 个等待名额）；排队期间可以用 job_kill 取消。有前置任务时用 depends_on，只有前置任务执行成功且独立验证通过才启动。重启后任务标记中断，不自动重放。',
+    description: '任务使用派发时固定的权限和时间预算，三次重复拒绝或失败会暂停；续接不扩大权限。把一个编码任务交给本机的编码工具（Codex 或 Claude Code）在后台执行。监工替用户把关：凭据和硬规则禁止的破坏性操作直接拒绝；标准模式命令可联网，命令与额外权限按具体内容安全审核，不确定时询问用户；严格模式保留文件和网络沙箱。文件工具默认限任务目录，提问发给任务所属用户。你不需要参与审批。任务结束后你会收到 background job 完成通知，用 job_output 读取汇报后向用户总结。运行期间用户问进展时，用 coder_status 看它当前在做什么和最近几步再回答。要调整一个已经停下或结束的任务时，带 resume_task_id 续接它：编码工具接着原来的会话，记得之前做过什么。默认最多同时运行两个独立工作区的任务，可在编码工具设置中调整为 1–4 个，Codex 和 Claude Code 共用上限；同一目录、包含关系的目录或同一 Git 工作树串行，其他可执行任务按入队顺序调度（另有最多 10 个等待名额）；排队期间可以用 job_kill 取消。有前置任务时用 depends_on，只有前置任务执行成功且独立验证通过才启动。短暂模型限流、网络故障在编码工具自身重试结束后最多自动续接原会话两次，等待计入原总时限；额度耗尽、认证失败或无原会话时暂停，不能靠重新派发绕过恢复上限。重启后任务标记中断，不自动重放。',
     parameters: {
       coder: { type: 'string', enum: ['codex', 'claude'], description: '执行任务的工具：codex 或 claude（Claude Code）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
       description: { type: 'string', required: true, description: '交给编码工具的完整任务说明，包括目标、约束和完成标准。续接时只写要调整或继续的内容，编码工具记得原来的任务。' },
@@ -798,6 +848,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const lines = [`编码任务 ${task.id}：${taskStatusLabel(task)}（${CODER_NAMES[task.coder]}）`,
           ...(isActive(task) ? [runningFor(task)] : []),
           ...(currentActivity(task) ? [`当前：${currentActivity(task)}`] : []),
+          ...(task.retry ? [retryText(task.retry), ...(task.retry.retryAt && task.retry.phase === 'waiting' ? [`预计重试时间：${clock(task.retry.retryAt)}`] : [])] : []),
           `任务：${task.description}`,
           ...(task.planStep ? [`计划步骤：${task.planStep}`] : []),
           ...(task.brief ? [`任务说明单：${task.brief.id} v${task.brief.revision}；验收项：${task.brief.acceptance.map(item => item.id).join('、')}`] : []),
@@ -918,6 +969,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       ...(task.dependsOn?.length ? { dependsOn: task.dependsOn } : {}),
       ...(task.resumedFrom ? { resumedFrom: task.resumedFrom } : {}), ...(isActive(task) ? { runningFor: runningFor(task) } : {}),
       ...(currentActivity(task) ? { activity: currentActivity(task)! } : {}),
+      ...(task.retry ? { retry: task.retry } : {}),
       ...(task.status === 'waiting-user' && task.pending ? { pending: { at: task.pending.at, summary: task.pending.summary, ...(task.pending.detail ? { detail: task.pending.detail } : {}) } } : {}),
       escalations: task.escalations, autoAllowed: task.autoAllowed ?? 0, decisions: task.decisions.map(describeDecision), trace: task.trace ?? [],
       ...(task.result ? { result: task.result } : {}),

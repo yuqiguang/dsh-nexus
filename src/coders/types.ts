@@ -1,3 +1,4 @@
+import type { TaskRetry } from './retry.js';
 import type { BriefSnapshot } from './brief.js';
 import type { TaskPermissions } from './permissions.js';
 import type { ReviewAudit } from './review.js';
@@ -108,6 +109,7 @@ export interface TaskRecord {
   permissions?: TaskPermissions;
   safetyReviews?: (ReviewAudit & { at: number })[];
   stopReason?: string;
+  retry?: TaskRetry;
   status: TaskStatus;
   /** DSH session that dispatched the task; escalations are asked on its live agent. */
   ownerSession: string;

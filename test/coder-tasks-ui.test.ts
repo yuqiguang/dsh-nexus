@@ -164,3 +164,15 @@ test('an unread task card does not invent running state and ignores a late respo
   assert.match(doc.body.textContent!, /ct-0000dcba.*排队中/);
   assert.doesNotMatch(doc.body.textContent!, /ct-0000abcd|运行中/);
 });
+
+
+test('task panel displays retry source, attempt, scheduled time and stop reason without a replay button', async t => {
+  const api: TaskApi = async () => detail({ statusLabel: '等待自动续接', retry: { source: 'nexus', phase: 'waiting', attempt: 1, maxAttempts: 2,
+    retryAt: Date.now() + 15000, reason: '模型服务暂时限流；等待后恢复原会话' } });
+  const doc = await render(t, coderTaskPanel(api) as ComponentType<never>, { useTabInfo: () => ({ tab: { contentId: taskAddress('ct-0000abcd'), visible: true } }) });
+  const panel = doc.querySelector('[aria-label="请求恢复状态"]')!;
+  assert.match(panel.textContent!, /自动续接（第 1\/2 次）/);
+  assert.match(panel.textContent!, /预计重试时间/);
+  assert.match(panel.textContent!, /等待计入本次运行时限/);
+  assert.equal(panel.querySelectorAll('button').length, 0);
+});

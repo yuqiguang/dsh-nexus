@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import type { RetryNotice } from '../src/coders/retry.js';
 import { test } from 'node:test';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
@@ -375,12 +376,14 @@ function fakeDomain(): { opener: DomainOpener; records: Map<string, TaskRecord>;
 
 test('the task store keeps records in native storage and marks live tasks interrupted after a restart', async () => {
   const { opener, records } = fakeDomain();
-  records.set('ct-old', task({ id: 'ct-old', status: 'waiting-user', coderSessionId: 'claude-9' }));
+  records.set('ct-old', task({ id: 'ct-old', status: 'running', coderSessionId: 'claude-9', retry: { source: 'nexus', phase: 'waiting', attempt: 1, maxAttempts: 2, retryAt: Date.now() + 10000, reason: 'temporary failure' } }));
   records.set('ct-done', task({ id: 'ct-done', status: 'completed', createdAt: 5 }));
   const store = await CoderStore.open(opener);
   assert.deepEqual(await store.markInterrupted(), ['ct-old']);
   assert.equal(store.get('ct-old')!.status, 'interrupted');
   assert.equal(store.get('ct-old')!.coderSessionId, 'claude-9');
+  assert.equal(taskSchema.parse(store.get('ct-old')).retry?.phase, 'stopped');
+  assert.equal(store.get('ct-old')!.retry?.retryAt, undefined);
   assert.equal(store.get('ct-done')!.status, 'completed');
   await store.put(task({ id: 'ct-new', status: 'queued', createdAt: 9 }));
   assert.deepEqual(store.list().map(item => item.id), ['ct-new', 'ct-done', 'ct-old']);
@@ -1883,7 +1886,7 @@ test('provider rate limits preserve the session as interrupted and expose the re
     yield {type:'result',subtype:'error',is_error:true,errors:['rate limit exceeded: token rate limit']};
   };
   try {
-    await installCoders(harness.ctx,{securityMode:'strict',roots:[workdir],query,defaultCoder:'claude'});
+    await installCoders(harness.ctx,{securityMode:'strict',roots:[workdir],query,defaultCoder:'claude',retryWait:async()=>{}});
     const task=await harness.run('coder_task',{cwd:join(workdir,'new-project'),description:'work',verify:'true'});
     await harness.jobs.at(-1)!.done;
     assert.equal(harness.tasks.get(task.task_id!)!.status,'interrupted');
@@ -2053,4 +2056,141 @@ test('status leads with inactivity and marks the last action as history before a
  const output=await harness.run('coder_status',{task_id:record.id});
  assert.match(output.text!,/尚未收到新动作/); assert.match(output.text!,/最后记录（历史）：layout work/);
  assert.ok(output.text!.indexOf('尚未收到新动作')<output.text!.indexOf('任务：'));
+});
+
+
+test('Claude reports native retry metadata and never treats an assistant API error as successful work', async () => {
+  const notices: (RetryNotice | undefined)[] = [];
+  const run = runClaudeTask(task(), { decide: async () => ({ behavior: 'deny', message: 'unused' }), onRetry: value => notices.push(value),
+    query: async function* () {
+      yield { type: 'system', subtype: 'api_retry', attempt: 2, max_retries: 3, retry_delay_ms: 15000, error_status: 429, error: 'rate_limit' };
+      yield { type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: 'API Error: 429 temporary limit' }] } };
+      yield { type: 'result', subtype: 'success', result: 'API Error: 429 temporary limit' };
+    } });
+  const result = await run.done;
+  assert.equal(notices[0]?.attempt, 2); assert.equal(notices[0]?.delayMs, 15000);
+  assert.equal(result.status, 'failed'); assert.equal(result.providerFailure?.kind, 'rate-limit');
+  const exhausted = await runClaudeTask(task(), { decide: async () => ({ behavior: 'deny', message: 'unused' }), query: async function* () {
+    yield { type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day', resetsAt: Date.now() / 1000 + 3600 } };
+    yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['rate limit exceeded'] };
+  } }).done;
+  assert.equal(exhausted.providerFailure?.kind, 'quota');
+});
+
+test('temporary Claude provider failure resumes the same task and session, preserves files and repeats scoped approvals', async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-auto-resume-'));
+  t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(qs => qs.map(q => ({ id: q.id, selected: ['允许'] })));
+  const sessions: (string | undefined)[] = [], prompts: string[] = [], waits: number[] = [];
+  const query: ClaudeQuery = async function* ({ prompt, options }) {
+    sessions.push(options.resume); prompts.push(prompt);
+    yield { type: 'system', subtype: 'init', session_id: 'claude-preserved' };
+    const decision = await options.canUseTool('Bash', { command: 'git push' }, { signal: options.abortController.signal });
+    assert.equal(decision.behavior, 'allow');
+    if (!options.resume) {
+      await writeFile(join(workdir, 'already-written.txt'), 'keep this once');
+      yield { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 1, retry_delay_ms: 1, error_status: null, error: 'unknown' };
+      yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['Connection error.'] };
+    } else {
+      assert.equal(await readFile(join(workdir, 'already-written.txt'), 'utf8'), 'keep this once');
+      yield { type: 'result', subtype: 'success', result: 'finished remaining work' };
+    }
+  };
+  let rpc: ((method: string, payload: unknown) => Promise<unknown>) | undefined;
+  await installCoders(harness.ctx, { securityMode: 'strict', roots: [workdir], query, defaultCoder: 'claude',
+    retryWait: async ms => { waits.push(ms); }, registerRpc: (_family, _methods, handle) => { rpc = handle; } });
+  const id = (await harness.run('coder_task', { cwd: workdir, description: 'write once' })).task_id!;
+  await harness.jobs[0]!.done;
+  assert.equal(harness.jobs.length, 1); assert.equal(harness.tasks.size, 1);
+  assert.deepEqual(sessions, [undefined, 'claude-preserved']); assert.deepEqual(waits, [5000]);
+  assert.match(prompts[1]!, /不要重复已成功/);
+  assert.equal(harness.asked.length, 2, 'each resumed permission request still needs its own approval');
+  const record = harness.tasks.get(id)!;
+  assert.equal(record.status, 'completed'); assert.equal(record.retry?.phase, 'recovered');
+  assert.ok(record.result?.changedFiles.includes(join(workdir, 'already-written.txt')));
+  const view = await rpc!('get', { id, brief: true }) as { retry: { phase: string } };
+  assert.equal(view.retry.phase, 'recovered');
+  assert.ok(harness.panels[0]!.progress.some(text => /自行重试/.test(text)));
+});
+
+test('Codex native retries are visible and exhausted transient errors resume the original thread only after exit', async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-codex-resume-')); t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(); let starts = 0;
+  const methods: string[] = [], notices: string[] = [];
+  const spawnCodex = () => {
+    const attempt = ++starts;
+    return fakeCodex(io => io.onWrite(message => {
+      methods.push(String(message.method));
+      if (message.method === 'initialize') io.reply(message.id, {});
+      if (message.method === 'thread/start' || message.method === 'thread/resume') {
+        if (attempt > 1) assert.equal((message.params as { threadId: string }).threadId, 'thread-recovered');
+        io.reply(message.id, { thread: { id: 'thread-recovered' } });
+      }
+      if (message.method === 'turn/start') {
+        io.reply(message.id, { turn: { id: 'turn-' + attempt } });
+        if (attempt === 1) {
+          io.push({ method: 'error', params: { willRetry: true, error: { message: 'provider reset', codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } } } } });
+          io.push({ method: 'turn/completed', params: { turn: { status: 'failed', error: { message: 'retries exhausted', codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 503 } } } } } });
+        } else io.push({ method: 'turn/completed', params: { turn: { status: 'completed', items: [] } } });
+      }
+    })).process;
+  };
+  await installCoders(harness.ctx, { roots: [workdir], spawnCodex, retryWait: async () => {
+    assert.equal(starts, 1); notices.push(...harness.panels[0]!.progress);
+  } });
+  const id = (await harness.run('coder_task', { cwd: workdir, description: 'continue' })).task_id!;
+  await harness.jobs[0]!.done;
+  assert.equal(starts, 2); assert.equal(harness.jobs.length, 1);
+  assert.deepEqual(methods.filter(m => m.startsWith('thread/')), ['thread/start', 'thread/resume']);
+  assert.ok(notices.some(text => /自行重试/.test(text)));
+  assert.equal(harness.tasks.get(id)!.status, 'completed');
+});
+
+for (const action of ['cancel', 'boundary', 'quota', 'no-session'] as const) test(`${action} prevents automatic recovery without repeating work`, async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-retry-guard-')); t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(); let attempts = 0;
+  const query: ClaudeQuery = async function* () {
+    attempts++;
+    if (action !== 'no-session') yield { type: 'system', subtype: 'init', session_id: 'retry-guard' };
+    yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: [action === 'quota' ? '429 insufficient_quota' : 'ECONNRESET'] };
+  };
+  await installCoders(harness.ctx, { roots: [workdir], query, defaultCoder: 'claude', retryWait: async () => {
+    if (action === 'cancel') harness.jobs[0]!.cancel('user cancelled');
+    if (action === 'boundary') await rm(workdir, { recursive: true, force: true });
+  } });
+  const id = (await harness.run('coder_task', { cwd: workdir, description: 'work' })).task_id!;
+  await harness.jobs[0]!.done;
+  assert.equal(attempts, 1);
+  assert.equal(harness.tasks.get(id)!.status, action === 'cancel' ? 'cancelled' : action === 'boundary' ? 'failed' : 'interrupted');
+  assert.equal(harness.tasks.get(id)!.retry?.phase, 'stopped');
+});
+
+
+test('automatic Claude recovery refuses a replacement native session', async () => {
+  let registered = false;
+  const result = await runClaudeTask(task({ coderSessionId: 'original' }), { continuation: true, onSession: () => { registered = true; },
+    decide: async () => ({ behavior: 'deny', message: 'unused' }), query: async function* () {
+      yield { type: 'system', subtype: 'init', session_id: 'replacement' };
+      yield { type: 'result', subtype: 'success', result: 'must not run' };
+    } }).done;
+  assert.equal(result.status, 'failed'); assert.match(result.detail!, /未恢复原会话/); assert.equal(registered, false);
+});
+
+
+test('the original runtime budget expires during retry backoff without starting another coder', async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-retry-budget-')); t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(), permissions = await taskPermissions(workdir, [workdir], 'claude');
+  permissions.maxDurationMs = 200;
+  harness.tasks.set('ct-before', task({ id: 'ct-before', status: 'interrupted', cwd: workdir, coderSessionId: 'original', permissions }));
+  let starts = 0;
+  await installCoders(harness.ctx, { roots: [workdir], query: async function* () {
+    starts++;
+    yield { type: 'system', subtype: 'init', session_id: 'original' };
+    yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['ECONNRESET'] };
+  } });
+  const id = (await harness.run('coder_task', { cwd: workdir, description: 'continue', resume_task_id: 'ct-before' })).task_id!;
+  await harness.jobs[0]!.done;
+  assert.equal(starts, 1); assert.equal(harness.tasks.get(id)!.status, 'interrupted');
+  assert.match(harness.tasks.get(id)!.stopReason!, /时间预算/);
+  assert.equal(harness.tasks.get(id)!.retry?.phase, 'stopped');
 });

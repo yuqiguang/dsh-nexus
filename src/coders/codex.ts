@@ -4,7 +4,7 @@ import { requireWindowsFirewall } from './windows-firewall.js';
 import { LOCAL_CHECK_GUIDANCE, RESEARCH_GUIDANCE, RESEARCH_TOKEN_ENV, type ResearchBridge } from './research.js';
 import type { TaskPermissions } from './permissions.js';
 import { isInside } from './rules.js';
-import type { JobHooks, JobOutcome } from '@deepseek-ai/dsh-jobs';
+import { codexFailure, exceptionFailure, failureLabel, safeFailureDetail, RESUME_PROMPT, type CodexError, type CoderRun, type CoderOutcome as JobOutcome, type RetryNotice } from './retry.js';
 import { codexCommandRequest, codexFileChangeRequest, codexPermissionRequest, codexQuestionRequest, codexStep, codexTextQuestion, narration, outputTail } from './normalize.js';
 import type { CoderDecision, CoderRequest, TaskRecord } from './types.js';
 
@@ -13,7 +13,7 @@ export { APP_SERVER_ARGS, WINDOWS_CODEX_ARGS, spawnCodexAppServer, type CodexPro
 const MAX_QUESTION_ROUNDS = 5;
 
 /** A running Codex task's hooks, plus a way to talk to it mid-turn. */
-export interface CodexHooks extends JobHooks {
+export interface CodexHooks extends CoderRun {
   /**
    * Put the user's words into the running task. Without `interrupt` they join the current turn (`turn/steer`) and Codex reads them at
    * its next step; a pending approval still waits for its answer. With `interrupt` the turn stops, its pending approvals are withdrawn,
@@ -24,6 +24,8 @@ export interface CodexHooks extends JobHooks {
 
 export interface CodexRunDeps {
   instructions?: string;
+  continuation?: boolean;
+  onRetry?(notice: RetryNotice | undefined): void;
   research?: ResearchBridge;
   spawn?: CodexSpawn;
   launch?: CodexLaunch;
@@ -100,6 +102,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   let threadId: string | undefined;
   let turnId: string | undefined;
   let nextId = 0;
+  const requests = new Set<Promise<void>>();
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   const itemPaths = new Map<string, string[]>();
   const itemDiffs = new Map<string, string>();
@@ -112,7 +115,8 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   let turnAbort = new AbortController();
   /** What the user said when interrupting; it starts the next turn once the current one ends. */
   let redirect: string | undefined;
-  const errors: string[] = [];
+  const errors: CodexError[] = [];
+  let nativeRetryAttempt = 0;
   let finish: (outcome: JobOutcome) => void = () => {};
   const finished = new Promise<JobOutcome>(resolve => { finish = resolve; });
 
@@ -180,6 +184,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   }
 
   function handleNotification(message: JsonRpc): void {
+    if (['item/started', 'item/agentMessage/delta', 'item/completed'].includes(message.method ?? '')) deps.onRetry?.(undefined);
     const params = message.params ?? {};
     switch (message.method) {
       case 'item/started':
@@ -209,12 +214,14 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         return;
       }
       case 'error': {
-        const error = params.error as { message?: string } | undefined;
-        if (error?.message && params.willRetry !== true) errors.push(error.message);
+        const error = params.error as CodexError | undefined;
+        if (params.willRetry === true) {
+          deps.onRetry?.({ failure: codexFailure(error) ?? { kind: 'permanent' }, attempt: ++nativeRetryAttempt });
+        } else if (error) errors.push(error);
         return;
       }
       case 'turn/completed': {
-        const turn = params.turn as { status?: string; error?: { message?: string } | null; items?: unknown[] } | undefined;
+        const turn = params.turn as { status?: string; error?: CodexError | null; items?: unknown[] } | undefined;
         void completeTurn(turn);
         return;
       }
@@ -222,7 +229,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
     }
   }
 
-  async function completeTurn(turn: { status?: string; error?: { message?: string } | null; items?: unknown[] } | undefined): Promise<void> {
+  async function completeTurn(turn: { status?: string; error?: CodexError | null; items?: unknown[] } | undefined): Promise<void> {
     if (controller.signal.aborted) return;
     turnActive = false;
     // The user interrupted to change course: whether the turn stopped or had just finished, their words start the next one.
@@ -230,11 +237,15 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
       const text = redirect;
       redirect = undefined;
       try { await startTurn(text); }
-      catch (error) { finish({ status: 'failed', detail: (error as Error)?.message ?? String(error), result: lastAssistant }); }
+      catch (error) { finish({ status: 'failed', detail: safeFailureDetail((error as Error)?.message ?? String(error)), result: lastAssistant }); }
       return;
     }
     const items = turn?.items?.length ? turn.items : turnItems;
-    if (turn?.status === 'failed') return finish({ status: 'failed', detail: turn.error?.message ?? errors.at(-1) ?? 'turn failed', result: lastAssistant });
+    if (turn?.status === 'failed') {
+      const error = turn.error ?? errors.at(-1), failure = codexFailure(error);
+      return finish({ status: 'failed', detail: failure ? failureLabel(failure) : safeFailureDetail(error?.message ?? 'turn failed'), result: lastAssistant,
+        ...(failure ? { providerFailure: failure } : {}) });
+    }
     if (turn?.status === 'interrupted') return finish({ status: 'killed', detail: cancelReason ?? 'interrupted', result: lastAssistant });
     const text = turnText || lastAssistant;
     if (trailingQuestion(text, items) && questionRounds < MAX_QUESTION_ROUNDS) {
@@ -247,7 +258,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         await startTurn(answer);
         return;
       } catch (error) {
-        return finish({ status: 'failed', detail: (error as Error)?.message ?? String(error), result: text });
+        return finish({ status: 'failed', detail: safeFailureDetail((error as Error)?.message ?? String(error)), result: text });
       }
     }
     finish({ status: 'completed', result: text });
@@ -272,15 +283,16 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
           if (message.error) waiter.reject(new Error(message.error.message ?? 'codex request failed'));
           else waiter.resolve(message.result);
         } else if (message.id !== undefined && message.method) {
-          void handleRequest(message).catch(error => {
-            respondError(message.id!, (error as Error)?.message ?? String(error));
+          const request = handleRequest(message).catch(error => {
+            if (!turnAbort.signal.aborted && !controller.signal.aborted) respondError(message.id!, (error as Error)?.message ?? String(error));
           });
+          requests.add(request); void request.then(() => requests.delete(request), () => requests.delete(request));
         } else if (message.method) {
           handleNotification(message);
         }
       }
     })();
-    void reading.catch(() => finish({ status: 'failed', detail: 'Codex 输出连接中断，任务已停止。', result: lastAssistant }));
+    void reading.catch(() => finish({ status: 'failed', detail: 'Codex 输出连接中断，任务已停止。', providerFailure: { kind: 'network' }, result: lastAssistant }));
     const session = (async () => {
       await send('initialize', { clientInfo: { name: 'nexus-next', version: '0.1.0' }, capabilities: {} });
       notify('initialized');
@@ -296,13 +308,14 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         { thread?: { id?: string }; approvalPolicy?: unknown; sandbox?: unknown };
       threadId = started?.thread?.id;
       if (!threadId) throw new Error(`codex ${method} 没有返回线程 ID`);
+      if (task.coderSessionId && threadId !== task.coderSessionId) throw new Error('Codex 未恢复原线程，任务已停止。');
       // Codex echoes the effective policies; a Codex that ignored the thread parameters must not run unattended.
       const drift = threadPolicyDrift(started, task.permissions);
       if (drift) throw new Error(`Codex 没有采用监工要求的策略：${drift}`);
       deps.onSession?.(threadId);
-      await startTurn(coderPrompt(task) + (deps.instructions ?? '') + (globalThis.process.platform === 'win32' ? WINDOWS_CODER_GUIDANCE : '') + (deps.research ? (deps.research.webResearch === false ? '' : RESEARCH_GUIDANCE) + (deps.research.localChecks ? LOCAL_CHECK_GUIDANCE : '') : ''));
+      await startTurn((deps.continuation ? RESUME_PROMPT : coderPrompt(task)) + (deps.instructions ?? '') + (globalThis.process.platform === 'win32' ? WINDOWS_CODER_GUIDANCE : '') + (deps.research ? (deps.research.webResearch === false ? '' : RESEARCH_GUIDANCE) + (deps.research.localChecks ? LOCAL_CHECK_GUIDANCE : '') : ''));
     })();
-    const exitedEarly = process.exited.then(code => ({ status: 'failed', detail: `codex app-server 退出（${code ?? 'signal'}）${errors.length ? `：${errors.at(-1)}` : ''}`, result: lastAssistant } satisfies JobOutcome));
+    const exitedEarly = process.exited.then(code => ({ ...(codexFailure(errors.at(-1)) ? { providerFailure: codexFailure(errors.at(-1)) } : {}), status: 'failed', detail: `codex app-server 退出（${code ?? 'signal'}）${errors.length ? `：${safeFailureDetail(errors.at(-1)?.message ?? '')}` : ''}`, result: lastAssistant } satisfies JobOutcome));
     let outcome: JobOutcome;
     try {
       outcome = await Promise.race([
@@ -311,16 +324,19 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         session.then(() => finished),
       ]);
     } catch (error) {
+      const failure = exceptionFailure(error);
       outcome = controller.signal.aborted ? { status: 'killed', detail: cancelReason ?? 'cancelled', result: lastAssistant }
-        : { status: 'failed', detail: (error as Error)?.message ?? String(error), result: lastAssistant };
+        : { status: 'failed', detail: failure ? failureLabel(failure) : safeFailureDetail((error as Error)?.message ?? String(error)), result: lastAssistant, ...(failure ? { providerFailure: failure } : {}) };
     }
     if (controller.signal.aborted && outcome.status !== 'killed') outcome = { status: 'killed', detail: cancelReason ?? 'cancelled', result: outcome.result ?? lastAssistant };
+    turnAbort.abort(new Error('编码回合已结束'));
+    await Promise.allSettled(requests);
     for (const waiter of pending.values()) waiter.reject(new Error('codex session closed'));
     pending.clear();
     process.kill();
     const exit = await Promise.race([process.exited, new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 6000).unref())]);
     await reading.catch(() => {});
-    if (globalThis.process.platform === 'win32' && exit == null && outcome.status === 'completed') return { status: 'failed', detail: '无法确认 Windows 任务进程已完全清理。', result: outcome.result };
+    if (exit == null && (outcome.status === 'completed' || outcome.providerFailure)) return { status: 'failed', detail: '无法确认任务进程已完全清理，不能自动续接。', result: outcome.result };
     return outcome;
   })();
 

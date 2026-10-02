@@ -4,7 +4,7 @@ import { coderPrompt } from './brief.js';
 import { WINDOWS_CODER_GUIDANCE } from './runtime.js';
 import { LOCAL_CHECK_GUIDANCE, RESEARCH_GUIDANCE, type ResearchBridge } from './research.js';
 import { credentialPaths } from './permissions.js';
-import type { JobHooks, JobOutcome } from '@deepseek-ai/dsh-jobs';
+import { counter, exceptionFailure, failureLabel, providerFailure, safeFailureDetail, RESUME_PROMPT, type CoderRun, type CoderOutcome, type ProviderFailure, type RetryNotice } from './retry.js';
 import { pathToFileURL } from 'node:url';
 import { claudeStep, claudeToolOutput, narration, normalizeClaudeRequest, outputTail, type ClaudePermissionContext } from './normalize.js';
 import type { CoderDecision, CoderRequest, TaskRecord } from './types.js';
@@ -18,6 +18,13 @@ export interface ClaudeStreamMessage {
   result?: string;
   is_error?: boolean;
   errors?: string[];
+  error?: string;
+  parent_tool_use_id?: string | null;
+  attempt?: number;
+  max_retries?: number;
+  retry_delay_ms?: number;
+  error_status?: number | null;
+  rate_limit_info?: { status: string; rateLimitType?: string; resetsAt?: number; overageDisabledReason?: string };
 }
 
 export type ClaudePermissionResult = CoderDecision;
@@ -52,6 +59,8 @@ export type ClaudeQuery = (params: { prompt: string; options: ClaudeQueryOptions
 
 export interface ClaudeRunDeps {
   instructions?: string;
+  continuation?: boolean;
+  onRetry?(notice: RetryNotice | undefined): void;
   research?: ResearchBridge;
   query: ClaudeQuery;
   env?: Record<string, string | undefined>;
@@ -88,35 +97,45 @@ function textOf(content: unknown): string {
  * Run one task in Claude Code through the Agent SDK. Every permission request
  * and AskUserQuestion reaches `deps.decide`; the returned hooks fit a native job.
  */
-export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): JobHooks {
+export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
   const controller = new AbortController();
   let cancelReason: string | undefined;
+  let transportFailed = false;
+  let lastFailure: ProviderFailure | undefined;
+  let quota: ProviderFailure | undefined;
+  const interrupted = (result: string): CoderOutcome => transportFailed
+    ? { status: 'failed', detail: 'Claude 输出连接中断', providerFailure: { kind: 'network' }, result }
+    : { status: 'killed', detail: cancelReason ?? 'cancelled', result };
+  const failed = (detail: string, result: string, failure = providerFailure({ message: detail }) ?? lastFailure ?? quota): CoderOutcome =>
+    ({ status: 'failed', detail: failure ? failureLabel(failure) : safeFailureDetail(detail), result, ...(failure ? { providerFailure: failure } : {}) });
   const calls = new Map<string, string>();
   // AskUserQuestion may reach both the hook and canUseTool. Only dedupe that exact question;
   // a later command permission callback can carry a newly discovered blocked path and must be checked again.
+  const decisions = new Set<Promise<CoderDecision>>();
   const questionAnswers = new Map<string, Promise<CoderDecision>>();
   const decide = (name: string, input: Record<string, unknown>, context: ClaudePermissionContext, id: string | undefined, signal: AbortSignal) => {
     const key = name === 'AskUserQuestion' && id ? `${id}:${JSON.stringify(input.questions)}` : undefined;
     const prior = key ? questionAnswers.get(key) : undefined;
     if (prior) return prior;
     const answer = deps.decide(normalizeClaudeRequest(name, input, context, task.cwd), signal);
+    decisions.add(answer); void answer.then(() => decisions.delete(answer), () => decisions.delete(answer));
     if (key) questionAnswers.set(key, answer);
     return answer;
   };
   // The annotation makes TypeScript check each returned literal against JobOutcome; inferred, a renamed field slips through.
   const children = new Set<ReturnType<typeof spawnTaskProcess>>();
-  const execution = (async (): Promise<JobOutcome> => {
+  const execution = (async (): Promise<CoderOutcome> => {
     let lastAssistant = '';
     try {
       if (process.platform === 'win32' && task.permissions?.securityMode !== 'standard') throw new Error('Claude Code 严格模式需要 Linux / WSL2 或 macOS 命令沙箱。');
-      const stream = deps.query({ prompt: coderPrompt(task) + (deps.instructions ?? '') + (process.platform === 'win32' ? WINDOWS_CODER_GUIDANCE : '') + (deps.research ? (deps.research.webResearch === false ? '' : RESEARCH_GUIDANCE) + (deps.research.localChecks ? LOCAL_CHECK_GUIDANCE : '') : ''), options: {
+      const stream = deps.query({ prompt: (deps.continuation ? RESUME_PROMPT : coderPrompt(task)) + (deps.instructions ?? '') + (process.platform === 'win32' ? WINDOWS_CODER_GUIDANCE : '') + (deps.research ? (deps.research.webResearch === false ? '' : RESEARCH_GUIDANCE) + (deps.research.localChecks ? LOCAL_CHECK_GUIDANCE : '') : ''), options: {
         ...((process.platform === 'linux' || process.platform === 'win32') && task.permissions ? { spawnClaudeCodeProcess: (options: SpawnOptions) => {
           const child = spawnTaskProcess(options.command, options.args, options.cwd, options.env);
           // The SDK's custom spawn interface owns stdio but does not drain stderr.
           child.stderr.resume();
-          child.stderr.on('error', () => controller.abort(new Error('Claude stderr interrupted')));
-          child.stdout.on('error', () => controller.abort(new Error('Claude stdout interrupted')));
-          child.stdin.on('error', () => controller.abort(new Error('Claude stdin interrupted')));
+          child.stderr.on('error', () => { transportFailed = true; controller.abort(new Error('Claude stderr interrupted')); });
+          child.stdout.on('error', () => { transportFailed = true; controller.abort(new Error('Claude stdout interrupted')); });
+          child.stdin.on('error', () => { transportFailed = true; controller.abort(new Error('Claude stdin interrupted')); });
           children.add(child);
           const abort = () => { void closeTaskProcess(child); };
           options.signal.addEventListener('abort', abort, { once: true });
@@ -151,8 +170,27 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): JobHooks {
         },
       } });
       for await (const message of stream) {
-        if (message.type === 'system' && message.subtype === 'init' && message.session_id) deps.onSession?.(message.session_id);
-        else if (message.type === 'assistant') {
+        if (message.type === 'system' && message.subtype === 'init' && message.session_id) {
+          if (deps.continuation && task.coderSessionId && message.session_id !== task.coderSessionId) throw new Error('Claude 未恢复原会话，任务已停止。');
+          deps.onSession?.(message.session_id);
+        }
+        else if (message.type === 'system' && message.subtype === 'api_retry') {
+          const failure = providerFailure({ code: message.error, status: message.error_status,
+            retryAfterMs: message.retry_delay_ms }) ?? (message.error_status === null ? { kind: 'network' as const } : { kind: 'permanent' as const });
+          lastFailure = failure;
+          deps.onRetry?.({ failure, attempt: counter(message.attempt), maxAttempts: counter(message.max_retries), delayMs: counter(message.retry_delay_ms) });
+        } else if (message.type === 'rate_limit_event') {
+          if (message.rate_limit_info?.status === 'rejected') {
+            quota = { kind: 'quota' };
+            deps.onRetry?.({ failure: quota, retrying: false });
+          } else { quota = undefined; }
+        } else if (message.type === 'assistant') {
+          if (!message.parent_tool_use_id && message.error) {
+            lastFailure = quota ?? providerFailure({ code: message.error, message: textOf(message.message?.content) }) ?? { kind: 'permanent' };
+            deps.onActivity?.(failureLabel(lastFailure));
+            continue;
+          } else if (!message.parent_tool_use_id) { lastFailure = undefined; deps.onRetry?.(undefined); }
+
           const content = message.message?.content;
           const text = textOf(content);
           if (text) { lastAssistant = text; const said = narration(text); if (said) deps.onActivity?.(said); }
@@ -170,22 +208,23 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): JobHooks {
             const output = claudeToolOutput(block); if (output?.trim()) deps.onLog?.(outputTail(output)); }
         }
         else if (message.type === 'result') {
-          if (controller.signal.aborted) return { status: 'killed', detail: cancelReason ?? 'cancelled', result: lastAssistant };
+          if (controller.signal.aborted) return interrupted(lastAssistant);
           const output = typeof message.result === 'string' && message.result ? message.result : lastAssistant;
           if (message.is_error || (message.subtype && message.subtype !== 'success')) {
-            return { status: 'failed', detail: [message.subtype, ...(message.errors ?? [])].filter(Boolean).join(': ') || 'error', result: output };
+            return failed([message.subtype, ...(message.errors ?? [])].filter(Boolean).join(': ') || 'error', lastAssistant, quota ?? providerFailure({ message: (message.errors ?? []).join(': ') }) ?? lastFailure);
           }
+          if (lastFailure || quota) return failed('模型请求失败', lastAssistant, quota ?? lastFailure);
           return { status: 'completed', result: output };
         }
       }
-      if (controller.signal.aborted) return { status: 'killed', detail: cancelReason ?? 'cancelled', result: lastAssistant };
-      return { status: 'failed', detail: 'Claude Code 没有返回结果', result: lastAssistant };
+      if (controller.signal.aborted) return interrupted(lastAssistant);
+      return failed('Claude Code 没有返回结果', lastAssistant);
     } catch (error) {
-      if (controller.signal.aborted) return { status: 'killed', detail: cancelReason ?? 'cancelled', result: lastAssistant };
-      return { status: 'failed', detail: (error as Error)?.message ?? String(error), result: lastAssistant };
-    } finally { await Promise.all([...children].map(closeTaskProcess)); }
+      if (controller.signal.aborted) return interrupted(lastAssistant);
+      return failed((error as Error)?.message ?? String(error), lastAssistant, exceptionFailure(error) ?? quota ?? lastFailure);
+    } finally { controller.abort(); await Promise.allSettled(decisions); await Promise.all([...children].map(closeTaskProcess)); }
   })();
-  const done = execution.then((outcome): JobOutcome => process.platform === 'win32' && outcome.status === 'completed' && (!children.size || [...children].some(child => !taskProcessCleaned(child)))
+  const done = execution.then((outcome): CoderOutcome => process.platform === 'win32' && (outcome.status === 'completed' || outcome.providerFailure) && (!children.size || [...children].some(child => !taskProcessCleaned(child)))
     ? { status: 'failed', detail: '无法确认 Windows Claude 任务进程已完全清理。', result: outcome.result } : outcome);
   return {
     cancel(reason?: string) {
