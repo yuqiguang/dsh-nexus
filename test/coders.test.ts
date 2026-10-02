@@ -279,6 +279,7 @@ test('the verify command runs without a shell and reports exit status', async ()
   assert.match(failed.output, /\[exit \d+\]/);
   const missing = await runVerifyCommand('definitely-not-a-program-xyz', process.cwd());
   assert.equal(missing.ok, false);
+  if (process.platform === 'win32') assert.equal(missing.executed, false);
 });
 
 test('changed files are measured against the work tree at dispatch: leftovers and prior edits are not the task\'s, new, edited, deleted and committed files are', async () => {
@@ -2314,4 +2315,41 @@ test('automatic-review fallback reasons reach native questions, pending task rec
    assert.ok(record.trace?.some(step=>step.text.includes(pendingReason!.slice(0,40))));
   }finally{await rm(cwd,{recursive:true,force:true});}
  });
+});
+
+
+test('missing verification cwd is not executed and does not reach approval or process launch', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-missing-verify-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let approvals = 0;
+  const result = await verifyTask({ cwd: root, verifyCwd: join(root, 'removed'), verify: 'node --version' }, [root], undefined, undefined,
+    async argv => { approvals++; return argv; });
+  assert.equal(approvals, 0);
+  assert.equal(result.verifyExecuted, false);
+  assert.equal(result.verifyChecks?.[0]?.executed, false);
+  assert.match(result.verifyOutput!, /验证目录不存在/);
+});
+
+test('retry rejects a removed verification directory before dispatch and accepts an explicit corrected root', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-retry-directory-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  let codingRuns = 0;
+  const query = scriptedQuery(async function* () {
+    codingRuns++;
+    yield { type: 'system', subtype: 'init', session_id: 'verify-dir-session' };
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [root], query, defaultCoder: 'claude', safetyReviewer: async () => ({ safe: true, reason: 'local fixture' }) });
+  const first = await harness.run('coder_task', { description: 'fixture', verify: 'true', verify_cwd: 'removed' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(first.task_id!)!.result?.verification, 'not-run');
+  await assert.rejects(harness.run('coder_task', { description: 'retry', retry_task_id: first.task_id }), /重试未启动.*验证目录不存在/);
+  assert.equal(harness.jobs.length, 1);
+  const corrected = await harness.run('coder_task', { description: 'retry', retry_task_id: first.task_id, verification_only: true, verify_cwd: '.' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(codingRuns, 1, 'verification-only must not invoke the coder again');
+  assert.equal(harness.tasks.get(corrected.task_id!)!.verificationOnly, true);
+  assert.equal(harness.tasks.get(corrected.task_id!)!.verifyCwd, root);
+  assert.equal(harness.tasks.get(corrected.task_id!)!.result?.verification, 'passed');
 });

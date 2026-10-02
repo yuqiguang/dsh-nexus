@@ -204,7 +204,7 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     ...(task.permissions ? [permissionSummary(task.permissions)] : []),
     '',
     `DSH 独立验证范围：${task.verify ? [task.verify, ...(task.verifyCommands ?? [])].join('；') : '未指定'}。编码工具自述的其他测试不代表 DSH 已独立运行。`,
-    `${CODER_NAMES[task.coder]} 的结果（编码工具自述）：`,
+    task.verificationOnly ? '本轮执行方式：' : `${CODER_NAMES[task.coder]} 的结果（编码工具自述）：`,
     clip(outcome.result?.trim() || '（没有文本结果）', 4000),
     '',
     `改动文件（${verify.changedFiles.length}）：`,
@@ -574,6 +574,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const hooks: JobHooks = {
       done: (async (): Promise<JobOutcome> => {
         try {
+          if (task.verificationOnly) {
+            runSignal.throwIfAborted();
+            return { status: 'completed', result: '本轮只运行监工独立验证，未启动编码工具；检查结果见下方独立验证记录。' };
+          }
           if (task.permissions?.webResearch && config.web || process.platform === 'linux' && task.permissions && ctx.sandbox) research = await createResearchBridge(task.permissions?.webResearch ? config.web?.(task.ownerSession) : undefined, shared.decide, task.cwd, runSignal, shared.onActivity,
             process.platform === 'linux' && task.permissions && ctx.sandbox ? (command, directory, signal) => localCheck(ctx, task.cwd, task.ownerSession, command, directory, signal) : undefined);
           const instructions = await hostInstructions(task.cwd);
@@ -749,6 +753,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       brief_revision: { type: 'integer', description: '说明单当前版本，关联时必填，防止按过期目标执行。' },
       acceptance_ids: { type: 'array', items: { type: 'string' }, description: '本任务负责的说明单验收项 ID，例如 a1、a2，关联时必填。' },
       depends_on: { type: 'array', items: { type: 'string' }, description: '前置任务 ID 列表（最多 10 个，必须已派发且属于当前会话）。全部执行成功且独立验证通过才启动；失败、取消、中断或未验证都会阻止本任务。等待依赖不占执行名额。续接默认沿用原依赖；修复前置任务后须填新的任务 ID。' },
+      verification_only: { type: 'boolean', description: '仅对已完成编码的原任务重新运行监工独立验证，不启动 Codex/Claude。须带 retry_task_id 或 resume_task_id；核实 verify_cwd，并用 verify_commands 登记所有需要的检查。原权限、工作区和审批边界不变。' },
       retry_task_id: { type: 'string', description: '失败、取消或中断后的最新任务 ID；显式重试同一步骤。保留权限边界，有原生会话则续接，没有则重新启动。与 resume_task_id 互斥；不能重做已验证通过的步骤。' },
       resume_task_id: { type: 'string', description: '要续接的任务 ID（ct-xxxx），它必须已经停下、结束或因重启中断。用于用户叫停后要调整方向，或结束后要接着改：在原任务的编码工具会话里继续，而不是从头开始。' },
       verify_commands: { type: 'array', items: { type: 'string' }, description: '完整的独立验证命令列表（1 到 10 条），按顺序执行，每条单独审核，任一失败则停止；与 verify 二选一。覆盖验收所需的语法、逻辑和集成测试。' },
@@ -791,6 +796,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           resuming.add(key);
           resumeKey = key;
         }
+        if (args.verification_only && previous?.result?.execution !== 'completed') throw new Error('仅验证模式需要引用编码已完成的原任务。');
         const briefId = args.brief_id ?? previous?.brief?.id;
         if (!briefId && (args.brief_revision !== undefined || args.acceptance_ids !== undefined)) throw new Error('验收项和版本必须与 brief_id 一起填写。');
         if (previous?.brief && briefId !== previous.brief.id) throw new Error('续接不能切换任务说明单；新目标请重新派发。');
@@ -823,9 +829,11 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const suite = args.verify_commands;
         if (suite && (suite.length < 1 || suite.length > 10 || suite.some(command => !command.trim()))) throw new Error('独立验证列表需要 1 到 10 条非空命令。');
         const verify = suite?.[0] ?? planned?.step.verify ?? args.verify ?? previous?.verify;
+        if (args.verification_only && !verify) throw new Error('仅验证模式必须指定独立验证命令。');
         const verifyCommands = suite ? suite.slice(1) : args.verify !== undefined ? undefined : previous?.verifyCommands;
         const verifyCwd = await canonical(resolve(cwd, args.verify_cwd ?? previous?.verifyCwd ?? '.'));
         if (!isInside(cwd, verifyCwd)) throw new Error('验证目录必须位于任务目录内。');
+        if (previous && verify && !await stat(verifyCwd).then(info => info.isDirectory(), () => false)) throw new Error(`重试未启动：验证目录不存在或不可访问：${verifyCwd}。请先核实目录；verify_cwd 相对于任务 cwd，验证项目根目录用 .。不会原样重跑编码任务。`);
         const verifyNetwork = verificationNetwork(args.verify_network, previous?.verifyNetwork, permissions.securityMode ?? 'strict');
         if (verify) await preflightVerification(process.platform, coder, verifyNetwork);
         for (const command of verify ? [verify, ...(verifyCommands ?? [])] : []) {
@@ -835,7 +843,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         }
         await mkdir(cwd, { recursive: true });
         if (await canonical(cwd) !== cwd || !(await stat(cwd)).isDirectory()) throw new Error('创建项目目录时工作区发生变化，请重新检查。');
-        const task: TaskRecord = { id: taskId, ...(planned ? { planStep: planned.step.id } : {}), ...(brief ? { brief } : {}), ...(dependsOn.length ? { dependsOn } : {}), coder, description: args.description, cwd, permissions,
+        const task: TaskRecord = { id: taskId, ...(args.verification_only ? { verificationOnly: true } : {}), ...(planned ? { planStep: planned.step.id } : {}), ...(brief ? { brief } : {}), ...(dependsOn.length ? { dependsOn } : {}), coder, description: args.description, cwd, permissions,
           ...(verify ? { verify, ...(verifyCommands?.length ? { verifyCommands } : {}), verifyCwd, verifyNetwork } : {}), status: 'queued', ownerSession: exec.agent.id, createdAt: now, updatedAt: now,
           ...(previous ? { ...(previous.coderSessionId ? { coderSessionId: previous.coderSessionId, resumedFrom: previous.id } : {}), ...(args.retry_task_id ? { replaces: previous.id } : {}) } : {}), escalations: 0, decisions: [] };
         projectRulesOf.set(task.id, await projectRules(cwd, roots));
@@ -1023,7 +1031,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'nexus:coders',
     order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 1,
-    text: () => `当用户要求实现、修改或修复一个代码项目，而不是让你直接回答时，用 coder_task 把任务派给本机的编码工具（默认 ${CODER_NAMES[currentDefault()]}，用户指名时用 coder 参数选择），编码任务默认使用当前 DSH 会话工作区，通常省略 cwd；新项目可指定工作区内子目录，不得改用渠道默认目录。设置里的目录列表只作额外限制，不能扩大当前会话工作区。派发后向用户说明工具返回的实际项目目录。当前实例最多同时执行 ${maxConcurrent} 个编码任务，Codex 与 Claude Code 共用名额；独立工作区可并行，同一目录或同一 Git 工作树仍需排队。排队原因未被工具确认时，不要说正在等待其他任务；状态出现无新动作时，先如实报告无动作时长，再注明最后记录，不能把历史动作说成当前正在做的事。复杂或分阶段需求先用 coder_brief 记录用户目标、已明确的约束和可核验的验收项；能从项目查清的信息自己调查，仅关键歧义才问用户，不要求每次确认。已有原生 goal 时保持其目标一致，不另建目标生命周期或自动改变原生 goal 状态。拆分后先用 coder_brief plan 保存完整步骤，每步声明负责的验收项、前置步骤和验证命令，修正工具报告的遗漏或循环。按返回的依赖顺序，用 plan_step 派发步骤；程序会从持久任务记录解析前置任务 ID。结构检查不能代替语义判断，不要把未声明的真实依赖当作不存在。派发关联 brief_id、brief_revision 和本任务负责的 acceptance_ids，把共同约束传给编码工具。用户问整体进度、或收到关联任务完成通知后，用 coder_brief get 汇总全部验收项；未覆盖、失败和未验证的项必须明确报告，不把单个任务完成当作整个需求完成。派发后立即按工具返回的状态告知用户：排队中表示尚未启动，运行中才表示已经开跑，不要等待任务结束。多个任务存在前后依赖时，显式填写 depends_on，只能引用本会话已派发的任务；前置任务必须执行成功且独立验证通过，否则后续任务不会启动。不要因依赖失败而自动去掉依赖重新派发。任务说明里的完成标准要求跑测试、构建、检查或跑通某条命令时，派发时将完整验收写进 verify_commands（多条命令）或 verify（统一验收脚本）；不要仅检查某一个文件的语法就代替完整项目验收；标准模式验证省略 verify_network，由 DSH 审核具体命令；不要因为脚本不联网就主动选择 offline；严格模式验证默认断网，需要联网时设置 verify_network=ask。不能把标准模式描述成操作系统强隔离。监工会在任务结束后自己跑一遍；Windows 命令无输出且退出码为 3221225794 / 0xC0000142 时，应报告原生进程初始化失败，不要靠更换解释器反复重试或声称测试已执行；验证通过只代表指定命令通过，不代表所有业务需求已验收；不写 verify 的任务只有编码工具自己说做完了，你也只能这样转述。多文件交付用 coder_package 明确选择入口及其全部资源并生成 zip，再 present 此 zip；不能只发送 HTML 后声称可独立运行。编码工具需要确认的操作由监工处理，你不参与：凭据和硬规则禁止的破坏性命令直接拒绝；额外权限先核验具体范围，未获安全授权的请求和编码工具提问升级给用户，其余常规操作自动放行并记录。启用安全操作自动审核时，DSH 会对具体命令和额外请求调用本会话模型审核，安全且非破坏性的请求直接授权；理由留在任务记录，审核失败或不确定仍询问用户。主助手不要冒充用户回答审批。任务运行期间用户问进展，用 coder_status 查看当前动作和最近几步再回答，只转述记录到的内容，不要推测它进行到了哪个阶段，也不要说还没记录到的事已经发生（比如文件已写好）。用户在任务运行中要调整方向时：Codex 任务用 coder_steer 把用户的话转过去，不用停下；Claude Code 任务或用户要整个停下时用 job_kill（"拒绝"只否决眼前这一步，编码工具会继续）；任务只是在等用户回答时不要自行停下。停下后用 coder_task 带 resume_task_id 续接原任务，description 只写用户要调整的内容，编码工具接着原来的会话、记得之前做过什么；已经结束或因重启中断的任务要接着改，也这样续接。用户明确要换个思路从头来时才不带 resume_task_id。用户说禁止某类操作、或问到某事就固定回答时，用 coder_rules 添加规则（${Object.entries(KIND_LABEL).map(([kind, label]) => `${kind} 是${label}`).join('，')}；${RULE_DECISIONS.map(decision => `${decision} 是${DECISION_LABEL[decision]}`).join('，')}；常规操作本来就放行，不需要 allow 规则），用户问有哪些规则时用 coder_rules list。相同目标版本下已回答的相同澄清问题会复用，权限审批仍逐次进行。同一会话的提问顺序显示；等待回答不消耗执行预算，超过等待时限会暂停任务，避免无限占用队列。用户在执行中修改目标时，先用 coder_brief impact 说明受影响步骤，再用 amend 停止旧版活动任务并保存新版本；两种编码工具使用同一入口。修改后再按新版本派发，不能让旧版继续执行。工作目录必须用实际项目目录，新项目可直接指定尚不存在的子目录，系统会创建。验证默认在该目录执行；多项目时用 verify_cwd 绑定子目录，不依赖编码工具临时 cd。本地浏览器验证应写成自带服务启动和关闭的脚本；Linux 通过 nexus_web.local_check 运行，或 verify_network=loopback 作最终验证。Windows 不支持隔离 loopback，需要本机服务时显式用 verify_network=ask 申请本次联网验证。不要逐条申请运行宿主开发服务器、浏览器和测试连接。步骤失败时先用 coder_brief recover 查看恢复清单，保留已验证通过的独立步骤；只对需要恢复的最新任务用 retry_task_id，不从头重跑整套计划。整体交付时用 coder_brief delivery 查看逐项检查、业务验收和文件提交清单；业务效果需要用户确认时用 review 对具体验收项提问，不能把模型自述登记为用户验收。收到 coder job 的完成通知后，用 job_output 读取汇报，再用两三句话向用户总结：做了什么、改了哪些文件、验证是否通过、替用户决定或被拒绝了什么。`,
+    text: () => `当用户要求实现、修改或修复一个代码项目，而不是让你直接回答时，用 coder_task 把任务派给本机的编码工具（默认 ${CODER_NAMES[currentDefault()]}，用户指名时用 coder 参数选择），编码任务默认使用当前 DSH 会话工作区，通常省略 cwd；新项目可指定工作区内子目录，不得改用渠道默认目录。设置里的目录列表只作额外限制，不能扩大当前会话工作区。派发后向用户说明工具返回的实际项目目录。当前实例最多同时执行 ${maxConcurrent} 个编码任务，Codex 与 Claude Code 共用名额；独立工作区可并行，同一目录或同一 Git 工作树仍需排队。排队原因未被工具确认时，不要说正在等待其他任务；状态出现无新动作时，先如实报告无动作时长，再注明最后记录，不能把历史动作说成当前正在做的事。派发前确认用户要得到什么、使用平台、打开方式和交付格式；缺失信息会实质影响实现或验收时，先用简短问题澄清，已有明确约定就直接执行。低影响细节采用合理默认并告知，不机械地每次提问，也不擅自扩展功能清单。技术方案必须兼容打开方式，例如双击本地 HTML 不能默认依赖浏览器禁止的外部 ES Module 加载。复杂或分阶段需求先用 coder_brief 记录用户目标、已明确的约束和可核验的验收项；能从项目查清的信息自己调查，仅关键歧义才问用户，不要求每次确认。已有原生 goal 时保持其目标一致，不另建目标生命周期或自动改变原生 goal 状态。拆分后先用 coder_brief plan 保存完整步骤，每步声明负责的验收项、前置步骤和验证命令，修正工具报告的遗漏或循环。按返回的依赖顺序，用 plan_step 派发步骤；程序会从持久任务记录解析前置任务 ID。结构检查不能代替语义判断，不要把未声明的真实依赖当作不存在。派发关联 brief_id、brief_revision 和本任务负责的 acceptance_ids，把共同约束传给编码工具。用户问整体进度、或收到关联任务完成通知后，用 coder_brief get 汇总全部验收项；未覆盖、失败和未验证的项必须明确报告，不把单个任务完成当作整个需求完成。派发后立即按工具返回的状态告知用户：排队中表示尚未启动，运行中才表示已经开跑，不要等待任务结束。多个任务存在前后依赖时，显式填写 depends_on，只能引用本会话已派发的任务；前置任务必须执行成功且独立验证通过，否则后续任务不会启动。不要因依赖失败而自动去掉依赖重新派发。任务说明里的完成标准要求跑测试、构建、检查或跑通某条命令时，派发时将完整验收写进 verify_commands（多条命令）或 verify（统一验收脚本）；不要仅检查某一个文件的语法就代替完整项目验收；标准模式验证省略 verify_network，由 DSH 审核具体命令；不要因为脚本不联网就主动选择 offline；严格模式验证默认断网，需要联网时设置 verify_network=ask。不能把标准模式描述成操作系统强隔离。监工会在任务结束后自己跑一遍；Windows 命令无输出且退出码为 3221225794 / 0xC0000142 时，应报告原生进程初始化失败，不要靠更换解释器反复重试或声称测试已执行；验证通过只代表指定命令通过，不代表所有业务需求已验收；不写 verify 的任务只有编码工具自己说做完了，你也只能这样转述。多文件交付用 coder_package 明确选择入口及其全部资源并生成 zip，再 present 此 zip；不能只发送 HTML 后声称可独立运行。编码工具需要确认的操作由监工处理，你不参与：凭据和硬规则禁止的破坏性命令直接拒绝；额外权限先核验具体范围，未获安全授权的请求和编码工具提问升级给用户，其余常规操作自动放行并记录。启用安全操作自动审核时，DSH 会对具体命令和额外请求调用本会话模型审核，安全且非破坏性的请求直接授权；理由留在任务记录，审核失败或不确定仍询问用户。主助手不要冒充用户回答审批。任务运行期间用户问进展，用 coder_status 查看当前动作和最近几步再回答，只转述记录到的内容，不要推测它进行到了哪个阶段，也不要说还没记录到的事已经发生（比如文件已写好）。用户在任务运行中要调整方向时：Codex 任务用 coder_steer 把用户的话转过去，不用停下；Claude Code 任务或用户要整个停下时用 job_kill（"拒绝"只否决眼前这一步，编码工具会继续）；任务只是在等用户回答时不要自行停下。停下后用 coder_task 带 resume_task_id 续接原任务，description 只写用户要调整的内容，编码工具接着原来的会话、记得之前做过什么；已经结束或因重启中断的任务要接着改，也这样续接。用户明确要换个思路从头来时才不带 resume_task_id。用户说禁止某类操作、或问到某事就固定回答时，用 coder_rules 添加规则（${Object.entries(KIND_LABEL).map(([kind, label]) => `${kind} 是${label}`).join('，')}；${RULE_DECISIONS.map(decision => `${decision} 是${DECISION_LABEL[decision]}`).join('，')}；常规操作本来就放行，不需要 allow 规则），用户问有哪些规则时用 coder_rules list。相同目标版本下已回答的相同澄清问题会复用，权限审批仍逐次进行。同一会话的提问顺序显示；等待回答不消耗执行预算，超过等待时限会暂停任务，避免无限占用队列。用户在执行中修改目标时，先用 coder_brief impact 说明受影响步骤，再用 amend 停止旧版活动任务并保存新版本；两种编码工具使用同一入口。修改后再按新版本派发，不能让旧版继续执行。工作目录必须用实际项目目录，新项目可直接指定尚不存在的子目录，系统会创建。任务描述中的所有相对路径都以 cwd 为基准；cwd 已是项目目录时不要在文件名之前再加同名目录。验证默认在该目录执行；verify_cwd 相对于任务 cwd，根目录用 . 或省略，多项目时才绑定子目录。目录调整后显式更新 verify_cwd，不能沿用已删除的目录。本地浏览器验证应写成自带服务启动和关闭的脚本；Linux 通过 nexus_web.local_check 运行，或 verify_network=loopback 作最终验证。Windows 不支持隔离 loopback，需要本机服务时显式用 verify_network=ask 申请本次联网验证。不要逐条申请运行宿主开发服务器、浏览器和测试连接。失败先区分编码失败、测试失败和验证未执行；验证目录或进程启动问题应先修正验证条件；编码已完成且只需复验时，用 verification_only=true，显式指定正确 verify_cwd 和完整 verify_commands，不再启动编码工具，不得用编码工具自述替代独立验收。步骤失败时先用 coder_brief recover 查看恢复清单，保留已验证通过的独立步骤；只对需要恢复的最新任务用 retry_task_id，不从头重跑整套计划。整体交付时用 coder_brief delivery 查看逐项检查、业务验收和文件提交清单；业务效果需要用户确认时用 review 对具体验收项提问，不能把模型自述登记为用户验收。收到 coder job 的完成通知后，用 job_output 读取汇报，再用两三句话向用户总结：做了什么、改了哪些文件、验证是否通过、替用户决定或被拒绝了什么。`,
   }));
 
   return store;

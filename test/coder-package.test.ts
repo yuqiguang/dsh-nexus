@@ -72,3 +72,22 @@ test('native packaging tool and present hook preserve owner, current workspace, 
     task.status = 'running'; await assert.rejects(tool.execute(args, exec), /已结束/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+
+test('resource parsing ignores import-shaped prose but retains executable imports and re-exports', () => {
+  const source = `
+    // import './comment.js';
+    const text = "from './quoted.js';";
+    const pattern = /from '.fake.js'/;
+    const template = \`import './template-text.js'\`;
+    import './real.js';
+    export { value } from './export.js';
+    export * from './all.js';
+    const lazy = import('./lazy.js');
+    const cjs = require('./cjs.js');
+    const nested = \`text \${import('./nested.js')}\`;
+  `;
+  assert.deepEqual(resourceReferences('test.mjs', source), ['./real.js', './export.js', './all.js', './lazy.js', './cjs.js', './nested.js']);
+  assert.deepEqual(resourceReferences('index.html', '<script type="importmap">{"imports":{"core":"./core.js"}}</script><script type="module">import "./app.js"</script>'), ['./app.js']);
+  assert.throws(() => resourceReferences('broken.js', 'import {'), /无法解析/);
+});

@@ -330,7 +330,7 @@ export class AgendaConnector {
       order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 5,
       text: () => !connector.current(generation) ? '' : [connector.nowText(),
         `日历与待办：用户的日程和待办由你用 calendar 和 todo 两个工具保管，不在别处。用户说“明天下午三点和张老师开会”“下周二上午十点去医院”就 calendar add；问“今天有什么安排”“这周排了什么”就 calendar list；说“记个待办”“周五前要交报告”就 todo add；说“报告交了”就 todo done。日期时间都换算成本地时间 YYYY-MM-DD HH:mm 再调用，含糊的（比如没说几点）先问一句。日程开始前和待办到期时系统会自动推送提醒，不要再为它们建 schedule_create 提醒。calendar 返回冲突时先告诉用户，用户坚持再带 force。`,
-        `固定时间重复的提醒也放进日历：用户说“每天七点半叫我起床”“每周一早上提醒我交周报”“每月 1 号提醒我交房租”，就 calendar add，repeat 选 daily、weekly 或 monthly，duration_minutes 给 0（只是一个时间点，不占时段、不算冲突），remind_minutes 给 0（到点提醒），title 写提醒时要说的话。系统到点推送，不经过你，也不会漏掉一天；不要用 schedule_create 一次一次地排下一次。`,
+        `日历的重复日程用 repeat daily、weekly 或 monthly；日历到点只发送已保存的提醒文字，不调用助理执行任务，也不出现在 DSH 自动化列表。需要助理定时执行工作的请求应使用当前会话可用的原生自动化工具，并将完整工作要求写入任务；不要把它保存成日历项后声称已安排自动执行。原生自动化工具不可用时如实说明，不能用日历通知代替。`,
       ].join('\n'),
     }));
   }

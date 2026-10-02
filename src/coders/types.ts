@@ -94,6 +94,8 @@ export interface TaskResult {
 }
 
 export interface TaskRecord {
+  /** Run only the registered supervisor checks; no coding agent is invoked. */
+  verificationOnly?: boolean;
   id: string;
   coder: CoderKind;
   description: string;

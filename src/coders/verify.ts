@@ -177,6 +177,7 @@ export async function changedFiles(cwd: string, baseline?: WorkTreeSnapshot, sig
 
 /** Run the user's verify command without a shell: the first word is the program, the rest are arguments. */
 export async function runVerifyCommand(command: string, cwd: string, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv): Promise<{ ok: boolean; output: string; executed?: boolean }> {
+  if (!await stat(cwd).then(info => info.isDirectory(), () => false)) return { ok: false, executed: false, output: `验证未执行：验证目录不存在或不可访问：${cwd}。verify_cwd 相对于任务 cwd；项目根目录请填写 .，不要重复项目目录名。` };
   let words: string[];
   try { words = process.platform === 'win32' ? windowsVerifyWords(command) : command.trim().split(/\s+/); }
   catch (error) { return { ok: false, executed: false, output: (error as Error).message }; }
@@ -202,7 +203,7 @@ export async function runVerifyCommand(command: string, cwd: string, signal?: Ab
     // Node's own `timeout` option leaks its timer when the program does not exist; keep the timer here and unref it.
     const timer = setTimeout(() => { timedOut = true; output += '\n[verify timed out]'; kill(); }, VERIFY_TIMEOUT_MS);
     timer.unref();
-    const settle = (result: { ok: boolean; output: string }) => {
+    const settle = (result: { ok: boolean; output: string; executed?: boolean }) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -216,7 +217,7 @@ export async function runVerifyCommand(command: string, cwd: string, signal?: Ab
     const brokenPipe = () => { streamFailed = true; output += '\n验证进程输出连接中断。'; kill(); };
     child.stdout.on('error', brokenPipe);
     child.stderr.on('error', brokenPipe);
-    child.on('error', error => settle({ ok: false, output: `${output}\n${error.message}`.trim() }));
+    child.on('error', error => settle({ ok: false, executed: !!child.pid, output: `${output}\n${child.pid ? '验证进程错误' : '验证未执行：进程启动失败'}：${error.message}`.trim() }));
     child.on('close', (code, signalName) => settle({ ok: code === 0 && !timedOut && !streamFailed && !signal?.aborted && taskProcessCleaned(child),
       output: !taskProcessCleaned(child) ? `${output}\n无法确认 Windows 验证进程已完全清理。` : code === 0 ? output : `${output}\n[exit ${code ?? signalName ?? 'unknown'}]`.trim() }));
   });

@@ -50,6 +50,9 @@ test('assistant prompt follows live capabilities and keeps file delivery and unt
   const nativeOnly = renderAssistantPrompt({ agenda: false, reminders: true });
   assert.match(nativeOnly, /schedule_create/);
   assert.doesNotMatch(nativeOnly, /放进日历/);
-  assert.match(nativeOnly, /没有启用日历/);
+  assert.match(nativeOnly, /固定时间重复任务不依赖日历组件/);
+  assert.match(nativeOnly, /daily.*08:00:00/);
+  assert.match(nativeOnly, /需要搜索、检查或生成内容的任务先完成工作再汇报/);
+  assert.match(nativeOnly, /DSH 自动化页面/);
   assert.ok(disabled.length < enabled.length);
 });

@@ -1,3 +1,4 @@
+import { parse } from 'acorn';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-sandbox-policy';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -19,11 +20,33 @@ export function resourceReferences(path: string, text: string): string[] {
       const match = /\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/i.exec(tag[0]);
       if (match) refs.push(match[1] ?? match[2] ?? match[3]!);
     }
-    for (const block of text.matchAll(/<(script|style)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi)) refs.push(...resourceReferences(block[1]!.toLowerCase() === 'script' ? 'inline.js' : 'inline.css', block[2]!));
+    for (const block of text.matchAll(/<(script|style)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi)) {
+      const script = block[1]!.toLowerCase() === 'script';
+      const type = /\btype\s*=\s*["']([^"']+)["']/i.exec(block[2]!)?.[1]?.toLowerCase();
+      if (script && type && !['module', 'text/javascript', 'application/javascript'].includes(type)) continue;
+      refs.push(...resourceReferences(script ? 'inline.js' : 'inline.css', block[3]!));
+    }
   } else if (/\.css$/i.test(path)) {
     for (const match of text.matchAll(/url\(\s*["']?([^\s"')]+)["']?\s*\)|@import\s+["']([^"']+)["']/gi)) refs.push(match[1] ?? match[2]!);
   } else if (/\.[cm]?js$/i.test(path)) {
-    for (const match of text.matchAll(/(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)["'](\.[^"']+)["']/g)) refs.push(match[1]!);
+    // Parse syntax rather than matching import-like words inside comments, regexes or strings.
+    let tree: unknown;
+    try { tree = parse(text, { ecmaVersion: 'latest', sourceType: 'module', allowReturnOutsideFunction: true }); }
+    catch { throw new Error(`无法解析 JavaScript 资源依赖：${path}；请检查语法或使用编译后的文件。`); }
+    const literal = (node: any): string | undefined => typeof node?.value === 'string' ? node.value
+      : node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0]?.value.cooked : undefined;
+    const visit = (node: any): void => {
+      if (!node || typeof node !== 'object') return;
+      const source = ['ImportDeclaration', 'ExportNamedDeclaration', 'ExportAllDeclaration', 'ImportExpression'].includes(node.type) ? node.source
+        : node.type === 'CallExpression' && node.callee?.type === 'Identifier' && node.callee.name === 'require' ? node.arguments[0] : undefined;
+      const value = literal(source);
+      if (value?.startsWith('.')) refs.push(value);
+      for (const child of Object.values(node)) {
+        if (Array.isArray(child)) child.forEach(visit);
+        else if (child && typeof child === 'object') visit(child);
+      }
+    };
+    visit(tree);
   }
   return [...new Set(refs.map(value => value.replace(/&amp;/g, '&')).filter(value => value && !/^(?:https?:|data:|blob:|\/\/|#)/i.test(value))
     .map(value => decodeURIComponent(value.split(/[?#]/)[0]!)).filter(Boolean))];

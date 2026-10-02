@@ -2,7 +2,7 @@
 
 Nexus 自有代码采用 [MIT License](LICENSE)。第三方代码、程序和服务仍适用各自的许可证与服务条款，不因本项目的许可证而被重新授权。
 
-以下版本依据 0.2.33 的 `package-lock.json` 及对应已安装包中的许可文件核对。完整依赖树由锁文件记录；升级依赖后应重新核对。
+以下版本依据 0.2.34 的 `package-lock.json` 及对应已安装包中的许可文件核对。完整依赖树由锁文件记录；升级依赖后应重新核对。
 
 ## 分发范围
 
@@ -18,6 +18,7 @@ Nexus 的 `.tgz` 安装包包含本项目编译后的插件、客户端界面、
 | `@modelcontextprotocol/sdk` | 1.30.0 | MIT |
 | `@npmcli/config` | 10.4.2 | ISC |
 | `@wecom/aibot-node-sdk` | 1.0.7 | MIT |
+| `acorn` | 8.15.0 | MIT |
 | `cacache` | 20.0.0 | ISC |
 | `imapflow` | 1.7.8 | MIT |
 | `jszip` | 3.10.1 | MIT OR GPL-3.0-or-later；本项目选择 MIT 选项 |

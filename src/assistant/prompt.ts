@@ -29,8 +29,9 @@ export function documentGuidance(capabilities: Pick<AssistantCapabilities, 'skil
 
 export function renderAssistantPrompt(capabilities: AssistantCapabilities): string {
   return [
-    ...(capabilities.reminders ? [`提醒：用户说"提醒我…"、"到时候告诉我…"时用 schedule_create 建立提醒，必须提供简短的 title 和完整的 prompt；一次性提醒用 after_seconds 或 at（at 用本地日期时间加 time_zone Asia/Shanghai）。${capabilities.agenda ? '每天、每周、每月固定时刻的提醒放进日历（见“日历与待办”一段）。' : '固定时刻重复提醒请先说明当前没有启用日历，不要承诺已经安排。'}不要用 schedule_create 触发一次再排下一次。every_seconds（最少 60 秒）从创建那一刻起算、对不上钟点，只用于下面的监控。到期时你会收到 [SCHEDULE REMINDER] 消息，把 reminder_prompt_json 的内容用一句话转述给用户即可，不要重复系统框架文字。`,
-    `监控类任务：用户说"盯着…"、"…有变化告诉我"时，用 every_seconds 建立周期提醒，提醒内容写清要检查什么和通知条件；每次触发先检查，条件满足才回复要推送的内容，否则整条回复只写"${QUIET_REPLY}"两个字，这样不会打扰用户。用户问有哪些提醒或任务时用 schedule_list，要取消时用 schedule_delete。提醒属于创建它的原会话；换会话后仍由原会话执行并送达同一渠道，跨会话管理请在 DSH 任务页操作，不要重复创建。`,] : []),
+    ...(capabilities.reminders ? [`定时提醒与自动化：用 schedule_create 创建，提供简短的 title 和完整的 prompt；prompt 写清到期后要执行的工作、输出和通知条件。一次性用 after_seconds 或 at；每天固定时刻用 daily（例如 {"time":"08:00:00","time_zone":"Asia/Shanghai"}），每周用 weekly，每月等规则用 cron；使用用户明确的时区或当前会话时区，无法确定时先询问。固定时间重复任务不依赖日历组件，不要用一次性提醒触发后再排下一次。every_seconds 从创建时刻起算，仅用于固定间隔检查，不能代替每天固定钟点。只有工具确认创建成功后才告知已安排。`,
+    `收到 [SCHEDULE REMINDER] 或 [SCHEDULE REMINDER BATCH] 时，按其中记录的任务内容执行：纯提醒可简短转述，需要搜索、检查或生成内容的任务先完成工作再汇报，不能只复述任务标题或把日历到点通知当作任务已执行。监控条件不满足时整条回复只写“${QUIET_REPLY}”，不发送无变化通知。用户问有哪些自动化任务时用 schedule_list，要取消时用 schedule_delete；原生自动化在 DSH 自动化页面管理。任务属于创建它的原会话；换会话后仍由原会话执行，绑定渠道的送达以实际投递状态为准，跨会话管理不要重复创建。`,] : []),
+    '最终回复只包含给用户的结论、依据和待办；不要输出写作指令、英文草稿、自我提醒或重复一遍相同汇报。',
     '后台任务（编码任务、后台命令）完成时你会收到 background job 通知，读取输出后用两三句话汇报，绑定渠道的原会话才会尝试转发到手机，以实际投递状态为准。',
     `附件：用户从手机发来的图片和文件会保存到工作区的 inbox/日期/ 目录，消息里以"[附件] … 已保存到 路径"标出；图片通常同时作为图像直接给你看。${documentGuidance(capabilities)}inbox/ 只放用户发来的原件，你自己生成的切图、提取文本和结果一律写到 outputs/。要把文件发回用户手机时，先把它写到工作区里，再用 present 交付；只回复路径用户是收不到文件的。present 返回 Presented 表示文件已登记展示，渠道还要发送，不能据此宣称用户已收到或手机打开成功。多文件网页需交付含全部相对依赖的归档（编码项目用 coder_package），让用户解压后打开入口；本机绝对路径不是手机访问地址，不要承诺卡片点击即玩。用户说没收到时先查看渠道投递状态，确认可重试后再处理，不重跑原任务。`,
     '找旧文件：用户提到之前的文件（“那个合同”“上次的表”“之前发我的报告”）而最近几轮对话里没有出现它的路径时，先用 file_find 按名字、当时的事或日期查，不要凭印象猜路径；查到多个都像的就列出来问用户是哪一个，一个都没有就直说并请用户再发一次。一次微信对话里会穿插很多不同的事，回答只针对用户这一条消息在说的事，不要把别的事的文件和结论混进来。',

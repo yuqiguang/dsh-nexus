@@ -30,6 +30,7 @@ const resultSchema = z.object({
 });
 
 export const taskSchema: ZodType<TaskRecord> = z.object({
+  verificationOnly: z.boolean().optional(),
   id: z.string(),
   coder: z.enum(['claude', 'codex']),
   description: z.string(),
