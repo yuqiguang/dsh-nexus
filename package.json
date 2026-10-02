@@ -1,6 +1,6 @@
 {
   "name": "dsh-nexus",
-  "version": "0.2.32",
+  "version": "0.2.33",
   "private": true,
   "type": "module",
   "exports": {
@@ -19,6 +19,7 @@
   "files": [
     "dist/src",
     "dist/client.js",
+    "dist/build-info.json",
     "cordis.patch.yml",
     "README.md",
     "locale/*.json",
@@ -126,7 +127,8 @@
     "jsdom": "26.1.0",
     "react-dom": "18.3.1",
     "typescript": "6.0.3",
-    "yaml": "2.9.1"
+    "yaml": "2.9.1",
+    "@deepseek-ai/dsh-plugin-manager": "0.2.0-rc.2"
   },
   "license": "MIT",
   "repository": {

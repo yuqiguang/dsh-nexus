@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { parse } from 'yaml';
 import { assistantPlugins, projectRoot, scheduleBundle } from './setup.mjs';
 import { renameProfile } from './rename-profile.mjs';
+import { ensureProfilePackage } from './profile-package.mjs';
 
 const exec = promisify(execFile);
 const root = join(projectRoot, '.nexus', 'smoke');
@@ -34,10 +35,11 @@ let peakRssMiB = 0;
 let minimumAvailableMiB = Infinity;
 const pluginRuntime = join(runRoot, 'plugin-runtime');
 const renameOnly = process.argv.includes('--rename-only');
+const sourcePackageOnly = process.argv.includes('--source-package-only');
 const legacyArgument = process.argv.indexOf('--legacy-package');
 const legacyPackage = legacyArgument === -1 ? undefined : process.argv[legacyArgument + 1];
 if (renameOnly && (!legacyPackage || legacyPackage.startsWith('--'))) throw new Error('--rename-only requires --legacy-package <0.2.31 tarball>');
-const pluginOnly = process.argv.includes('--plugin-only') || renameOnly;
+const pluginOnly = process.argv.includes('--plugin-only') || renameOnly || sourcePackageOnly;
 let currentPackage;
 const interactionOnly = process.argv.includes('--interaction-only');
 // A fixture inside this repo would itself activate dsh-nexus's client manifest after uninstall.
@@ -93,7 +95,19 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     await writeFile(join(activeProfile, 'package.json'), JSON.stringify({ private: true,
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', scheduleBundle], patchReload: 'startup' } } }));
     await writeFile(join(activeProfile, 'pnpm-workspace.yaml'), 'autoInstallPeers: false\nnodeLinker: hoisted\n');
-    await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', renameOnly ? legacyPackage : currentPackage,
+    if (sourcePackageOnly) {
+      await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([{ insert: [
+        { id: 'nexus-channels', name: pathToFileURL(join(projectRoot, 'dist/src/plugin.js')).href, config: { workspaceRoot: workspace, coderRoots: [workspace] } },
+        ...['memory', 'mail', 'agenda'].map(component => ({ id: `nexus-${component}`, disabled: true,
+          name: pathToFileURL(join(projectRoot, 'dist/src', component === 'memory' ? 'memory/plugin.js' : `connectors/${component}/plugin.js`)).href })),
+      ] }]));
+      assert.deepEqual(await ensureProfilePackage({ root: projectRoot, home: activeRuntime, offline: process.env.NEXUS_SMOKE_OFFLINE === '1' }),
+        { status: 'installed', converted: 4 });
+      const patch = parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8'));
+      assert.deepEqual(patch.find(row => row.id === 'nexus-channels').config, { workspaceRoot: workspace, coderRoots: [workspace] });
+      assert.ok(patch.every(row => !row.insert));
+      console.log('Source profile: four file entries converted to installed bundle overrides.');
+    } else await exec(process.execPath, ['--max-old-space-size=384', entry, 'plugin', '--profile', 'nexus', 'add', renameOnly ? legacyPackage : currentPackage,
       // The first run after a dependency change must fetch it into pnpm's store through a slow mirror; later runs reuse the store.
       '--ignore-scripts', '--network-concurrency=1', '--child-concurrency=1', ...(process.env.NEXUS_SMOKE_OFFLINE === '1' ? ['--offline'] : [])], { cwd: projectRoot, env, timeout: 900_000 });
     const installed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
@@ -125,6 +139,13 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
       { cwd: projectRoot, env, timeout: 60_000 });
     const removed = JSON.parse(await readFile(join(activeProfile, 'package.json'), 'utf8'));
     assert.ok(!removed.dsh.profile.bundles.includes('dsh-nexus'));
+  }
+  if (sourcePackageOnly && phase > 7) {
+    const before = await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8');
+    const preparation = await ensureProfilePackage({ root: projectRoot, home: activeRuntime, offline: true });
+    assert.deepEqual(preparation, { status: phase === 10 ? 'uninstalled' : 'current', converted: 0 });
+    assert.equal(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8'), before);
+    console.log(`Source profile restart ${phase}: component overrides and explicit uninstall respected.`);
   }
   const previousPatch = installedPlugin ? parse(await readFile(join(activeProfile, 'cordis.patch.yml'), 'utf8').catch(() => '[]')) ?? [] : [];
   const componentOverrides = previousPatch.filter(row => ['nexus-channels', 'nexus-documents', 'nexus-memory', 'nexus-mail', 'nexus-agenda'].includes(row.id) && !row.insert);

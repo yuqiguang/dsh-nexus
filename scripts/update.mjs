@@ -150,8 +150,9 @@ try {
     return true;
   };
 
-  // Build beside dist. The service keeps running the old dist, and a restart during the
-  // build (or the tests) still finds it. dist is replaced only after the tests pass.
+  // Build beside dist, including its immutable plugin.tgz. The source launcher installs
+  // that snapshot through DSH before starting the host; restoring dist.previous restores
+  // the package snapshot too. No package installation occurs before these tests pass.
   const staging = plan.action === 'build';
   if (staging) {
     log(`building ${plan.reason}`);

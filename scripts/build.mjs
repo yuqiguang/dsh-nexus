@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { rm, writeFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { projectRoot } from './setup.mjs';
+import { packBuild } from './pack-build.mjs';
 
 // The updater builds into dist.next and swaps it in only after the tests pass, so the
 // service can be restarted at any moment and still find a complete dist.
@@ -35,3 +36,5 @@ const commit = git(['rev-parse', 'HEAD']);
 await writeFile(`${projectRoot}/${outName}/build-info.json`, JSON.stringify({ commit: commit || undefined, subject: commit ? git(['log', '-1', '--format=%s']) : undefined,
   dirty: commit ? git(['status', '--porcelain', '--untracked-files=no']).length > 0 : undefined, builtAt: Date.now() }, null, 2) + '\n');
 console.log(`Channels settings client bundle built${commit ? ` from ${commit.slice(0, 7)}` : ''}.`);
+await packBuild(projectRoot, `${projectRoot}/${outName}`);
+console.log('Installable plugin snapshot prepared for the source service.');

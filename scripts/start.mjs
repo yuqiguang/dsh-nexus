@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { setup, projectRoot, runtimeHome } from './setup.mjs';
 import { networkNodeOptions } from './netflags.mjs';
 import { saveWebUrl, splitWebUrl } from './weburl.mjs';
+import { ensureProfilePackage } from './profile-package.mjs';
 
 await access(join(projectRoot, 'dist/client.js')).catch(() => {
   throw new Error('Run npm run build before starting Nexus.');
@@ -27,6 +28,9 @@ try {
   process.exit(1);
 }
 const paths = await setup();
+const prepared = await ensureProfilePackage({ root: projectRoot, home: runtimeHome,
+  offline: process.env.NEXUS_PACKAGE_OFFLINE === '1' });
+console.log(`nexus: profile package ${prepared.status}; converted ${prepared.converted} source entries`);
 const require = createRequire(import.meta.url);
 const manifestPath = require.resolve('@deepseek-ai/dsh/package.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
