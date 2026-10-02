@@ -24,7 +24,10 @@
     "locale/*.json",
     "locale/memory/*.json",
     "locale/mail/*.json",
-    "locale/agenda/*.json"
+    "locale/agenda/*.json",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
@@ -121,5 +124,14 @@
     "react-dom": "18.3.1",
     "typescript": "6.0.3",
     "yaml": "2.9.1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuqiguang/dsh-nexus.git"
+  },
+  "homepage": "https://github.com/yuqiguang/dsh-nexus#readme",
+  "bugs": {
+    "url": "https://github.com/yuqiguang/dsh-nexus/issues"
   }
 }
