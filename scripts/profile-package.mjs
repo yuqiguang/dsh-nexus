@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parse } from 'yaml';
@@ -83,13 +83,23 @@ export async function ensureProfilePackage({ root, home, offline = false, instal
   const dependency = manifest?.dependencies?.['dsh-nexus'];
   // A deliberate uninstall in the manager must not be undone at the next restart.
   if (state && !dependency && !converted.converted) return { status: 'uninstalled', converted: 0 };
-  const archive = join(root, 'dist', 'plugin.tgz');
-  const sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
+  const bytes = await readFile(join(root, 'dist', 'plugin.tgz'));
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
   const info = await json(join(root, 'dist', 'build-info.json'));
   if (!info || !Number.isFinite(info.builtAt)) throw new Error('missing_build_metadata');
   const installed = await json(join(profile, 'node_modules', 'dsh-nexus', 'dist', 'build-info.json'));
   const matches = state?.sha256 === sha256 && dependency && installed?.builtAt === info?.builtAt && installed?.commit === info?.commit;
   if (!matches) {
+    // Each content gets an immutable spec. Reusing dist/plugin.tgz as the dependency
+    // would let a package-manager cache hide a rebuild with the same package version.
+    const cache = join(home, 'packages');
+    const archive = join(cache, `${sha256}.tgz`);
+    await mkdir(cache, { recursive: true, mode: 0o700 });
+    try { await writeFile(archive, bytes, { flag: 'wx', mode: 0o600 }); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (createHash('sha256').update(await readFile(archive)).digest('hex') !== sha256) throw new Error('corrupt_package_cache');
+    }
     await install({ profile, home, root, archive, offline });
     const actual = await json(join(profile, 'node_modules', 'dsh-nexus', 'dist', 'build-info.json'));
     if (!info || actual?.builtAt !== info.builtAt || actual?.commit !== info.commit) throw new Error('installed_build_mismatch');

@@ -54,7 +54,9 @@ async function fixture(run: (value: any) => Promise<void>) {
   };
   await writeBuild('old');
   const installed: string[] = [];
-  const install = async () => {
+  const archives: string[] = [];
+  const install = async (options: { archive: string }) => {
+    archives.push(options.archive);
     const info = JSON.parse(await readFile(join(root, 'dist/build-info.json'), 'utf8'));
     installed.push(info.commit);
     const path = join(profile, 'node_modules/dsh-nexus/dist');
@@ -67,7 +69,7 @@ async function fixture(run: (value: any) => Promise<void>) {
     if (!existing) manifest.dsh.profile.bundles.push('dsh-nexus');
     await writeFile(file, JSON.stringify(manifest));
   };
-  try { await run({ root, home, profile, install, installed, writeBuild }); }
+  try { await run({ root, home, profile, install, installed, archives, writeBuild }); }
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
@@ -100,6 +102,8 @@ test('a changed build installs again; restoring the old build restores its packa
   await f.writeBuild('old');
   await ensureProfilePackage(f);
   assert.deepEqual(f.installed, ['old', 'new', 'old']);
+  assert.notEqual(f.archives[0], f.archives[1], 'a rebuild must use a different package spec');
+  assert.equal(f.archives[0], f.archives[2], 'rollback returns to the same immutable package');
   assert.equal(await readFile(join(f.profile, 'cordis.patch.yml'), 'utf8'), patch);
 }));
 
@@ -113,8 +117,8 @@ test('explicit uninstall is not reversed by source startup', async () => fixture
 
 test('a concurrent settings edit is never overwritten by the installer', async () => fixture(async (f) => {
   const changed = JSON.stringify([{ id: 'nexus-memory', disabled: true }]);
-  await assert.rejects(ensureProfilePackage({ ...f, install: async () => {
-    await f.install();
+  await assert.rejects(ensureProfilePackage({ ...f, install: async (options: any) => {
+    await f.install(options);
     await writeFile(join(f.profile, 'cordis.patch.yml'), changed);
   } }), /profile_changed_during_install/);
   assert.equal(await readFile(join(f.profile, 'cordis.patch.yml'), 'utf8'), changed);
