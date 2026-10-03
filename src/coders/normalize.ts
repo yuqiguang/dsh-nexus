@@ -113,13 +113,14 @@ export function codexCommandRequest(params: Record<string, unknown>, cwd: string
 }
 
 /** `item/fileChange/requestApproval`; paths and diff come from the matching `fileChange` item notification. */
-export function codexFileChangeRequest(params: Record<string, unknown>, paths: readonly string[], diff: string, cwd: string): CoderRequest {
+export function codexFileChangeRequest(params: Record<string, unknown>, paths: readonly string[], diff: string, cwd: string,
+  changes?: readonly { path: string; diff: string }[]): CoderRequest {
   const reason = text(params.reason);
   const grantRoot = text(params.grantRoot);
   const resolved = absoluteAll(cwd, paths);
   return { kind: 'file-write', tool: 'codex.fileChange', summary: `改动文件：${resolved.length ? resolved.map(path => clip(path, 80)).join('，') : '（未知路径）'}`,
     detail: [reason ? `Codex 说明：${reason}` : '', grantRoot ? `申请写入：${grantRoot}` : '', clip(diff, 1500)].filter(Boolean).join('\n'),
-    paths: [...resolved, ...absolute(cwd, grantRoot)], raw: params };
+    paths: [...resolved, ...absolute(cwd, grantRoot)], ...(changes ? { fileChanges: changes.map(change => ({ path: resolve(cwd, change.path), diff: change.diff })) } : {}), raw: params };
 }
 
 /** `item/tool/requestUserInput`: structured questions, answered by question id. */

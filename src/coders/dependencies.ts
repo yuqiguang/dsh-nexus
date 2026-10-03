@@ -12,7 +12,7 @@ export function dependencyIds(input: unknown, owner: string, get: (id: string) =
 
 export function dependencyPassed(task: TaskRecord): boolean {
   return task.status === 'completed' && task.result?.execution === 'completed' && task.result.verification === 'passed'
-    && task.result.verifyOk === true && task.result.outsideRoots.length === 0;
+    && task.result.verifyOk === true && (task.permissions?.securityMode === 'full' || task.result.outsideRoots.length === 0);
 }
 
 /** Wait before acquiring an execution slot; abort promptly without cancelling the prerequisites. */

@@ -11,6 +11,24 @@ import { CodersManager } from '../src/coders/manager.js';
 import { CoderSettingsStore, defaultSettings, redact, rootsInput, endpointUrl, coderConcurrency } from '../src/coders/settings.js';
 import type { CoderStore } from '../src/coders/store.js';
 import { MemoryRecords } from './helpers.js';
+import { DEFAULT_REVIEW_POLICY } from '../src/coders/review-policy.js';
+
+test('full access and review rules require settings saves and survive reopening without changing defaults', async () => {
+  const records = new MemoryRecords(), store = new CoderSettingsStore(records);
+  const initial = redact(await store.read());
+  assert.equal(initial.securityMode, 'standard');
+  assert.equal(initial.autoApproveSafe, true);
+  assert.deepEqual(initial.reviewPolicy, DEFAULT_REVIEW_POLICY);
+  const policy = { ...DEFAULT_REVIEW_POLICY, files: 'ask', instructions: '数据库迁移请询问我' };
+  await store.save(0, { securityMode: 'full', reviewPolicy: policy });
+  const saved = await new CoderSettingsStore(records).read();
+  assert.equal(saved.securityMode, 'full'); assert.deepEqual(saved.reviewPolicy, policy);
+  const kept = await store.save(1, { maxTaskMinutes: 30 });
+  assert.equal(kept.securityMode, 'full'); assert.deepEqual(kept.reviewPolicy, policy);
+  await assert.rejects(store.save(2, { reviewPolicy: { files: 'allow-all' } }), /invalid_configuration/);
+  await assert.rejects(store.save(1, { securityMode: 'standard' }), /configuration_changed/);
+  assert.equal((await store.read()).securityMode, 'full');
+});
 
 test('coder settings validate input, keep secrets on empty fields, redact them in views, and check revisions', async () => {
   const store = new CoderSettingsStore(new MemoryRecords());

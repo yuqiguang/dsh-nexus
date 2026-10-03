@@ -43,5 +43,8 @@ export function pythonImports(source: string): { imports: PythonImport[]; dynami
 
 /** Match module entry points even inside an outer PowerShell or shell command. */
 export function pythonModuleCommands(command: string): string[] {
-  return [...command.matchAll(/\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?["']?\s+(?:-[IBEsSu]+\s+)*-m\s+([A-Za-z_]\w*(?:\.\w+)*)/gi)].map(match => match[1]!);
+  const modules = [...command.matchAll(/\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?["']?\s+(?:(?:-[IBEsSu]+|-[XW]\s+[^\s]+)\s+)*-m\s+([A-Za-z_]\w*(?:\.\w+)*)/gi)].map(match => match[1]!);
+  // Common subprocess argv form. This only locates more evidence, never executes it or grants permission.
+  for (const match of command.matchAll(/(?:\bsys\.executable|["'][^"'\r\n]*\bpython(?:\d+(?:\.\d+)*)?(?:\.exe)?["'])\s*,\s*["']-m["']\s*,\s*["']([A-Za-z_]\w*(?:\.\w+)*)["']/g)) modules.push(match[1]!);
+  return [...new Set(modules)];
 }

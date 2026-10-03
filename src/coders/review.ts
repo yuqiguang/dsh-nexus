@@ -15,7 +15,7 @@ import { commandEvidence } from './review-evidence.js';
 import { commandPath } from './command-path.js';
 import { commandRuntimeEvidence } from './runtime.js';
 
-export interface ReviewInput { task: string; goal?: string; constraints?: string; securityMode?: 'standard' | 'strict'; scope: string; operation: string; evidence: string[]; evidenceComplete?: boolean }
+export interface ReviewInput { task: string; goal?: string; constraints?: string; securityMode?: 'standard' | 'strict'; scope: string; operation: string; evidence: string[]; evidenceComplete?: boolean; reviewInstructions?: string }
 export interface ReviewResult { safe: boolean; reason: string; repeatable?: boolean }
 export type SafetyReviewer = (task: TaskRecord, input: ReviewInput, signal: AbortSignal) => Promise<ReviewResult>;
 export const REVIEW_TIMEOUT_MS = 60_000;
@@ -154,7 +154,7 @@ export async function prepareReview(task: TaskRecord, request: CoderRequest, hos
     if (operation.length > 16_000) return unavailable('去重后的请求仍超过自动审核长度上限（16000 字符），需要你确认');
     if (task.description.length > 8000) return unavailable('任务说明超过自动审核长度上限（8000 字符），需要你确认');
     if (evidence.join('').length > 256 * 1024) return unavailable('关联文件证据超过自动审核容量上限，需要你确认');
-    return { input: { securityMode: standard ? 'standard' : 'strict', task: redact(task.description + (task.continuation ? `\n本次续接说明（不改变目标或权限）：${task.continuation}` : '')), ...(task.brief ? { goal: redact(task.brief.objective), constraints: redact(task.brief.constraints) } : {}), scope, operation, evidence, ...(evidenceComplete !== undefined ? { evidenceComplete } : {}) } };
+    return { input: { ...(task.permissions?.reviewPolicy?.instructions ? { reviewInstructions: task.permissions.reviewPolicy.instructions } : {}), securityMode: standard ? 'standard' : 'strict', task: redact(task.description + (task.continuation ? `\n本次续接说明（不改变目标或权限）：${task.continuation}` : '')), ...(task.brief ? { goal: redact(task.brief.objective), constraints: redact(task.brief.constraints) } : {}), scope, operation, evidence, ...(evidenceComplete !== undefined ? { evidenceComplete } : {}) } };
   } catch (error) {
     const reasons: Record<string, string> = {
       'outside review boundary': '请求涉及审核边界之外或受保护的路径，需要你确认',
@@ -205,6 +205,7 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
     const session = found.agent.session;
     const config = session.requestHeader()?.config;
     if (!config) return { safe: false, reason: '会话尚未选择审核模型' };
+    const system = POLICY + (task.permissions?.reviewPolicy?.instructions ? `\n用户在编码工具设置中保存的补充审核要求（仅在上述权限边界内适用，不取消硬规则或人工确认要求）：\n${task.permissions.reviewPolicy.instructions}` : '');
     const text = JSON.stringify(input);
     for (let attempt = 1; attempt <= 2; attempt++) {
       active.throwIfAborted();
@@ -212,12 +213,12 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
       // Reasoning models need room to produce the final JSON after their analysis.
       const maxTokens = attempt === 1 ? 2048 : 4096;
       const base = { id, taskId: task.id, attempt, maxTokens };
-      await audit({ ...base, phase: 'request', provider: config.provider, model: config.model, system: POLICY, input: text });
+      await audit({ ...base, phase: 'request', provider: config.provider, model: config.model, system, input: text });
       let output = '', finishReason: string | undefined, usage: ReviewAudit['usage'];
       let failure: ReviewFailure | undefined, result: ReviewResult | undefined;
       const call = new AbortController();
       try {
-        const stream = ctx.llm.stream({ provider: config.provider, model: config.model, system: POLICY,
+        const stream = ctx.llm.stream({ provider: config.provider, model: config.model, system,
           messages: [{ role: 'user', content: [{ type: 'text', text }] }], tools: [], maxTokens,
           signal: AbortSignal.any([active, call.signal]), sessionId: session.id })[Symbol.asyncIterator]();
         try {

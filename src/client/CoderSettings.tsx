@@ -3,6 +3,7 @@ import type { CodersView, CoderStatusView } from '../coders/manager.js';
 import type { InstallProgress, InstallStatus } from '../coders/install.js';
 import { MANAGED_PACKAGES, isManagedVersion } from '../coders/install-shared.js';
 import { explain } from './ChannelSettings.js';
+import { DEFAULT_REVIEW_POLICY, type CoderReviewPolicy } from '../coders/review-policy.js';
 
 export interface CoderNavigation { openTask(id: string): void }
 
@@ -34,14 +35,15 @@ const problems: Record<string, string> = { binary_missing: '缺少可执行文�
 interface VersionDraft { managedVersion: string; versionChoice: 'recommended' | 'custom' }
 
 interface Draft {
-  revision: number; defaultCoder: 'codex' | 'claude'; roots: string; maxTaskMinutes: number; maxConcurrent: number; autoApproveSafe: boolean; securityMode: 'standard' | 'strict'; allowedNetworkDomains: string;
+  revision: number; defaultCoder: 'codex' | 'claude'; roots: string; maxTaskMinutes: number; maxConcurrent: number; autoApproveSafe: boolean; securityMode: 'standard' | 'strict' | 'full'; allowedNetworkDomains: string;
+  reviewPolicy: CoderReviewPolicy;
   codex: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; wireApi: 'responses' | 'chat'; apiKey: string };
   claude: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; authHeader: 'auth-token' | 'api-key'; token: string };
 }
 
 function fromView(view: CodersView): Draft {
   const { settings } = view;
-  return { securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, roots: (settings.roots ?? []).join('\n'), maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: settings.maxConcurrent ?? 2, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: (settings.allowedNetworkDomains ?? ['registry.npmjs.org']).join('\n'),
+  return { reviewPolicy: { ...DEFAULT_REVIEW_POLICY, ...settings.reviewPolicy }, securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, roots: (settings.roots ?? []).join('\n'), maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: settings.maxConcurrent ?? 2, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: (settings.allowedNetworkDomains ?? ['registry.npmjs.org']).join('\n'),
     codex: { managedVersion: settings.codex.managedVersion ?? '', versionChoice: settings.codex.managedVersion ? 'custom' : 'recommended', source: settings.codex.source, model: settings.codex.model ?? '', baseUrl: settings.codex.baseUrl ?? '', wireApi: settings.codex.wireApi ?? 'responses', apiKey: '' },
     claude: { managedVersion: settings.claude.managedVersion ?? '', versionChoice: settings.claude.managedVersion ? 'custom' : 'recommended', source: settings.claude.source, model: settings.claude.model ?? '', baseUrl: settings.claude.baseUrl ?? '', authHeader: settings.claude.authHeader, token: '' } };
 }
@@ -213,7 +215,7 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
     event.preventDefault();
     if (invalidVersion || stale) return;
     const { codex, claude } = draft;
-    if (await action('save', { revision: draft.revision, config: { defaultCoder: draft.defaultCoder, securityMode: draft.securityMode, roots: draft.roots, maxTaskMinutes: draft.maxTaskMinutes, maxConcurrent: draft.maxConcurrent, autoApproveSafe: draft.autoApproveSafe, allowedNetworkDomains: draft.allowedNetworkDomains,
+    if (await action('save', { revision: draft.revision, config: { defaultCoder: draft.defaultCoder, securityMode: draft.securityMode, reviewPolicy: draft.reviewPolicy, roots: draft.roots, maxTaskMinutes: draft.maxTaskMinutes, maxConcurrent: draft.maxConcurrent, autoApproveSafe: draft.autoApproveSafe, allowedNetworkDomains: draft.allowedNetworkDomains,
       codex: { managedVersion: codex.versionChoice === 'custom' ? codex.managedVersion.trim() : '', source: codex.source, model: codex.model, baseUrl: codex.baseUrl, wireApi: codex.wireApi, ...(codex.apiKey ? { apiKey: codex.apiKey } : {}) },
       claude: { managedVersion: claude.versionChoice === 'custom' ? claude.managedVersion.trim() : '', source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
   };
@@ -252,21 +254,42 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           {[1, 2, 3, 4].map(limit => <option key={limit} value={limit}>{limit}{limit === 2 ? '（推荐）' : ''}</option>)}</select>
         <p className="nexus-channel-hint">Codex 和 Claude Code 共用此上限。独立工作区可并行，同一目录或同一 Git 工作树仍排队；有依赖的任务等待前置验证。保存后立即生效，调低上限不终止正在执行的任务。</p>
         <label htmlFor="coders-security">派发模式（新任务生效）</label>
-        <select id="coders-security" value={draft.securityMode} disabled={busy} onChange={event => edit(d => ({ ...d, securityMode: event.target.value as Draft['securityMode'] }))}>
-          <option value="standard">标准：由 DSH 审核命令和额外权限</option><option value="strict">严格：要求原生沙箱隔离</option></select>
-        <p className="nexus-channel-hint">标准模式允许联网，由 DSH 判断具体操作是否安全；Claude 命令没有操作系统文件隔离。严格模式要求沙箱可用，Claude 在原生 Windows 下不可用。已有任务续接保持原模式。</p>
+        <select id="coders-security" value={draft.securityMode === 'standard' && !draft.autoApproveSafe ? 'manual' : draft.securityMode} disabled={busy} onChange={event => {
+          const mode = event.target.value;
+          edit(d => ({ ...d, securityMode: mode === 'manual' ? 'standard' : mode as Draft['securityMode'], autoApproveSafe: mode === 'manual' ? false : mode === 'standard' ? true : d.autoApproveSafe }));
+        }}>
+          <option value="standard">自动审核（推荐）：DSH 审核命令和额外权限</option>
+          <option value="manual">手动确认：命令和额外权限询问我</option>
+          <option value="strict">严格模式：要求原生沙箱隔离</option>
+          <option value="full">完全权限：关闭沙箱和执行审批</option></select>
+        {draft.securityMode === 'full'
+          ? <p className="nexus-channel-hint">完全权限以当前系统用户权限执行：可读写项目外文件、访问网络、运行发布和系统命令；关闭 Codex / Claude 执行沙箱、DSH 执行审批及拦截规则，不自动提升为管理员。目标澄清、任务取消、运行时限和渠道身份绑定仍生效。保存后仅新任务采用，已有任务续接保持原权限。</p>
+          : <p className="nexus-channel-hint">自动审核和手动确认均使用标准模式，允许命令联网；Claude 命令没有操作系统文件隔离。严格模式要求沙箱可用，Claude 在原生 Windows 下不可用。已有任务续接保持原模式及审核规则。</p>}
         <label htmlFor="coders-roots">限制可用的工作目录（每行一个绝对路径，留空跟随当前会话工作区）</label>
         <textarea id="coders-roots" rows={3} value={draft.roots} disabled={busy} placeholder="留空即可使用新建会话时选择的工作区"
           onChange={event => edit(d => ({ ...d, roots: event.target.value }))} />
-        <p className="nexus-channel-hint">{view.settings.roots?.length || view.restrictRoots ? `附加目录限制：${view.effectiveRoots.join('、')}。` : '默认跟随当前 DSH 会话工作区。'}任务只能使用当前工作区及其子目录；这里的限制不会扩大工作区，也不会将文件改写到渠道目录。每个任务默认只写自己的目录。</p>
+        <p className="nexus-channel-hint">{view.settings.roots?.length || view.restrictRoots ? `附加目录限制：${view.effectiveRoots.join('、')}。` : '默认跟随当前 DSH 会话工作区。'}任务起始目录只能选择当前工作区及其子目录；这里的限制不会扩大工作区，也不会将文件改写到渠道目录。{draft.securityMode === 'full' ? '完全权限运行后可访问目录之外，此设置不构成执行隔离。' : '每个任务的文件工具默认只写自己的目录。'}</p>
         <label htmlFor="coders-network">命令联网允许域名（每行一个，不含协议或通配符）</label>
-        <textarea id="coders-network" rows={2} value={draft.allowedNetworkDomains} disabled={busy} onChange={event => edit(d => ({ ...d, allowedNetworkDomains: event.target.value }))} />
-        <p className="nexus-channel-hint">网页搜索和读取优先通过 DSH 只读服务，不受命令域名名单限制；访问私网、携带网页认证等仍会被安全读取器拒绝。标准模式的命令允许联网，由 DSH 审核用途和影响，域名名单不构成网络隔离。严格模式下，Claude 命令仅能访问名单内域名，Codex 的具体域名请求可匹配名单；修改后新建任务生效，续接不会扩大权限。</p>
-        <label><input type="checkbox" checked={draft.autoApproveSafe} disabled={busy} onChange={event => edit(d => ({ ...d, autoApproveSafe: event.target.checked }))} /> 安全操作由 DSH 自动审核</label>
-        <p className="nexus-channel-hint">标准模式下，DSH 审核具体命令、项目依赖安装和额外文件操作，安全且与任务有关时自动批准并记录理由；不确定或审核失败时询问你。关闭后命令和额外权限交给你确认。凭据和明确的破坏性操作仍受限制。</p>
+        <textarea id="coders-network" rows={2} value={draft.allowedNetworkDomains} disabled={busy || draft.securityMode === 'full'} onChange={event => edit(d => ({ ...d, allowedNetworkDomains: event.target.value }))} />
+        <p className="nexus-channel-hint">标准模式的命令允许联网，域名名单不构成网络隔离。严格模式下，Claude 命令仅能访问名单内域名，Codex 的具体域名请求可匹配名单；手动确认规则优先。完全权限不使用此名单。DSH 网页服务仍遵循其只读访问限制。</p>
+        {draft.securityMode === 'strict' && <label><input type="checkbox" checked={draft.autoApproveSafe} disabled={busy} onChange={event => edit(d => ({ ...d, autoApproveSafe: event.target.checked }))} /> 安全操作由 DSH 自动审核</label>}
+        <fieldset disabled={busy || draft.securityMode === 'full' || !draft.autoApproveSafe}>
+          <legend>DSH 审核规则</legend>
+          {(['commands', 'files', 'network'] as const).map(key => <div key={key}>
+            <label htmlFor={`coders-review-${key}`}>{({ commands: '命令审批', files: '额外文件权限', network: '独立网络请求审批' })[key]}</label>
+            <select id={`coders-review-${key}`} value={draft.reviewPolicy[key]} onChange={event => edit(d => ({ ...d, reviewPolicy: { ...d.reviewPolicy, [key]: event.target.value as 'auto' | 'ask' } }))}>
+              <option value="auto">DSH 自动审核，不确定时询问</option><option value="ask">始终人工确认</option>
+            </select>
+          </div>)}
+          <label htmlFor="coders-review-instructions">补充审核要求（可选，最多 4000 字）</label>
+          <textarea id="coders-review-instructions" rows={3} maxLength={4000} value={draft.reviewPolicy.instructions}
+            placeholder="例如：涉及数据库结构修改时交给我确认。请勿填写密钥。"
+            onChange={event => edit(d => ({ ...d, reviewPolicy: { ...d.reviewPolicy, instructions: event.target.value } }))} />
+        </fieldset>
+        <p className="nexus-channel-hint">规则只用于需要审批的操作，项目内常规读写不逐次提问；独立网络规则不限制命令内部联网。自动审核仍受硬规则和明确拒绝规则约束，补充要求不能取消这些限制；证据不足或审核失败时询问你。完全权限跳过上述审批与拦截规则。规则保存在每个新任务中，续接沿用原规则。</p>
         <label htmlFor="coders-budget">每次运行时限（分钟，1–240；到期暂停，可续接）</label>
         <input id="coders-budget" type="number" min={1} max={240} value={draft.maxTaskMinutes} disabled={busy} onChange={event => edit(d => ({ ...d, maxTaskMinutes: Number(event.target.value) }))} />
-        <p className="nexus-channel-hint">无人值守开发：任务目录内写入，额外权限由监工逐次判断，范围不明时询问；同一拒绝累计三次或同一操作连续失败三次暂停；成功操作清零失败计数。Codex 保留工作目录写入沙箱；标准模式的 Claude 使用工具审批。审批不能约束任意脚本内部的全部行为，不等同于系统沙箱。续接沿用原任务权限。</p>
+        <p className="nexus-channel-hint">运行时限和连续失败暂停适用于所有模式。续接沿用原任务权限；切换模式后请新建任务。显式指定的离线或回环验证仍需相应隔离环境，完全权限不会取消该验证约定。</p>
       </article>
       <article className="nexus-channel-card">
         <header><h3>Codex</h3><Status status={view.codex} /></header>

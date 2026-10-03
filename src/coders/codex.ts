@@ -49,6 +49,11 @@ type JsonRpc = { jsonrpc?: string; id?: number | string; method?: string; params
 export function threadPolicyDrift(response: { approvalPolicy?: unknown; sandbox?: unknown }, expected?: TaskPermissions): string | undefined {
   // The request uses kebab-case (`workspace-write`); the echoed settings use camelCase (`workspaceWrite`). Compare shape-insensitively.
   const same = (value: unknown, expected: string) => typeof value === 'string' && value.toLowerCase().replace(/[-_]/g, '') === expected.replace(/-/g, '');
+  if (expected?.securityMode === 'full') {
+    const sandbox = response.sandbox;
+    const type = sandbox && typeof sandbox === 'object' ? (sandbox as { type?: unknown }).type : sandbox;
+    return same(response.approvalPolicy, 'never') && same(type, 'danger-full-access') ? undefined : '未确认完全权限策略（never / dangerFullAccess）';
+  }
   const problems: string[] = [];
   if (response.approvalPolicy !== undefined && response.approvalPolicy !== null && !same(response.approvalPolicy, 'untrusted')) problems.push(`approvalPolicy=${JSON.stringify(response.approvalPolicy)}`);
   const sandbox = response.sandbox;
@@ -106,6 +111,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   const itemPaths = new Map<string, string[]>();
   const itemDiffs = new Map<string, string>();
+  const itemChanges = new Map<string, { path: string; diff: string }[]>();
   let lastAssistant = '';
   let turnText = '';
   let turnItems: unknown[] = [];
@@ -138,7 +144,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   async function startTurn(text: string): Promise<void> {
     turnText = '';
     turnItems = [];
-    const result = await send('turn/start', { threadId, input: [{ type: 'text', text }], ...(task.permissions ? { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite', writableRoots: task.permissions.writableRoots, networkAccess: task.permissions.securityMode === 'standard', excludeTmpdirEnvVar: true, excludeSlashTmp: true } } : {}) }) as { turn?: { id?: string } };
+    const result = await send('turn/start', { threadId, input: [{ type: 'text', text }], ...(task.permissions?.securityMode === 'full' ? { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } : task.permissions ? { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite', writableRoots: task.permissions.writableRoots, networkAccess: task.permissions.securityMode === 'standard', excludeTmpdirEnvVar: true, excludeSlashTmp: true } } : {}) }) as { turn?: { id?: string } };
     turnId = result?.turn?.id;
     turnAbort = new AbortController();
     turnActive = true;
@@ -156,7 +162,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
       }
       case 'item/fileChange/requestApproval': {
         const itemId = String(params.itemId ?? '');
-        const decision = await deps.decide(codexFileChangeRequest(params, itemPaths.get(itemId) ?? [], itemDiffs.get(itemId) ?? '', task.cwd), signal);
+        const decision = await deps.decide(codexFileChangeRequest(params, itemPaths.get(itemId) ?? [], itemDiffs.get(itemId) ?? '', task.cwd, itemChanges.get(itemId)), signal);
         respond(id, { decision: decision.behavior === 'allow' ? 'accept' : decision.interrupt ? 'cancel' : 'decline' });
         return;
       }
@@ -194,6 +200,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         if (item.type === 'fileChange') {
           itemPaths.set(item.id, (item.changes ?? []).flatMap(change => change.path ? [change.path] : []));
           itemDiffs.set(item.id, (item.changes ?? []).map(change => `--- ${change.path}\n${change.diff ?? ''}`).join('\n'));
+          itemChanges.set(item.id, (item.changes ?? []).flatMap(change => typeof change.path === 'string' && typeof change.diff === 'string' ? [{ path: change.path, diff: change.diff }] : []));
         }
         if (message.method === 'item/started') {
           const step = codexStep(item, task.cwd);
@@ -267,7 +274,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   const done = (async (): Promise<JobOutcome> => {
     try {
       const launch = deps.launch ?? { command: 'codex', env: globalThis.process.env };
-      process = (deps.spawn ?? spawnCodexAppServer)(task.cwd, deps.research ? { ...launch, env: { ...launch.env, [RESEARCH_TOKEN_ENV]: deps.research.token } } : launch);
+      process = (deps.spawn ?? spawnCodexAppServer)(task.cwd, { ...launch, fullAccess: task.permissions?.securityMode === 'full', ...(deps.research ? { env: { ...launch.env, [RESEARCH_TOKEN_ENV]: deps.research.token } } : {}) });
     } catch (error) {
       return { status: 'failed', detail: `无法启动 codex app-server：${(error as Error)?.message ?? String(error)}`, result: '' };
     }
@@ -296,12 +303,12 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
     const session = (async () => {
       await send('initialize', { clientInfo: { name: 'dsh-nexus', version: '0.1.0' }, capabilities: {} });
       notify('initialized');
-      if (globalThis.process.platform === 'win32') {
+      if (globalThis.process.platform === 'win32' && task.permissions?.securityMode !== 'full') {
         if (task.permissions?.securityMode !== 'standard') await requireWindowsFirewall();
         const readiness = await send('windowsSandbox/readiness', {}) as { status?: string };
         if (readiness.status !== 'ready') throw new Error('Windows 增强沙箱未就绪，请先在编码工具设置中配置沙箱。');
       }
-      const policy = { cwd: task.cwd, approvalPolicy: 'untrusted', sandbox: 'workspace-write', ...(deps.model ? { model: deps.model } : {}), ...(task.permissions ? { config: { ...(deps.research ? { 'mcp_servers.nexus_web': { url: deps.research.url, bearer_token_env_var: RESEARCH_TOKEN_ENV, enabled: true, startup_timeout_sec: 15, tool_timeout_sec: 130 } } : {}), web_search: task.permissions.webResearch ? 'live' : 'disabled', 'sandbox_workspace_write.network_access': task.permissions.securityMode === 'standard', 'sandbox_workspace_write.writable_roots': task.permissions.writableRoots, 'sandbox_workspace_write.exclude_tmpdir_env_var': true, 'sandbox_workspace_write.exclude_slash_tmp': true, 'shell_environment_policy.exclude': ['*TOKEN*', '*SECRET*', '*PASSWORD*', '*KEY*', '*AUTH*', '*PROXY*', 'DSH_*'] } } : {}) };
+      const policy = { cwd: task.cwd, approvalPolicy: task.permissions?.securityMode === 'full' ? 'never' : 'untrusted', sandbox: task.permissions?.securityMode === 'full' ? 'danger-full-access' : 'workspace-write', ...(deps.model ? { model: deps.model } : {}), ...(task.permissions ? { config: { ...(deps.research ? { 'mcp_servers.nexus_web': { url: deps.research.url, bearer_token_env_var: RESEARCH_TOKEN_ENV, enabled: true, startup_timeout_sec: 15, tool_timeout_sec: 130 } } : {}), web_search: task.permissions.webResearch ? 'live' : 'disabled', 'sandbox_workspace_write.network_access': task.permissions.securityMode === 'standard', 'sandbox_workspace_write.writable_roots': task.permissions.writableRoots, 'sandbox_workspace_write.exclude_tmpdir_env_var': true, 'sandbox_workspace_write.exclude_slash_tmp': true, 'shell_environment_policy.exclude': ['*TOKEN*', '*SECRET*', '*PASSWORD*', '*KEY*', '*AUTH*', '*PROXY*', 'DSH_*'] } } : {}) };
       // A task that continues another resumes its thread under the same policies; the history stays on Codex's side.
       const method = task.coderSessionId ? 'thread/resume' : 'thread/start';
       const started = await send(method, task.coderSessionId ? { threadId: task.coderSessionId, excludeTurns: true, ...policy } : policy) as

@@ -1,3 +1,4 @@
+import type { CoderReviewPolicy } from './review-policy.js';
 import { requireWindowsFirewall } from './windows-firewall.js';
 import { taskStatusLabel } from './status.js';
 import { windowsSandbox, type WindowsSandboxStatus } from './windows-sandbox.js';
@@ -58,6 +59,7 @@ export interface EffectiveRuntime {
   maxTaskMinutes?: number;
   autoApproveSafe?: boolean;
   securityMode?: CoderSecurityMode;
+  reviewPolicy?: CoderReviewPolicy;
   allowedNetworkDomains?: string[];
   roots: string[];
   defaultCoder: CoderKind;
@@ -86,7 +88,7 @@ const SLOW_MS = 2_000;
 
 /** Do not advertise an installed tool as safe to dispatch before its isolation is supported. */
 export function coderPlatformProblem(coder: CoderKind, platform: NodeJS.Platform, securityMode: CoderSecurityMode = 'strict'): string | undefined {
-  if (platform !== 'win32' || securityMode === 'standard') return undefined;
+  if (platform !== 'win32' || securityMode !== 'strict') return undefined;
   return coder === 'claude'
     ? 'Claude Code 可以安装，但其命令沙箱不支持原生 Windows。严格模式不能派发；可选择标准模式由 DSH 审核命令，或在 WSL2 / Linux 实例使用严格模式。'
     : undefined;
@@ -272,7 +274,7 @@ export class CodersManager {
       if (codexPick.active === 'managed') await this.ensureCodexHome(settings);
       codex = { command: detection.codex[codexPick.active].path!, env: this.codexEnv(settings, codexPick.active), source: codexPick.active,
         ...(settings.codex.model && codexPick.active === 'system' ? { model: settings.codex.model } : {}) };
-      const sandboxProblem = platform === 'win32' ? this.settingUpSandbox ? 'Windows 沙箱正在配置，请稍候。' : await this.checkWindowsSandbox(codex.command, codex.env) : undefined;
+      const sandboxProblem = platform === 'win32' && securityMode !== 'full' ? this.settingUpSandbox ? 'Windows 沙箱正在配置，请稍候。' : await this.checkWindowsSandbox(codex.command, codex.env) : undefined;
       const firewallProblem = platform === 'win32' && securityMode === 'strict' && !sandboxProblem ? await requireWindowsFirewall().then(() => undefined, () => '严格模式需要有效的 Windows 防火墙网络隔离；请配置防火墙，或为新任务选择标准模式。') : undefined;
       if (firewallProblem) codex = { error: firewallProblem };
       else if (sandboxProblem) codex = { error: sandboxProblem };
@@ -294,7 +296,7 @@ export class CodersManager {
         ...(claudePick.active === 'system' && detection.claude.system.executable ? { executable: detection.claude.system.executable } : {}),
         env: this.claudeEnv(settings), source: claudePick.active, ...(settings.claude.model ? { model: settings.claude.model } : {}) };
     }
-    return { securityMode, roots, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: settings.allowedNetworkDomains, codex, claude };
+    return { securityMode, reviewPolicy: settings.reviewPolicy, roots, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: settings.allowedNetworkDomains, codex, claude };
   }
 
   private lastTask(coder: CoderKind): CoderStatusView['lastTask'] {
@@ -335,7 +337,7 @@ export class CodersManager {
       ...(this.lastTask(kind) ? { lastTask: this.lastTask(kind) } : {}),
     });
     const codex = status('codex', codexPick, detection.codex, runtime.codex);
-    if ((this.deps.detect?.host?.platform ?? process.platform) === 'win32' && codexPick.active !== 'none') codex.windowsSandbox = this.settingUpSandbox ? 'checking' : this.sandbox?.status ?? 'failed';
+    if ((this.deps.detect?.host?.platform ?? process.platform) === 'win32' && settings.securityMode !== 'full' && codexPick.active !== 'none') codex.windowsSandbox = this.settingUpSandbox ? 'checking' : this.sandbox?.status ?? 'failed';
     const login = await this.codexLogin(settings, codexPick.active, detection.codex);
     if (login) { codex.login = login.text; codex.credentialState = login.state; }
     const claude = status('claude', claudePick, detection.claude, runtime.claude);

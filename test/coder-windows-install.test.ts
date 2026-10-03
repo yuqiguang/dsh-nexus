@@ -111,6 +111,10 @@ test('Windows standard mode permits Claude; Codex keeps readiness and strict Cla
   }
   assert.equal(view.codex.windowsSandbox, 'notConfigured');
   assert.equal(view.claude.platformProblem, undefined);
+  const full = await manager.runtime('full');
+  assert.equal('error' in full.codex, false, 'full access does not need Windows sandbox setup');
+  assert.equal('error' in full.claude, false, 'full access does not require Claude sandbox support');
+  assert.equal(configured, false, 'resolving full access never configures the host');
   assert.ok('error' in (await manager.runtime('strict')).claude);
   const ready = await manager.handle('windows-sandbox/setup', {});
   assert.equal(ready.codex.windowsSandbox, 'ready');

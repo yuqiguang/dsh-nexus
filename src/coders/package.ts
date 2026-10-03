@@ -9,7 +9,8 @@ import { lstat, mkdir, open } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { readDelivery, MAX_DELIVERY_BYTES } from '../channels/files.js';
 import { canonical } from './permissions.js';
-import { isInside, isProtectedPath } from './rules.js';
+import { isInside, isProtectedPath, isEnvironmentTemplate, isProjectEnvironment } from './rules.js';
+import { safeEnvironmentTemplate } from './environment-files.js';
 import { isActive, type TaskRecord } from './types.js';
 
 /** Static resource references only. No fetching, executing JS, or interpreting instructions in a file. */
@@ -54,10 +55,13 @@ export function resourceReferences(path: string, text: string): string[] {
 
 async function source(root: string, path: string): Promise<{ path: string; bytes: Buffer }> {
   const absolute = resolve(root, path), real = await canonical(absolute);
-  if (absolute !== real || !isInside(root, absolute) || !isInside(root, real) || isProtectedPath(absolute, [root], true) || isProtectedPath(real, [root], true)
+  const template = isEnvironmentTemplate(real) && isProjectEnvironment(real, root, true);
+  if (absolute !== real || !isInside(root, absolute) || !isInside(root, real) || (!template && (isProtectedPath(absolute, [root], true) || isProtectedPath(real, [root], true)))
     || relative(root, real).split(/[\\/]/).some(part => ['.git', '.deliverables'].includes(part))) throw new Error('打包文件超出任务范围或属于受保护文件。');
   if ((await lstat(real)).nlink !== 1) throw new Error('交付源文件不能是硬链接。');
-  return { path: real, bytes: (await readDelivery(root, absolute)).bytes };
+  const bytes = (await readDelivery(root, absolute)).bytes;
+  if (template && !safeEnvironmentTemplate(bytes.toString('utf8'))) throw new Error('环境配置模板包含非占位内容，不能作为普通交付文件。');
+  return { path: real, bytes };
 }
 
 /** Preserve relative paths and require explicit selection of every static dependency. */

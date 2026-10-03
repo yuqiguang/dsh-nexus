@@ -10,7 +10,7 @@ export interface CodexProcess {
 }
 
 /** Which `codex` to run and with what environment; defaults to the one on PATH with the current environment. */
-export interface CodexLaunch { command: string; env: NodeJS.ProcessEnv }
+export interface CodexLaunch { command: string; env: NodeJS.ProcessEnv; fullAccess?: boolean }
 
 export type CodexSpawn = (cwd: string, launch: CodexLaunch) => CodexProcess;
 
@@ -23,9 +23,15 @@ export const CODEX_FEATURES = ['default_mode_request_user_input'];
 export const APP_SERVER_ARGS = ['app-server', '-c', 'approval_policy="on-request"', ...CODEX_FEATURES.flatMap(feature => ['-c', `features.${feature}=true`])];
 export const WINDOWS_CODEX_ARGS = ['-c', 'windows.sandbox="elevated"', '-c', 'windows.sandbox_private_desktop=true'];
 
+export function codexAppServerArgs(fullAccess: boolean, platform = globalThis.process.platform): string[] {
+  return fullAccess
+    ? ['app-server', '-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"', ...CODEX_FEATURES.flatMap(feature => ['-c', `features.${feature}=true`])]
+    : [...APP_SERVER_ARGS, ...(platform === 'win32' ? WINDOWS_CODEX_ARGS : [])];
+}
+
 /** The real process: newline-delimited JSON-RPC over stdio. */
 export function spawnCodexAppServer(cwd: string, launch: CodexLaunch = { command: 'codex', env: process.env }): CodexProcess {
-  const child = spawnTaskProcess(launch.command, [...APP_SERVER_ARGS, ...(globalThis.process.platform === 'win32' ? WINDOWS_CODEX_ARGS : [])], cwd, launch.env);
+  const child = spawnTaskProcess(launch.command, codexAppServerArgs(launch.fullAccess === true), cwd, launch.env);
   const stderr: string[] = [];
   child.stderr.on('data', chunk => { stderr.push(chunk.toString()); if (stderr.length > 50) stderr.shift(); });
   child.stderr.on('error', () => stopTaskProcess(child));

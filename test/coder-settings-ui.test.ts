@@ -16,6 +16,39 @@ const initial = (): CodersView => ({
   recentTasks: [{ id: 'ct-1', coder: 'codex', status: 'completed', description: '列目录', updatedAt: 1 }],
 });
 
+test('full access and per-operation review rules save, reload, and explain the effect on new tasks', async t => {
+  let view = initial(); const saves: any[] = [];
+  const ui = await page(t, async (method, payload: any) => {
+    if (method === 'save') {
+      saves.push(payload.config);
+      view = { ...view, settings: { ...view.settings, securityMode: payload.config.securityMode, autoApproveSafe: payload.config.autoApproveSafe,
+        reviewPolicy: payload.config.reviewPolicy, revision: view.settings.revision + 1 } };
+    }
+    return structuredClone(view);
+  });
+  assert.equal(ui.field('coders-security').value, 'standard');
+  await ui.enter('coders-review-commands', 'ask');
+  await ui.enter('coders-review-instructions', '数据库迁移先询问');
+  await ui.enter('coders-security', 'full');
+  assert.match(ui.text(), /可读写项目外文件.*关闭 Codex \/ Claude 执行沙箱/);
+  assert.match(ui.text(), /保存后仅新任务采用/);
+  assert.equal(ui.field('coders-review-commands').matches(':disabled'), true);
+  assert.equal(ui.field('coders-network').disabled, true);
+  await ui.submit();
+  assert.equal(saves[0].securityMode, 'full');
+  assert.deepEqual(saves[0].reviewPolicy, { commands: 'ask', files: 'auto', network: 'auto', instructions: '数据库迁移先询问' });
+  assert.equal(ui.field('coders-security').value, 'full');
+  await ui.enter('coders-security', 'manual');
+  await ui.submit();
+  assert.equal(saves[1].securityMode, 'standard'); assert.equal(saves[1].autoApproveSafe, false);
+  assert.equal(ui.field('coders-security').value, 'manual');
+  await ui.enter('coders-security', 'standard');
+  await ui.submit();
+  assert.equal(saves[2].autoApproveSafe, true);
+  assert.equal(ui.field('coders-review-commands').matches(':disabled'), false);
+  assert.equal(ui.field('coders-review-commands').value, 'ask');
+});
+
 test('tool readiness needs no separate project choice and checks only the saved default tool', async t => {
   const view = initial();
   view.codex.credentialState = 'configured';

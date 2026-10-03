@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import type { CoderRequest } from './types.js';
@@ -27,6 +27,15 @@ export type HardVerdict = {
 const PACKAGE_CONFIG = /^\.(npmrc|netrc)$/;
 const PROTECTED_BASENAMES = [/^\.env(\..+)?$/, /credentials/i, /^id_rsa/, /^id_ed25519/, /^id_ecdsa/, /\.pem$/];
 const PROTECTED_DIRS = ['.ssh', '.dsh', '.nexus', '.gnupg', '.aws', '.config/gh'];
+
+export function isEnvironmentFile(path: string): boolean { return /^\.env(?:\..+)?$/i.test(baseName(path)); }
+export function isEnvironmentTemplate(path: string): boolean { return /^\.env\.(?:example|sample|template)$/i.test(baseName(path)); }
+
+/** Naming an output is not permission to read/write it. Credential directories still win. */
+export function isProjectEnvironment(path: string, cwd: string, standard: boolean): boolean {
+  return isAbsolute(path) && isInside(cwd, path) && isEnvironmentFile(path)
+    && !isProtectedPath(dirname(path), [cwd], standard);
+}
 
 const DENY_COMMANDS: readonly [RegExp, string][] = [
   [/\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\s+(\/|~\/?|\$HOME\/?)(\s|$|\*)/i, '删除根目录或家目录'],
@@ -147,10 +156,17 @@ export function isPublicWebRequest(request: CoderRequest): boolean {
  * First decision layer. Returns `undefined` when no hard rule applies, which
  * never means "allow": the caller continues with the next layer.
  */
-export function hardRule(request: CoderRequest, roots: readonly string[], webResearch = false, standard = false): HardVerdict | undefined {
+export function hardRule(request: CoderRequest, roots: readonly string[], webResearch = false, standard = false,
+  cwd = roots[0] ?? '', safeTemplates: readonly string[] = []): HardVerdict | undefined {
   if (request.tool === 'codex.permissions') return { verdict: 'deny', reason: '无人值守任务不授予整个回合额外权限，请按具体命令或文件操作申请', key: 'turn-permissions' };
-  const protectedPath = request.paths.find(path => isProtectedPath(path, roots, standard));
+  const scopedWrite = request.kind === 'file-write' && ['Write', 'Edit', 'codex.fileChange'].includes(request.tool) && !request.raw.grantRoot && !request.raw.additionalPermissions;
+  const environment = request.paths.filter(path => isProjectEnvironment(path, cwd, standard));
+  const safeTemplate = (path: string) => environment.includes(path) && isEnvironmentTemplate(path) && safeTemplates.includes(path);
+  const protectedPath = request.paths.find(path => isProtectedPath(path, roots, standard) && !safeTemplate(path)
+    && !(standard && scopedWrite && environment.includes(path)));
   if (protectedPath) return { verdict: 'deny', reason: `涉及凭据或密钥文件：${protectedPath}`, key: `credential:${baseName(protectedPath)}` };
+  if (environment.some(path => !safeTemplate(path))) return { verdict: 'escalate', manualOnly: true,
+    reason: '本次写入项目环境配置文件，可能包含凭据；需你确认，仅授权所列文件的这次修改，内容不在审批消息中展示' };
   const outside = request.paths.find(path => !insideAny(roots, path));
   if (outside && (request.kind === 'file-write' || request.kind === 'file-read' || request.kind === 'other')) {
     return { verdict: 'escalate', reason: `路径在任务根目录之外：${outside}` };

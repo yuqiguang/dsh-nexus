@@ -4,6 +4,7 @@ import { dirname, isAbsolute, resolve, relative, sep } from 'node:path';
 import { commandPath } from './command-path.js';
 import { redact } from './normalize.js';
 import { pythonImports, pythonModuleCommands, type PythonImport } from './python-evidence.js';
+import { pytestSources, customPytestDiscovery } from './pytest-evidence.js';
 
 const EXTENSIONS = '(?:[cm]?[jt]sx?|py|sh|ps1|html?|json|css|md|mdx|txt|ya?ml|toml|ini|cfg)';
 const FILE = new RegExp(`\\.${EXTENSIONS}$`, 'i');
@@ -80,8 +81,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   for (const module of modules) if (module !== 'pytest') await addModule({ module, names: [] }, cwd, true);
   const pytest = modules.includes('pytest') || /(?:^|[\s/\\])pytest(?:\.exe)?(?:\s|$)/i.test(command);
   if (pytest) {
+    // Include a bounded superset of the default project tests even for `pytest -q` or `pytest tests`.
+    const discovered = await pytestSources(cwd, within);
+    queue.push(...discovered.paths.map(path => ({ path })));
+    evidence.push(...discovered.evidence);
+    complete &&= discovered.complete;
     const targets = queue.filter(item => /\.py$/i.test(item.path));
-    if (!targets.length) { evidence.push('pytest 未显式指定 Python 测试文件，目录或自动发现的测试范围未展开，证据不完整。'); complete = false; }
+    if (!targets.length) { evidence.push('pytest 未找到默认命名的测试文件，不能确认测试发现范围。'); complete = false; }
     for (const file of ['conftest.py', 'pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini']) queue.push({ path: resolve(cwd, file), optional: true });
     for (const target of targets) {
       for (let parent = dirname(target.path); inProject(parent); parent = dirname(parent)) {
@@ -128,7 +134,11 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       if (/\.py$/i.test(real)) {
         const parsed = pythonImports(source);
         for (const item of parsed.imports) await addModule(item, dirname(real));
+        for (const module of pythonModuleCommands(source)) if (module !== 'pytest') await addModule({ module, names: [] }, dirname(real), true);
         if (parsed.dynamic) { evidence.push(`${redact(real)}: 存在动态 Python 加载或执行，静态依赖证据不完整`); complete = false; }
+      }
+      if (pytest && /\.(?:toml|ini|cfg)$/i.test(real) && customPytestDiscovery(source)) {
+        evidence.push(`${redact(real)}: 存在自定义测试发现或模块路径配置，默认命名扫描不能证明执行范围完整`); complete = false;
       }
       add(source, dirname(real), true);
     } finally { await file.close(); }

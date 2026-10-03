@@ -6,14 +6,161 @@ import type { AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
 import { runClaudeTask, type ClaudeQuery, type ClaudeStreamMessage } from '../src/coders/claude.js';
 import { escalateToUser, type EscalationHost } from '../src/coders/escalate.js';
 import { normalizeClaudeRequest } from '../src/coders/normalize.js';
+import { coderPrompt } from '../src/coders/brief.js';
 import { hardRule, isInside, isProtectedPath } from '../src/coders/rules.js';
 import { CoderStore, taskSchema, type CoderDomain, type DomainOpener } from '../src/coders/store.js';
 import type { CoderRequest, TaskRecord } from '../src/coders/types.js';
 import { changedFiles, runVerifyCommand, snapshotWorkTree, verifyTask } from '../src/coders/verify.js';
 import { execFileSync } from 'node:child_process';
+import { symlinkSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DEFAULT_REVIEW_POLICY, type CoderReviewPolicy } from '../src/coders/review-policy.js';
+import { dependencyPassed } from '../src/coders/dependencies.js';
+
+test('full access uses native Claude bypass, allows protected requests, but retains questions, cancellation and owner scope', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-full-flow-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(qs => qs.map(q => ({ id: q.id, selected: ['A'] })), root);
+  let options!: Parameters<ClaudeQuery>[0]['options'];
+  const query: ClaudeQuery = async function* (params) {
+    options = params.options;
+    assert.equal(options.permissionMode, 'bypassPermissions');
+    assert.equal(options.allowDangerouslySkipPermissions, true);
+    assert.equal(options.sandbox?.enabled, false);
+    const cancelled = new AbortController(); cancelled.abort();
+    assert.equal((await options.canUseTool('Bash', { command: 'echo cancelled' }, { signal: cancelled.signal })).behavior, 'deny');
+    assert.match(params.prompt, /本任务已由设置授予完全权限/);
+    assert.doesNotMatch(params.prompt, /实际 .env 写入在标准模式下申请/);
+    for (const [name, input] of [
+      ['Write', { file_path: join(root, '.env'), content: 'APP=fixture' }],
+      ['Read', { file_path: join(root, '..', '.ssh', 'fixture') }],
+      ['Bash', { command: 'git push', dangerouslyDisableSandbox: true }],
+    ] as const) {
+      // Requests are fixtures; no credential read or real publishing occurs.
+      const hook = await options.hooks!.PreToolUse[0]!.hooks[0]!({ hook_event_name: 'PreToolUse', tool_name: name, tool_input: input }, name, { signal: options.abortController.signal });
+      assert.equal(hook.hookSpecificOutput?.permissionDecision, 'allow');
+    }
+    const question = await options.canUseTool('AskUserQuestion', { questions: [{ question: '选择交付格式', header: '格式', options: [{ label: 'A', description: 'local' }, { label: 'B', description: 'web' }] }] }, { signal: options.abortController.signal });
+    assert.equal(question.behavior, 'allow');
+    assert.ok(question.behavior === 'allow' && question.updatedInput?.answers);
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  };
+  await installCoders(harness.ctx, { roots: [root], defaultCoder: 'claude', securityMode: 'full', reviewPolicy: { ...DEFAULT_REVIEW_POLICY, commands: 'ask' }, query,
+    safetyReviewer: async () => { throw new Error('full access must never call the reviewer'); } });
+  await harness.run('coder_rules', { action: 'add', kind: 'command', pattern: 'git push', decision: 'deny' });
+  await writeFile(join(root, 'check.cjs'), 'console.log("full verification passed")');
+  const dispatched = await harness.run('coder_task', { description: 'work', verify: 'node check.cjs' });
+  await harness.jobs[0]!.done;
+  const record = harness.tasks.get(dispatched.task_id!)!;
+  assert.equal(record.status, 'completed', record.result?.detail);
+  assert.equal(record.result?.verification, 'passed');
+  assert.equal(record.permissions?.securityMode, 'full');
+  assert.equal(harness.asked.length, 1, 'only goal clarification reaches the owner');
+  assert.equal(record.decisions.some(d => d.layer === 'supervisor'), false);
+  const stopped = await options.canUseTool('Bash', { command: 'echo after completion' }, { signal: options.abortController.signal });
+  assert.equal(stopped.behavior, 'deny');
+  await assert.rejects(harness.run('coder_task', { description: 'resume', resume_task_id: dispatched.task_id }, 'another-owner'));
+  await assert.rejects(harness.run('coder_task', { description: 'outside', cwd: join(root, '..') }), /工作区/);
+  Object.assign(harness.ctx, { sandboxPolicy: { resolve: () => ({ mode: 'read-only', workspaceRoot: root }) } });
+  await assert.rejects(harness.run('coder_task', { description: 'read-only' }), /只读/);
+});
+
+test('full access verification respects an explicit offline contract and allows observed outside writes without failing dependencies', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-full-verify-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, 'check.cjs'), 'require("fs").writeFileSync("executed", "yes")');
+  const harness = coderHarness(undefined, root);
+  Object.assign(harness.ctx, { sandbox: undefined });
+  await installCoders(harness.ctx, { roots: [root], defaultCoder: 'claude', securityMode: 'full', query: async function* () { yield { type: 'result', subtype: 'success', result: 'done' }; } });
+  const offline = await harness.run('coder_task', { description: 'offline verification', verify: 'node check.cjs', verify_network: 'offline' });
+  await harness.jobs[0]!.done;
+  assert.equal(harness.tasks.get(offline.task_id!)!.result?.verification, 'not-run');
+  await assert.rejects(readFile(join(root, 'executed')));
+  const full = await harness.run('coder_task', { description: 'default verification', verify: 'node check.cjs' });
+  await harness.jobs[1]!.done;
+  assert.equal(await readFile(join(root, 'executed'), 'utf8'), 'yes');
+  const record = harness.tasks.get(full.task_id!)!;
+  assert.equal(dependencyPassed(record), true);
+  const observedOutside = { ...record, result: { ...record.result!, outsideRoots: [join(root, '..', 'fixture.txt')] } };
+  assert.equal(dependencyPassed(observedOutside), true);
+  assert.equal(dependencyPassed({ ...observedOutside, permissions: { ...record.permissions!, securityMode: 'standard' } }), false);
+  assert.equal(harness.asked.length, 0);
+});
+
+test('task input cannot enable full access and resuming keeps the original mode after settings change', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-mode-resume-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  const modes: string[] = [];
+  const config: import('../src/coders/index.js').CodersConfig = { roots: [root], defaultCoder: 'claude', securityMode: 'standard',
+    query: async function* ({ options }) {
+      modes.push(options.permissionMode);
+      yield { type: 'system', subtype: 'init', session_id: 'kept-mode-session' };
+      yield { type: 'result', subtype: 'success', result: 'done' };
+    } };
+  await installCoders(harness.ctx, config);
+  const first = await harness.run('coder_task', { description: 'use full access', securityMode: 'full' });
+  await harness.jobs[0]!.done;
+  config.securityMode = 'full';
+  const resumed = await harness.run('coder_task', { resume_task_id: first.task_id, description: 'continue' });
+  await harness.jobs[1]!.done;
+  assert.equal(harness.tasks.get(resumed.task_id!)!.permissions?.securityMode, 'standard');
+  assert.deepEqual(modes, ['default', 'default']);
+});
+
+for (const resumed of [false, true]) test(`Codex full access confirms native policies on ${resumed ? 'resume' : 'start'} and every turn`, async () => {
+  const cwd = process.cwd(); let launches = 0;
+  const fake = fakeCodex(io => io.onWrite(message => {
+    if (message.method === 'initialize') io.reply(message.id, {});
+    if (message.method === 'thread/start' || message.method === 'thread/resume') {
+      const p = message.params as Record<string, unknown>;
+      assert.equal(message.method, resumed ? 'thread/resume' : 'thread/start');
+      assert.equal(p.approvalPolicy, 'never'); assert.equal(p.sandbox, 'danger-full-access');
+      io.reply(message.id, { thread: { id: 'full-thread' }, approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } });
+    }
+    if (message.method === 'turn/start') {
+      const p = message.params as Record<string, unknown>;
+      assert.equal(p.approvalPolicy, 'never'); assert.deepEqual(p.sandboxPolicy, { type: 'dangerFullAccess' });
+      io.reply(message.id, { turn: { id: 'full-turn' } });
+      io.push({ method: 'turn/completed', params: { turn: { id: 'full-turn', status: 'completed', items: [] } } });
+    }
+  }));
+  const permissions = await taskPermissions(cwd, [cwd], 'codex', undefined, 60, [], true, 'full');
+  const outcome = await runCodexTask(codexTask({ cwd, permissions, ...(resumed ? { coderSessionId: 'full-thread' } : {}) }), {
+    spawn: (_cwd, launch) => { launches++; assert.equal(launch.fullAccess, true); return fake.process; },
+    async decide() { throw new Error('unexpected permission request'); },
+  }).done;
+  assert.equal(outcome.status, 'completed', outcome.detail); assert.equal(launches, 1);
+});
+
+test('DSH review routing is snapshotted and manual rules retain routine files and hard denials', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-review-policy-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(qs => qs.map(q => ({ id: q.id, selected: ['允许'] })), root);
+  const policy: CoderReviewPolicy = { ...DEFAULT_REVIEW_POLICY, commands: 'ask', files: 'ask', network: 'ask', instructions: '数据库迁移先询问' };
+  let reviews = 0;
+  const query = scriptedQuery(async function* (options) {
+    policy.commands = 'auto'; policy.files = 'auto'; policy.network = 'auto'; policy.instructions = 'changed';
+    const ask = (tool: string, input: Record<string, unknown>) => options.canUseTool(tool, input, { signal: options.abortController.signal });
+    assert.equal((await ask('Bash', { command: 'node --version' })).behavior, 'allow');
+    assert.equal((await ask('Read', { file_path: join(root, '..', 'outside-fixture.txt') })).behavior, 'allow');
+    assert.equal((await ask('Bash', { command: 'cat ~/.ssh/id_rsa' })).behavior, 'deny');
+    assert.equal((await ask('Write', { file_path: join(root, 'normal.txt'), content: 'fixture' })).behavior, 'allow');
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [root], defaultCoder: 'claude', reviewPolicy: policy, query,
+    safetyReviewer: async () => { reviews++; return { safe: true, reason: 'fixture' }; } });
+  const first = await harness.run('coder_task', { description: 'work' });
+  await harness.jobs[0]!.done;
+  const record = harness.tasks.get(first.task_id!)!;
+  assert.equal(record.status, 'completed', record.result?.detail);
+  assert.equal(record.permissions?.reviewPolicy?.commands, 'ask');
+  assert.equal(record.permissions?.reviewPolicy?.instructions, '数据库迁移先询问');
+  assert.equal(harness.asked.length, 2); assert.equal(reviews, 0);
+  assert.match(record.decisions.find(d => d.layer === 'user')?.reason ?? '', /审核规则/);
+});
 
 const roots = ['/home/dev/project'];
 const cwd = '/home/dev/project/app';
@@ -505,7 +652,7 @@ test('the Codex adapter drives app-server, routes approvals through decide, and 
         io.reply(message.id, { thread: { id: 'thread-1' } });
       }
       if (message.method === 'turn/start') {
-        assert.deepEqual((message.params as { input: unknown }).input, [{ type: 'text', text: '修复登录页' }]);
+        assert.deepEqual((message.params as { input: unknown }).input, [{ type: 'text', text: coderPrompt(codexTask()) }]);
         io.reply(message.id, { turn: { id: 'turn-1', status: 'inProgress' } });
         io.push({ jsonrpc: '2.0', method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'reasoning', id: 'r1' } } });
         io.push({ jsonrpc: '2.0', method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'commandExecution', id: 'c1', command: "/bin/bash -lc 'npm test'", cwd, status: 'inProgress' } } });
@@ -569,7 +716,7 @@ test('the Codex adapter turns a trailing plain-text question into an escalation 
   } });
   const outcome = await hooks.done;
   assert.deepEqual(outcome, { status: 'completed', result: '已用 SQLite 接好并加了测试。' });
-  assert.deepEqual(turns, ['修复登录页', 'SQLite', '要']);
+  assert.deepEqual(turns, [coderPrompt(codexTask()), 'SQLite', '要']);
   assert.deepEqual(asked.map(request => [request.kind, request.tool, request.summary]), [['question', 'codex.message', '请直接回复。'], ['question', 'codex.message', '要不要顺便加测试？']]);
 });
 
@@ -1082,7 +1229,7 @@ test('steering a running Codex task: words join the current turn, or interrupt i
   assert.deepEqual(outcome, { status: 'completed', result: '已改为创建 c.txt。' });
   assert.deepEqual(fake.sent.find(message => message.id === 'ap-1')!.result, { decision: 'cancel' });
   const starts = fake.sent.filter(message => message.method === 'turn/start').map(message => (message.params as { input: { text: string }[] }).input[0]!.text);
-  assert.deepEqual(starts, ['修复登录页', '不要建 b.txt，改建 c.txt。']);
+  assert.deepEqual(starts, [coderPrompt(codexTask()), '不要建 b.txt，改建 c.txt。']);
   await assert.rejects(hooks.steer('太晚了', false), /没有进行中的回合/);
 });
 
@@ -2418,10 +2565,10 @@ test('planned continuation keeps original requirements and explicit brief direct
   const saved = await harness.run('coder_brief', { action: 'save', objective: 'service', acceptance: ['API'], cwd: 'app' });
   const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
   await assert.rejects(harness.run('coder_brief', { action: 'plan', brief_id: id, revision: 1, steps: [
-    { id: 'api', description: 'Create config', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['.env.example'] },
+    { id: 'api', description: 'Create config', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['.ssh/credentials'] },
   ] }), /受凭据保护/);
   await harness.run('coder_brief', { action: 'plan', brief_id: id, revision: 1, steps: [
-    { id: 'api', description: 'Original API requirements', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['README.md'] },
+    { id: 'api', description: 'Original API requirements', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['README.md', '.env.example'] },
   ] });
   const first = await harness.run('coder_task', { brief_id: id, brief_revision: 2, plan_step: 'api', verify_commands: ['true', 'node --version'] });
   await harness.jobs.at(-1)!.done;
@@ -2464,6 +2611,60 @@ test('environment preflight failure prevents coding and remains distinct from fi
   assert.equal(codingRuns, 1);
   assert.equal(passed.result?.preflightCheck?.ok, true);
   assert.equal(passed.result?.verifyOk, true);
+});
+
+test('environment template work avoids approval while true environment writes ask once each without exposing values', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-env-approval-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const harness = coderHarness(questions => {
+    assert.doesNotMatch(JSON.stringify(questions), /fixture-private-value/);
+    assert.match(JSON.stringify(questions), /内容.*隐藏|内容不在审批/);
+    return questions.map(q => ({ id: q.id, selected: ['允许'] }));
+  });
+  let reviews = 0;
+  const query = scriptedQuery(async function* (options) {
+    const write = (name: string, content: string) => options.canUseTool('Write', { file_path: join(cwd, name), content }, { signal: options.abortController.signal });
+    assert.equal((await write('.env.example', 'API_KEY=\nPORT=3000')).behavior, 'allow');
+    assert.equal(harness.asked.length, 0);
+    assert.equal((await write('.env', 'API_KEY=fixture-private-value')).behavior, 'allow');
+    assert.equal((await write('.env', 'API_KEY=fixture-private-value')).behavior, 'allow');
+    yield { type: 'result', subtype: 'success', result: 'configuration prepared' };
+  });
+  await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard', safetyReviewer: async () => { reviews++; return { safe: true, reason: 'unused' }; } });
+  const result = await harness.run('coder_task', { cwd, description: 'prepare configuration' });
+  await harness.jobs.at(-1)!.done;
+  const record = harness.tasks.get(result.task_id!)!;
+  assert.equal(reviews, 0, 'sensitive writes cannot be delegated to the review model');
+  assert.equal(harness.asked.length, 2, 'a human approval never silently becomes a lasting credential grant');
+  assert.equal(record.autoAllowed, 1);
+  assert.doesNotMatch(JSON.stringify(record.decisions), /fixture-private-value/);
+});
+
+test('environment approval cannot authorize a link changed while waiting or override a new user deny', async t => {
+  for (const scenario of ['link', 'rule'] as const) await t.test(scenario, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'nexus-env-wait-')), cwd = join(root, 'project');
+    await mkdir(cwd); await writeFile(join(root, 'outside'), 'preserve');
+    try {
+      const harness = coderHarness(questions => {
+        if (scenario === 'link') symlinkSync(join(root, 'outside'), join(cwd, '.env'));
+        else harness.rules.set('deny-env', { id: 'deny-env', source: 'user', kind: 'file-write', pattern: '.env', decision: 'deny', createdAt: Date.now() });
+        return questions.map(q => ({ id: q.id, selected: ['允许'] }));
+      });
+      const query = scriptedQuery(async function* (options) {
+        const decision = await options.canUseTool('Write', { file_path: join(cwd, '.env'), content: 'API_KEY=' }, { signal: options.abortController.signal });
+        assert.equal(decision.behavior, 'deny');
+        yield { type: 'result', subtype: 'success', result: 'write not performed' };
+      });
+      await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard' });
+      const result = await harness.run('coder_task', { cwd, description: 'prepare config' });
+      await harness.jobs.at(-1)!.done;
+      const record = harness.tasks.get(result.task_id!)!;
+      assert.equal(harness.asked.length, 1);
+      assert.equal(record.decisions.at(-1)?.outcome, 'deny');
+      assert.match(record.decisions.at(-1)?.reason ?? '', /路径或规则已变化/);
+      assert.equal(await readFile(join(root, 'outside'), 'utf8'), 'preserve');
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 });
 
 test('denied or cancelled preflight never launches its command or the coder', async t => {

@@ -31,6 +31,8 @@ export interface CoderRequest {
   command?: string;
   /** Absolute paths the request touches, when known. */
   paths: string[];
+  /** Complete file diffs from the native Codex item, never the clipped display text. */
+  fileChanges?: { path: string; diff: string }[];
   /** Present for `question` requests only. */
   questions?: CoderQuestion[];
   raw: Record<string, unknown>;

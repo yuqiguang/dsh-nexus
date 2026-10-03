@@ -8,6 +8,45 @@ import { taskMinutes, networkDomains } from '../src/coders/settings.js';
 import { taskSchema } from '../src/coders/store.js';
 import { threadPolicyDrift } from '../src/coders/codex.js';
 import { decideLayers } from '../src/coders/decide.js';
+import { DEFAULT_REVIEW_POLICY, reviewPolicy, type CoderReviewPolicy } from '../src/coders/review-policy.js';
+import { permissionSummary } from '../src/coders/permissions.js';
+import { verificationNetwork } from '../src/coders/verification-policy.js';
+import { codexAppServerArgs } from '../src/coders/codex-process.js';
+
+test('full Codex launch uses one approval policy and does not enable Windows sandbox setup', () => {
+  const full = codexAppServerArgs(true, 'win32');
+  assert.deepEqual(full.filter(arg => arg.startsWith('approval_policy=')), ['approval_policy="never"']);
+  assert.ok(full.includes('sandbox_mode="danger-full-access"'));
+  assert.equal(full.some(arg => arg.startsWith('windows.sandbox')), false);
+  assert.ok(codexAppServerArgs(false, 'win32').includes('windows.sandbox="elevated"'));
+});
+
+test('full access is explicit, confirmed by Codex, persisted, and never widens a resume', async () => {
+  const cwd = process.cwd();
+  const reviewer: CoderReviewPolicy = { ...DEFAULT_REVIEW_POLICY, commands: 'ask' as const, instructions: 'check migrations' };
+  const full = await taskPermissions(cwd, [cwd], 'codex', undefined, 60, [], true, 'full', reviewer);
+  assert.equal(full.network, 'unrestricted');
+  assert.equal(full.isolation, 'unrestricted');
+  assert.equal(threadPolicyDrift({ approvalPolicy: 'never', sandbox: { type: 'dangerFullAccess' } }, full), undefined);
+  for (const response of [{}, { approvalPolicy: 'untrusted', sandbox: { type: 'dangerFullAccess' } }, { approvalPolicy: 'never', sandbox: { type: 'workspaceWrite' } }]) assert.ok(threadPolicyDrift(response, full));
+  const strict = await taskPermissions(cwd, [cwd], 'claude');
+  assert.deepEqual(await taskPermissions(cwd, [cwd], 'claude', strict, 60, [], true, 'full'), strict);
+  reviewer.commands = 'auto'; reviewer.instructions = 'changed';
+  const resumed = await taskPermissions(cwd, [cwd], 'codex', full, 60, [], true, 'standard', reviewer);
+  assert.deepEqual(resumed, full);
+  assert.equal(resumed.reviewPolicy?.instructions, 'check migrations');
+  const saved = taskSchema.parse({ id: 'full', coder: 'codex', description: 'work', cwd, status: 'running', ownerSession: 'owner', createdAt: 0, updatedAt: 0, decisions: [], escalations: 0, permissions: full });
+  assert.deepEqual(saved.permissions, full);
+  assert.match(permissionSummary(full), /完全权限.*关闭.*沙箱/);
+  assert.equal(verificationNetwork(undefined, undefined, 'full'), 'ask');
+  assert.equal(verificationNetwork('offline', undefined, 'full'), 'offline');
+  assert.equal(verificationNetwork(undefined, 'loopback', 'full'), 'loopback');
+});
+
+test('review settings reject malformed rules and excessive instructions', () => {
+  assert.deepEqual(reviewPolicy(undefined), DEFAULT_REVIEW_POLICY);
+  for (const value of [null, [], true, { commands: 'allow' }, { unknown: 'ask' }, { instructions: 1 }, { instructions: 'x'.repeat(4001) }]) assert.throws(() => reviewPolicy(value), /invalid_configuration/);
+});
 
 test('task scopes use real paths, reject symlink escapes and keep their budget when resumed', async () => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-scope-'));

@@ -56,12 +56,43 @@ test('static imports ignore comments and multiline strings, and flag dynamic exe
   assert.deepEqual(pythonImports('if ready: import app.db').imports, [{ module: 'app.db', names: [] }]);
 });
 
-test('pytest automatic discovery does not claim complete test source evidence', async t => {
+test('pytest directory discovery includes test bodies, conftest and imported application modules', async t => {
   const f = await fixture(t);
-  await f.write('tests/test_api.py', '# undiscovered source');
-  const result = await f.inspect('python -m pytest tests');
-  assert.equal(result.evidenceComplete, false);
-  assert.match(result.evidence.join('\n'), /自动发现的测试范围未展开/);
+  await f.write('tests/test_api.py', 'from app.main import run\n# DISCOVERED_TEST');
+  await f.write('tests/conftest.py', '# DISCOVERED_CONFTEST');
+  await f.write('app/main.py', '# DISCOVERED_APP');
+  await f.write('pyproject.toml', '[tool.pytest.ini_options]\ntestpaths = ["tests"]');
+  const result = await f.inspect('python -X utf8 -m pytest tests');
+  assert.equal(result.evidenceComplete, true);
+  for (const marker of ['DISCOVERED_TEST', 'DISCOVERED_CONFTEST', 'DISCOVERED_APP']) assert.match(result.evidence.join('\n'), new RegExp(marker));
+  await f.write('tests/test_added.py', '# ADDED_TEST');
+  assert.notEqual(reviewFingerprint(result), reviewFingerprint(await f.inspect('python -X utf8 -m pytest tests')));
+  await f.write('pyproject.toml', '[tool.pytest.ini_options]\npython_files = "check_*.py"');
+  assert.equal((await f.inspect('python -m pytest tests')).evidenceComplete, false, 'custom discovery is not mistaken for the default');
+});
+
+test('self-check subprocess module entry is included without running the application', async t => {
+  const f = await fixture(t);
+  await f.write('scripts/check.py', 'import subprocess, sys\nsubprocess.run([sys.executable, "-m", "app"])');
+  await f.write('app/__init__.py', '# SUBPROCESS_INIT');
+  await f.write('app/__main__.py', 'from .main import run\n# SUBPROCESS_ENTRY');
+  await f.write('app/main.py', '# SUBPROCESS_SOURCE');
+  const result = await f.inspect('python scripts/check.py');
+  for (const marker of ['SUBPROCESS_INIT', 'SUBPROCESS_ENTRY', 'SUBPROCESS_SOURCE']) assert.match(result.evidence.join('\n'), new RegExp(marker));
+});
+
+test('pytest discovery does not follow links and stops at a bounded number of directory entries', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.cwd, 'tests'));
+  await writeFile(join(f.root, 'outside.py'), '# OUTSIDE_TEST_SECRET');
+  await symlink(join(f.root, 'outside.py'), join(f.cwd, 'tests', 'test_link.py'));
+  const linked = await f.inspect('python -m pytest');
+  assert.equal(linked.evidenceComplete, false);
+  assert.doesNotMatch(linked.evidence.join('\n'), /OUTSIDE_TEST_SECRET/);
+  for (let i = 0; i < 270; i++) await f.write(`tests/entry${i}`, '');
+  const many = await f.inspect('pytest tests');
+  assert.equal(many.evidenceComplete, false);
+  assert.match(many.evidence.join('\n'), /上限/);
 });
 
 test('Python imports cannot disclose protected files or follow symlinks outside the review root', async t => {

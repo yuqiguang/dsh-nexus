@@ -32,7 +32,8 @@ export type ClaudePermissionResult = CoderDecision;
 export interface ClaudeQueryOptions {
   spawnClaudeCodeProcess?: (options: SpawnOptions) => SpawnedProcess;
   cwd: string;
-  permissionMode: 'default';
+  permissionMode: 'default' | 'bypassPermissions';
+  allowDangerouslySkipPermissions?: boolean;
   sandbox?: { enabled: boolean; failIfUnavailable: boolean; autoAllowBashIfSandboxed: boolean; allowUnsandboxedCommands: boolean;
     network: { allowedDomains: string[]; strictAllowlist: boolean; allowAllUnixSockets: boolean; allowLocalBinding: boolean };
     filesystem: { allowWrite: string[]; denyRead: string[]; denyWrite: string[] };
@@ -127,7 +128,7 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
   const execution = (async (): Promise<CoderOutcome> => {
     let lastAssistant = '';
     try {
-      if (process.platform === 'win32' && task.permissions?.securityMode !== 'standard') throw new Error('Claude Code 严格模式需要 Linux / WSL2 或 macOS 命令沙箱。');
+      if (process.platform === 'win32' && (task.permissions?.securityMode ?? 'strict') === 'strict') throw new Error('Claude Code 严格模式需要 Linux / WSL2 或 macOS 命令沙箱。');
       const stream = deps.query({ prompt: (deps.continuation ? RESUME_PROMPT : coderPrompt(task)) + (deps.instructions ?? '') + (process.platform === 'win32' ? WINDOWS_CODER_GUIDANCE : '') + (deps.research ? (deps.research.webResearch === false ? '' : RESEARCH_GUIDANCE) + (deps.research.localChecks ? LOCAL_CHECK_GUIDANCE : '') : ''), options: {
         ...((process.platform === 'linux' || process.platform === 'win32') && task.permissions ? { spawnClaudeCodeProcess: (options: SpawnOptions) => {
           const child = spawnTaskProcess(options.command, options.args, options.cwd, options.env);
@@ -143,12 +144,13 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
           if (options.signal.aborted) abort();
           return child;
         } } : {}),
-        cwd: task.cwd, permissionMode: 'default', abortController: controller,
+        cwd: task.cwd, permissionMode: task.permissions?.securityMode === 'full' ? 'bypassPermissions' : 'default',
+        ...(task.permissions?.securityMode === 'full' ? { allowDangerouslySkipPermissions: true } : {}), abortController: controller,
         ...(deps.research ? { strictMcpConfig: true, mcpServers: { nexus_web: { type: 'http' as const, url: deps.research.url, headers: { Authorization: `Bearer ${deps.research.token}` } } } } : {}),
         ...(task.permissions ? {
           settingSources: [],
           tools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'AskUserQuestion', ...(task.permissions.webResearch ? ['WebSearch', 'WebFetch'] : [])],
-          sandbox: { enabled: task.permissions.securityMode !== 'standard', failIfUnavailable: task.permissions.securityMode !== 'standard', autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: task.permissions.securityMode === 'standard',
+          sandbox: { enabled: (task.permissions.securityMode ?? 'strict') === 'strict', failIfUnavailable: (task.permissions.securityMode ?? 'strict') === 'strict', autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: task.permissions.securityMode === 'standard' || task.permissions.securityMode === 'full',
             network: { allowedDomains: task.permissions.allowedNetworkDomains, strictAllowlist: true, allowAllUnixSockets: false, allowLocalBinding: false },
             filesystem: { allowWrite: task.permissions.writableRoots, denyRead: credentialPaths(), denyWrite: credentialPaths() },
             credentials: { envVars: Object.keys(deps.env ?? process.env).filter(key => /TOKEN|SECRET|PASSWORD|API_KEY|AUTH/i.test(key)).map(name => ({ name, mode: 'deny' as const })) } },

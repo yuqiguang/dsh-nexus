@@ -1,8 +1,8 @@
 import { requireWindowsFirewall } from './windows-firewall.js';
 import type { CoderKind, TaskRecord } from './types.js';
 
-export function verificationNetwork(requested: TaskRecord['verifyNetwork'], previous: TaskRecord['verifyNetwork'], mode: 'standard' | 'strict'): NonNullable<TaskRecord['verifyNetwork']> {
-  return requested ?? previous ?? (mode === 'standard' ? 'ask' : 'offline');
+export function verificationNetwork(requested: TaskRecord['verifyNetwork'], previous: TaskRecord['verifyNetwork'], mode: 'standard' | 'strict' | 'full'): NonNullable<TaskRecord['verifyNetwork']> {
+  return requested ?? previous ?? (mode === 'strict' ? 'offline' : 'ask');
 }
 
 /** Fail before starting a coder, never downgrade an explicitly offline contract. */

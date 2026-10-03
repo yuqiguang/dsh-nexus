@@ -6,7 +6,7 @@
 
 ## 验证和打包
 
-更新版本时同步 `package.json`、`package-lock.json`、README、CHANGELOG 和第三方依赖说明。以下以 0.2.43 为例；仅文档和包元信息变化时，可沿用编译产物，但必须核对运行源码与产物均未变化，并重新计算安装包摘要。
+更新版本时同步 `package.json`、`package-lock.json`、README、CHANGELOG 和第三方依赖说明。以下以 0.2.44 为例；仅文档和包元信息变化时，可沿用编译产物，但必须核对运行源码与产物均未变化，并重新计算安装包摘要。
 
 源码发生变化时，在干净工作树中串行执行：
 
@@ -25,11 +25,11 @@ npm run smoke
 使用已验证的 `dist` 打包；下面的目录和摘要命令适用于 Linux / WSL：
 
 ```bash
-mkdir -p release/0.2.43
-npm pack --ignore-scripts --pack-destination release/0.2.43
-tar -tzf release/0.2.43/dsh-nexus-0.2.43.tgz
-cd release/0.2.43
-sha256sum dsh-nexus-0.2.43.tgz > SHA256SUMS
+mkdir -p release/0.2.44
+npm pack --ignore-scripts --pack-destination release/0.2.44
+tar -tzf release/0.2.44/dsh-nexus-0.2.44.tgz
+cd release/0.2.44
+sha256sum dsh-nexus-0.2.44.tgz > SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -46,7 +46,7 @@ sha256sum -c SHA256SUMS
 ```bash
 npm login --registry=https://registry.npmjs.org/ --browser=false
 npm whoami --registry=https://registry.npmjs.org/
-npm publish ./release/0.2.43/dsh-nexus-0.2.43.tgz --access public --tag next --registry=https://registry.npmjs.org/ --ignore-scripts
+npm publish ./release/0.2.44/dsh-nexus-0.2.44.tgz --access public --tag next --registry=https://registry.npmjs.org/ --ignore-scripts
 ```
 
 若 npm 要求二次验证，在本机终端按提示完成。不要提交凭据或授权链接。实验版使用 `next`，不主动设置 `latest`；用户在 DSH“添加插件”中填写 `dsh-nexus@next` 或指定版本。
@@ -55,9 +55,9 @@ npm 发布成功后核对版本、`next` 标签、registry 的 integrity，并�
 
 ## GitHub Release
 
-1. 审阅并推送公开源码提交；从实际用于打包的源码提交创建 `v0.2.43` 标签。
-2. 创建 Release，标题使用 `Nexus 0.2.43（实验版）`，勾选预发布选项。说明使用 CHANGELOG 中对应版本的内容。
-3. **先上传** `dsh-nexus-0.2.43.tgz` 和 `SHA256SUMS`，再发布 Release。校验文件必须包含该安装包的 SHA256。
+1. 审阅并推送公开源码提交；从实际用于打包的源码提交创建 `v0.2.44` 标签。
+2. 创建 Release，标题使用 `Nexus 0.2.44（实验版）`，勾选预发布选项。说明使用 CHANGELOG 中对应版本的内容。
+3. **先上传** `dsh-nexus-0.2.44.tgz` 和 `SHA256SUMS`，再发布 Release。校验文件必须包含该安装包的 SHA256。
 4. 发布后，GitHub Actions 的 **Update fixed installation link** 工作流自动校验这份已发布安装包，将相同字节同步到固定入口。它不重新构建安装包；运行失败时先查看日志，修正后通过 **Run workflow** 输入对应版本标签重试。
 5. 下载已发布版本附件及固定入口附件，检查 SHA256 与已验证安装包一致。源码公开和创建标签不会自动生成版本安装包。
 

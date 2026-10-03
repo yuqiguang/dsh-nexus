@@ -1,3 +1,4 @@
+import { reviewPolicy, type CoderReviewPolicy } from './review-policy.js';
 import { isAbsolute, resolve } from 'node:path';
 import type { Records } from '../channels/records.js';
 import { ChannelError } from '../channels/types.js';
@@ -5,7 +6,7 @@ import type { CoderKind } from './types.js';
 import { isManagedVersion } from './install-shared.js';
 
 /** Where a coder's binaries come from: the copy Nexus installs itself, or whatever the machine already has. */
-export type CoderSecurityMode = 'standard' | 'strict';
+export type CoderSecurityMode = 'standard' | 'strict' | 'full';
 export type CoderSource = 'managed' | 'system';
 export type ClaudeAuthHeader = 'auth-token' | 'api-key';
 export type CodexWireApi = 'responses' | 'chat';
@@ -47,6 +48,7 @@ export interface CoderSettingsRecord {
   maxConcurrent?: number;
   autoApproveSafe?: boolean;
   securityMode?: CoderSecurityMode;
+  reviewPolicy?: CoderReviewPolicy;
   allowedNetworkDomains?: string[];
   codex: CodexSettings;
   claude: ClaudeSettings;
@@ -59,6 +61,7 @@ export interface CoderSettingsInput {
   maxConcurrent?: unknown;
   autoApproveSafe?: unknown;
   securityMode?: unknown;
+  reviewPolicy?: unknown;
   allowedNetworkDomains?: unknown;
   codex?: unknown;
   claude?: unknown;
@@ -163,7 +166,8 @@ function decode(raw: unknown): CoderSettingsRecord | undefined {
   for (const coder of ['codex', 'claude'] as const) {
     if (value[coder].managedVersion !== undefined && !isManagedVersion(value[coder].managedVersion)) throw new ChannelError('invalid_saved_record');
   }
-  if (value.securityMode !== undefined && !['standard', 'strict'].includes(value.securityMode)) throw new ChannelError('invalid_saved_record');
+  if (value.securityMode !== undefined && !['standard', 'strict', 'full'].includes(value.securityMode)) throw new ChannelError('invalid_saved_record');
+  if (value.reviewPolicy !== undefined) reviewPolicy(value.reviewPolicy);
   if (value.projectRoot !== undefined && (typeof value.projectRoot !== 'string' || !isAbsolute(value.projectRoot))) throw new ChannelError('invalid_saved_record');
   if (value.allowedNetworkDomains !== undefined) networkDomains(value.allowedNetworkDomains);
   if (value.autoApproveSafe !== undefined && typeof value.autoApproveSafe !== 'boolean') throw new ChannelError('invalid_saved_record');
@@ -181,6 +185,7 @@ export interface CoderSettingsView {
   maxConcurrent?: number;
   autoApproveSafe?: boolean;
   securityMode?: CoderSecurityMode;
+  reviewPolicy?: CoderReviewPolicy;
   allowedNetworkDomains?: string[];
   codex: Omit<CodexSettings, 'apiKey'> & { apiKeyConfigured: boolean };
   claude: Omit<ClaudeSettings, 'token'> & { tokenConfigured: boolean };
@@ -189,7 +194,7 @@ export interface CoderSettingsView {
 export function redact(settings: CoderSettingsRecord): CoderSettingsView {
   const { apiKey, ...codex } = settings.codex;
   const { token, ...claude } = settings.claude;
-  return { securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: coderConcurrency(settings.maxConcurrent), autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: networkDomains(settings.allowedNetworkDomains), ...(settings.roots ? { roots: [...settings.roots] } : {}),
+  return { reviewPolicy: reviewPolicy(settings.reviewPolicy), securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: coderConcurrency(settings.maxConcurrent), autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: networkDomains(settings.allowedNetworkDomains), ...(settings.roots ? { roots: [...settings.roots] } : {}),
     codex: { ...codex, apiKeyConfigured: apiKey.length > 0 }, claude: { ...claude, tokenConfigured: token.length > 0 } };
 }
 
@@ -208,7 +213,7 @@ export class CoderSettingsStore {
     const codexInput = record(input.codex);
     const claudeInput = record(input.claude);
     const next = (previous: CoderSettingsRecord): CoderSettingsRecord => ({
-      version: 1, revision: previous.revision + 1, securityMode: oneOf(input.securityMode, ['standard', 'strict'] as const, previous.securityMode ?? 'standard'), autoApproveSafe: (input.autoApproveSafe as boolean | undefined) ?? previous.autoApproveSafe ?? true, maxTaskMinutes: taskMinutes(input.maxTaskMinutes ?? previous.maxTaskMinutes), allowedNetworkDomains: networkDomains(input.allowedNetworkDomains ?? previous.allowedNetworkDomains),
+      version: 1, revision: previous.revision + 1, reviewPolicy: reviewPolicy(input.reviewPolicy === undefined ? previous.reviewPolicy : input.reviewPolicy), securityMode: oneOf(input.securityMode, ['standard', 'strict', 'full'] as const, previous.securityMode ?? 'standard'), autoApproveSafe: (input.autoApproveSafe as boolean | undefined) ?? previous.autoApproveSafe ?? true, maxTaskMinutes: taskMinutes(input.maxTaskMinutes ?? previous.maxTaskMinutes), allowedNetworkDomains: networkDomains(input.allowedNetworkDomains ?? previous.allowedNetworkDomains),
       defaultCoder: oneOf(input.defaultCoder, ['codex', 'claude'] as const, previous.defaultCoder),
       ...(previous.projectRoot ? { projectRoot: previous.projectRoot } : {}),
       maxConcurrent: coderConcurrency(input.maxConcurrent === undefined ? previous.maxConcurrent : input.maxConcurrent),
