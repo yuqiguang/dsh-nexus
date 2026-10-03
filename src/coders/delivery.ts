@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { CoderBrief } from './brief.js';
 import { dependencyPassed } from './dependencies.js';
 import { isActive, type TaskRecord } from './types.js';
+import { changeSummary } from './change-summary.js';
 
 export interface AcceptanceReview { criterion: string; evidence: string; accepted: boolean; note: string; at: number }
 
@@ -30,12 +31,13 @@ export function deliveryReport(brief: CoderBrief, records: TaskRecord[]): string
     return `- ${item.id} ${item.text}：检查${state.checked ? '通过' : '未全部通过'}；业务验收${review ? review.accepted ? '用户已确认' : '用户未接受' : '待确认'}${review?.note ? `（${review.note}）` : ''}；任务 ${state.tasks.map(task => task.id).join('、') || '未安排'}`;
   });
   const files = [...new Set(tasks.flatMap(task => task.result?.changedFiles ?? []))].sort();
+  const changes = changeSummary(files);
   const commits = [...new Set(tasks.flatMap(task => task.result?.commits ?? []))];
   const active = tasks.some(isActive);
   const complete = accepted === brief.acceptance.length && checked === brief.acceptance.length && !active;
   return [`目标交付 ${brief.id} v${brief.revision}：${complete ? '检查与业务验收均通过' : active ? '仍有任务未结束' : '尚未完成全部验收'}`,
     `目标：${brief.objective}`, `检查通过 ${checked}/${brief.acceptance.length}，用户验收 ${accepted}/${brief.acceptance.length}`, ...lines,
-    `改动文件 ${files.length} 个：`, ...files.slice(0, 100).map(file => `- ${file}`), ...(files.length > 100 ? ['其余文件请查看对应任务结果。'] : []),
+    `改动文件共 ${files.length} 个：项目文件 ${changes.project.length}，依赖 ${changes.dependencies.length}，测试/缓存产物 ${changes.generated.length}；审计路径完整保留。`, ...changes.project.slice(0, 100).map(file => `- ${file}`), ...(changes.project.length > 100 ? ['其余项目文件请查看对应任务结果。'] : []),
     `任务期间观察到的 Git 提交 ${commits.length} 个：`, ...commits.slice(0, 50).map(commit => `- ${commit}`),
     '业务验收来自用户对具体验收项的回答；任务验证通过不自动等于业务验收通过。'].join('\n');
 }

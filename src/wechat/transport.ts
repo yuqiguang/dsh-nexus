@@ -5,6 +5,7 @@ import { ChannelError, type ConnectionRecord, type ConnectionState } from '../ch
 import { WechatClient, type WechatMessage } from './client.js';
 import { decryptMedia, inboundItems, mediaItem, outboundKind, prepareUpload, type WechatMediaRef } from './media.js';
 import { codecLabel, silkToWav } from './voice.js';
+import { WechatRequestError } from './errors.js';
 import { isFileDelivery, MAX_DELIVERY_ATTEMPTS, textParts, WechatStateStore } from './state.js';
 import { backoff, retryable, wait, type Wait } from './retry.js';
 
@@ -39,6 +40,7 @@ export class WechatTransport implements ChannelTransport {
   private readonly lifetime = new AbortController();
   private polling?: Promise<void>;
   private outgoing?: Promise<void>;
+  private wire = Promise.resolve();
   private flushRequested = false;
   private verified = false;
   private status: ConnectionState = { phase: 'connecting' };
@@ -72,31 +74,47 @@ export class WechatTransport implements ChannelTransport {
 
   async stop(): Promise<void> {
     this.lifetime.abort();
-    await Promise.allSettled([this.polling, this.outgoing]);
+    await Promise.allSettled([this.polling, this.outgoing, this.wire]);
   }
 
   async sendText(chatId: string, text: string, deliveryId: string, options?: DeliveryOptions): Promise<void> {
     if (chatId !== this.config.ownerId) throw new ChannelError('invalid_recipient');
     if (options?.durable) {
-      try { await this.store.enqueue(deliveryId, text); }
+      try { await this.store.enqueue(deliveryId, text, options.batchKey); }
       catch (error) { this.publish({ deliveryError: this.code(error) }); throw error; }
       await this.health();
       this.flush();
       return;
     }
-    const snapshot = await this.store.read();
-    const { contextToken } = snapshot;
-    if (!contextToken) throw new ChannelError('wechat_reply_context_missing');
-    if (this.stale(snapshot)) throw new ChannelError('wechat_context_stale');
-    try {
+    await this.sendWithContext(async (contextToken, signal) => {
       for (const part of textParts(text, deliveryId)) {
-        await this.client.sendText(chatId, contextToken, part.text, part.id, this.lifetime.signal);
+        signal.throwIfAborted();
+        await this.client.sendText(chatId, contextToken, part.text, part.id, signal);
       }
-    } catch (error) {
-      const code = this.code(error);
-      if (code === 'authentication_failed' || code === 'wechat_poller_conflict') this.publish({ phase: 'error', error: code });
-      throw error;
-    }
+    }, options?.signal);
+  }
+
+  /** One sender at a time, checking the latest reply allowance before touching the API. */
+  private sendWithContext(send: (token: string, signal: AbortSignal, revision: number) => Promise<void>, requestSignal?: AbortSignal): Promise<void> {
+    const signal = AbortSignal.any([this.lifetime.signal, ...(requestSignal ? [requestSignal] : [])]);
+    const sent = this.wire.then(async () => {
+      signal.throwIfAborted();
+      const snapshot = await this.store.read();
+      if (!snapshot.contextToken) throw new ChannelError('wechat_reply_context_missing');
+      if (snapshot.replyWait) throw new WechatRequestError('wechat_send_rejected', snapshot.replyWait.diagnostic);
+      if (this.stale(snapshot)) throw new ChannelError('wechat_context_stale');
+      try { await send(snapshot.contextToken, signal, snapshot.contextRevision ?? 0); }
+      catch (error) {
+        const code = this.code(error), diagnostic = error instanceof WechatRequestError ? error.diagnostic : undefined;
+        if (code === 'wechat_send_rejected') await this.store.waitForReply(snapshot.contextRevision ?? 0, diagnostic);
+        if (code === 'authentication_failed' || code === 'wechat_poller_conflict') this.publish({ phase: 'error', error: code });
+        else this.publish({ deliveryError: code, deliveryDiagnostic: diagnostic });
+        await this.health();
+        throw error;
+      }
+    });
+    this.wire = sent.catch(() => {});
+    return sent;
   }
 
   /**
@@ -113,10 +131,7 @@ export class WechatTransport implements ChannelTransport {
       this.flush();
       return;
     }
-    const snapshot = await this.store.read();
-    if (!snapshot.contextToken) throw new ChannelError('wechat_reply_context_missing');
-    if (this.stale(snapshot)) throw new ChannelError('wechat_context_stale');
-    await this.sendMedia(snapshot.contextToken, file, deliveryId);
+    await this.sendWithContext(token => this.sendMedia(token, file, deliveryId));
   }
 
   private async sendMedia(contextToken: string, file: OutboundFile, deliveryId: string): Promise<void> {
@@ -178,7 +193,10 @@ export class WechatTransport implements ChannelTransport {
     const snapshot = await this.store.read();
     const { pending } = snapshot;
     const held = pending.length > 0 && this.stale(snapshot) ? 'wechat_context_stale' : undefined;
-    this.publish({ pendingDeliveries: pending.length, deliveryError: held ?? pending.find(item => item.error)?.error });
+    const failed = pending.find(item => item.error);
+    this.publish({ pendingDeliveries: pending.length, waitingForReply: !!snapshot.replyWait,
+      deliveryError: snapshot.replyWait ? 'wechat_send_rejected' : held ?? failed?.error,
+      deliveryDiagnostic: snapshot.replyWait?.diagnostic ?? failed?.diagnostic });
   }
 
   private flush(): void {
@@ -199,11 +217,14 @@ export class WechatTransport implements ChannelTransport {
   private async flushPending(): Promise<void> {
     while (!this.lifetime.signal.aborted) {
       const snapshot = await this.store.read();
-      const item = snapshot.pending.find(item => item.attempts < MAX_DELIVERY_ATTEMPTS);
-      if (!item || !snapshot.contextToken) return;
+      const candidate = snapshot.pending.find(item => item.attempts < MAX_DELIVERY_ATTEMPTS);
+      if (!candidate || !snapshot.contextToken || snapshot.replyWait) return;
       // Held, not failed: the next inbound message refreshes the token and the poll loop flushes again.
       if (this.stale(snapshot)) { await this.health(); return; }
+      const item = await this.store.seal(candidate.id);
+      if (!item) continue;
       const part = isFileDelivery(item) ? { id: item.id, text: '' } : item.parts[item.nextPart]!;
+      let revision = snapshot.contextRevision ?? 0;
       try {
         if (isFileDelivery(item)) {
           let file: OutboundFile;
@@ -215,9 +236,9 @@ export class WechatTransport implements ChannelTransport {
             await this.store.replaceWithText(item.id, `文件 ${item.file.name} 已不在工作区或已改动，未能回传，请在本机 DSH 查看。`);
             continue;
           }
-          await this.sendMedia(snapshot.contextToken, file, item.id);
+          await this.sendWithContext(async (token, _signal, current) => { revision = current; await this.sendMedia(token, file, item.id); });
         } else {
-          await this.client.sendText(this.config.ownerId, snapshot.contextToken, part.text, part.id, this.lifetime.signal);
+          await this.sendWithContext(async (token, signal, current) => { revision = current; await this.client.sendText(this.config.ownerId, token, part.text, part.id, signal); });
         }
         await this.store.sent(item.id, part.id);
         await this.health();
@@ -225,7 +246,7 @@ export class WechatTransport implements ChannelTransport {
         if (this.lifetime.signal.aborted) return;
         if (['authentication_failed', 'wechat_poller_conflict'].includes(this.code(error))) throw error;
         const canRetry = retryable(error);
-        await this.store.failed(item.id, this.code(error), canRetry);
+        await this.store.failed(item.id, this.code(error), canRetry, error instanceof WechatRequestError ? error.diagnostic : undefined, revision);
         await this.health();
         if (!canRetry || item.attempts + 1 >= MAX_DELIVERY_ATTEMPTS) return;
         await this.sleep(backoff(item.attempts + 1), this.lifetime.signal);
@@ -253,7 +274,7 @@ export class WechatTransport implements ChannelTransport {
           const normalized = normalizeWechat(raw);
           if (!normalized || normalized.senderId !== this.config.ownerId) continue;
           if ((await this.store.read()).received.includes(normalized.messageId)) continue;
-          await this.store.rememberContext(raw.context_token!, this.now());
+          await this.store.rememberContext(raw.context_token!, this.now(), normalized.messageId);
           if (this.lifetime.signal.aborted) return;
           const message = await this.resolveMedia(normalized);
           if (this.lifetime.signal.aborted) return;

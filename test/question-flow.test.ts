@@ -43,7 +43,7 @@ async function fixture() {
     return bridge.ask({ agent, questions, signal } as unknown as AskUserQuestionRequest, local);
   }
   const questions = () => texts.filter(text => text.startsWith('需要你补充信息'));
-  return { bridge, prompts, texts, errors, events, ask, questions, setSend: (handler: typeof send) => { send = handler; },
+  return { bridge, prompts, texts, errors, events, ask, questions, sessionId: session.id, setSend: (handler: typeof send) => { send = handler; },
     setCold: () => { live = false; }, activations: () => activations, readClosed: () => readClosed };
 }
 
@@ -134,6 +134,24 @@ test('question cancellation, shutdown, and failed delivery release native waiter
     await f.bridge.close();
     await closed;
   } finally { await f.bridge.close(); }
+});
+
+test('failed WeChat question delivery is visible to its owner until the native desktop answer settles', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  f.setSend(async text => { if (text.startsWith('需要你补充信息')) throw new Error('fixture rejection'); });
+  let answer!: (value: AskUserQuestionAnswer) => void;
+  const waiting = f.ask([choice], undefined, () => new Promise(resolve => { answer = resolve; }));
+  await until(() => !!f.bridge.interactionWarning(f.sessionId), 'missing desktop delivery warning');
+  assert.match(f.bridge.interactionWarning(f.sessionId)!, /未完整送达微信.*电脑端处理/);
+  assert.equal(f.bridge.interactionWarning('unrelated-session'), undefined);
+  await f.bridge.receive(inbound('unpresented', '回答 1'));
+  assert.match(f.texts.at(-1)!, /没有匹配的待回答问题/);
+  answer({ answers: [{ id: 'format', selected: ['PDF'] }] });
+  assert.equal((await waiting).answers[0]?.selected[0], 'PDF');
+  assert.equal(f.bridge.interactionWarning(f.sessionId), undefined);
+  await f.bridge.drain();
+  assert.match(f.texts.at(-1)!, /已在电脑端完成回答/);
+  assert.equal(f.prompts.length, 0, 'channel recovery must not submit another task');
 });
 
 test('an oversized plan stays in the native UI without dropping its details', async t => {

@@ -41,6 +41,14 @@ test('task addresses and the dispatched id round-trip', () => {
   assert.equal(dispatchedTaskId([{ type: 'text', text: '工作目录不存在' }]), undefined);
 });
 
+test('the desktop task row exposes a channel delivery warning while native approval stays pending', async t => {
+  const document = await render(t, coderTaskRow(() => {}, async () => detail({ status: 'waiting-user', statusLabel: '等待用户回答',
+    pending: { at: 1, summary: '运行检查' }, channelWarning: '本会话有审批未完整送达微信，请在电脑端处理。' })) as ComponentType<never>,
+    { phase: 'result', block: { content: [{ type: 'text', text: '已派发编码任务 ct-0000abcd' }] } });
+  assert.match(document.querySelector('[role="alert"]')!.textContent!, /未完整送达微信/);
+  assert.match(document.body.textContent!, /等待用户回答/);
+});
+
 test('finished task details open the owning session and refresh versioned goal acceptance without dispatching work', async t => {
   const opened: string[] = [];
   let reads = 0;

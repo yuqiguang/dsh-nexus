@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WechatClient } from '../src/wechat/client.js';
+import { WechatRequestError } from '../src/wechat/errors.js';
 import { DEFAULT_CONTEXT_MAX_AGE_MS, WechatTransport, type WechatTransportOptions } from '../src/wechat/transport.js';
 import { MAX_DELIVERY_ATTEMPTS, WechatStateStore, type PendingText } from '../src/wechat/state.js';
 import { backoff, type Wait } from '../src/wechat/retry.js';
@@ -18,7 +19,7 @@ function fixture(records = new MemoryRecords(), account = grant, sleep: Wait = i
   const states: ConnectionState[] = [];
   const requests: { path: string; body: any }[] = [];
   const updates: (Response | Error)[] = [];
-  let send: (body: any) => Response = () => Response.json({ ret: 0 });
+  let send: (body: any) => Response | Promise<Response> = () => Response.json({ ret: 0 });
   let wake: (() => void) | undefined;
   const fetchImpl: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
@@ -287,7 +288,7 @@ test('interactive approval prompts are never stored for later replay', async t =
   assert.deepEqual((await f.store.read()).pending, []);
 });
 
-test('permanent delivery failures pause, remain visible, and can be explicitly retried', async t => {
+test('send rejection pauses delivery and requires a new owner message instead of manual retries', async t => {
   const f = fixture();
   t.after(() => f.transport.stop());
   await f.store.rememberContext('context');
@@ -298,8 +299,9 @@ test('permanent delivery failures pause, remain visible, and can be explicitly r
   assert.equal(f.sent().length, 1);
   assert.equal(f.states.at(-1)?.pendingDeliveries, 1);
   f.setSend(() => Response.json({ ret: 0 }));
-  await f.transport.retryPending();
-  await until(async () => (await f.store.read()).pending.length === 0, 'manual retry did not drain the result');
+  await assert.rejects(f.transport.retryPending(), /wechat_send_rejected/);
+  f.feed(Response.json({ msgs: [message('resume-after-refusal')], get_updates_buf: 'fresh' }));
+  await until(async () => (await f.store.read()).pending.length === 0, 'new owner message did not drain the result');
   assert.equal(f.sent().length, 2);
   assert.equal(f.sent()[0].client_id, f.sent()[1].client_id);
 });
@@ -356,4 +358,132 @@ test('a reply context recorded before ages were kept is still used, and a fresh 
   await legacy.transport.sendText(grant.ownerId, '旧记录', 'legacy-1', { durable: true });
   await until(() => legacy.sent().length === 1, 'legacy token was not used');
   assert.equal(legacy.sent()[0].context_token, 'legacy');
+});
+
+test('WeChat rejection preserves only numeric diagnostics and distinguishes send refusal from authentication and polling', async () => {
+  for (const sample of [
+    { status: 200, value: { ret: '-54321', errcode: -54322, errmsg: 'private-token https://private.example/?token=secret' }, code: 'wechat_send_rejected' },
+    { status: 403, value: { errcode: -54322 }, code: 'wechat_send_rejected' },
+    { status: 401, value: {}, code: 'authentication_failed' },
+    { status: 200, value: { ret: '-14' }, code: 'authentication_failed' },
+  ]) {
+    const client = new WechatClient(undefined, grant.secret, async () => Response.json(sample.value, { status: sample.status }));
+    await assert.rejects(client.sendText(grant.ownerId, 'private-context', 'private-text', 'id', new AbortController().signal), error => {
+      assert.ok(error instanceof WechatRequestError);
+      assert.equal(error.code, sample.code);
+      assert.equal(error.diagnostic?.httpStatus, sample.status);
+      assert.equal(error.diagnostic?.operation, 'send');
+      if (sample.value.errcode) assert.equal(error.diagnostic?.errcode, -54322);
+      assert.doesNotMatch(JSON.stringify(error), /private|secret|https/);
+      return true;
+    });
+  }
+});
+
+test('send refusal pauses the whole outbox across restart and a new owner message with the same token restores only unsent parts', async t => {
+  const f = fixture(); t.after(() => f.transport.stop());
+  await f.store.rememberContext('same-token', Date.now(), 'old');
+  f.setSend(() => f.sent().length === 1 ? Response.json({ ret: 0 }) : Response.json({ ret: -54321 }));
+  await f.transport.start(async () => assert.fail('no task should run'));
+  await f.transport.sendText(grant.ownerId, '文'.repeat(1700), 'long-result', { durable: true });
+  await until(async () => !!(await f.store.read()).replyWait, 'refusal did not hold the reply allowance');
+  const before = await f.store.read();
+  assert.equal((before.pending[0] as PendingText).nextPart, 1);
+  assert.equal(before.replyWait?.diagnostic?.ret, -54321);
+  await f.transport.sendText(grant.ownerId, 'following result', 'after', { durable: true });
+  await assert.rejects(f.transport.sendText(grant.ownerId, 'interactive approval', 'prompt'), /wechat_send_rejected/);
+  await assert.rejects(f.transport.retryPending(), /wechat_send_rejected/);
+  assert.equal(f.sent().length, 2, 'no later item or approval should spend another API request');
+  await f.transport.stop();
+  const restored = fixture(f.records); t.after(() => restored.transport.stop());
+  const admitted: string[] = [];
+  await restored.transport.start(async incoming => { admitted.push(incoming.messageId); });
+  await until(() => restored.requests.filter(r => r.path.endsWith('getupdates')).length >= 2, 'restored polling');
+  assert.equal(restored.sent().length, 0, 'authentication and process restart must not reset the hold');
+  restored.feed(Response.json({ msgs: [message('foreign', 'stranger', 'same-token')], get_updates_buf: 'foreign' }));
+  await until(async () => (await restored.store.read()).cursor === 'foreign', 'foreign update');
+  assert.equal(restored.sent().length, 0);
+  restored.feed(Response.json({ msgs: [message('new-owner-message', grant.ownerId, 'same-token')], get_updates_buf: 'new' }));
+  await until(async () => (await restored.store.read()).pending.length === 0, 'new message did not resume delivery');
+  assert.deepEqual(admitted, ['new-owner-message']);
+  assert.equal(restored.sent().length, 3);
+  assert.equal(restored.sent()[0].client_id, f.sent()[1].client_id, 'resume the failed wire part with its original client id');
+  assert.ok(restored.sent().every(sent => sent.client_id !== f.sent()[0].client_id));
+  assert.ok(restored.sent().every(sent => !sent.item_list[0].text_item.text.includes('interactive approval')));
+  assert.equal((await restored.store.read()).replyWait, undefined);
+});
+
+test('duplicate inbound messages and delayed rejections cannot reset or consume a newer reply allowance', async t => {
+  const f = fixture(); t.after(() => f.transport.stop());
+  await f.store.rememberContext('same', Date.now(), 'old');
+  let release!: (value: Response) => void;
+  f.setSend(() => new Promise(resolve => { release = resolve; }));
+  const old = assert.rejects(f.transport.sendText(grant.ownerId, 'old', 'old'), /wechat_send_rejected/);
+  await until(() => !!release, 'old request');
+  await f.store.rememberContext('same', Date.now(), 'new');
+  release(Response.json({ ret: -54321 }));
+  await old;
+  assert.equal((await f.store.read()).replyWait, undefined, 'old failure must not block a newer owner message');
+  const revision = (await f.store.read()).contextRevision!;
+  await f.store.waitForReply(revision);
+  await f.store.rememberContext('same', Date.now(), 'new');
+  assert.equal((await f.store.read()).replyWait?.contextRevision, revision, 'replayed message cannot refill allowance');
+  await f.store.rememberContext('same', Date.now(), 'newer');
+  assert.equal((await f.store.read()).replyWait, undefined);
+});
+
+test('receipt batches keep every result and source id, never rewrite sealed or partial wire messages, and survive restart', async () => {
+  const records = new MemoryRecords();
+  const store = new WechatStateStore(records, 'bot', 'owner');
+  await store.enqueue('receipt-1', 'first allowed', 'session-a');
+  await store.enqueue('receipt-2', 'second denied', 'session-a');
+  const sealed = await store.seal('receipt-1') as PendingText;
+  assert.deepEqual(sealed.sourceIds, ['receipt-1', 'receipt-2']);
+  assert.equal(sealed.parts[0]!.text, 'first allowed\n\nsecond denied');
+  await store.failed(sealed.id, 'wechat_send_rejected', false);
+  await store.enqueue('receipt-3', 'third allowed', 'session-a');
+  await store.enqueue('receipt-4', 'fourth denied', 'session-b');
+  await store.enqueue('result', 'complete task result');
+  assert.deepEqual(((await store.read()).pending[0] as PendingText).parts, sealed.parts);
+  assert.equal((await store.read()).pending.length, 4);
+  const reopened = new WechatStateStore(records, 'bot', 'owner');
+  await reopened.sent(sealed.id, sealed.parts[0]!.id);
+  await reopened.enqueue('receipt-2', 'duplicate must not appear', 'session-a');
+  assert.equal((await reopened.read()).pending.length, 3);
+  assert.deepEqual((await reopened.read()).delivered, ['receipt-1', 'receipt-2']);
+  assert.equal((await reopened.read()).pending[2]!.id, 'result');
+});
+
+test('cancelling a live prompt stops remaining parts without persisting an approval for recovery', async t => {
+  const f = fixture(); t.after(() => f.transport.stop());
+  await f.store.rememberContext('context');
+  const controller = new AbortController();
+  f.setSend(() => { controller.abort(); return Response.json({ ret: 0 }); });
+  await assert.rejects(f.transport.sendText(grant.ownerId, 'approval'.repeat(300), 'prompt', { signal: controller.signal }));
+  assert.equal(f.sent().length, 1);
+  assert.deepEqual((await f.store.read()).pending, []);
+  assert.equal((await f.store.read()).replyWait, undefined);
+});
+
+test('all reply-state transitions satisfy the native credential JSON round-trip contract', async () => {
+  const memory = new MemoryRecords();
+  const store = new WechatStateStore({
+    read: key => memory.read(key),
+    modify: (key, update) => memory.modify(key, async current => {
+      const next = await update(current);
+      assert.deepEqual(next, JSON.parse(JSON.stringify(next)), 'native credentials reject undefined payload fields');
+      return next;
+    }),
+  }, 'bot', 'owner');
+  await store.rememberContext('context', Date.now(), 'one');
+  await store.enqueue('receipt', 'allowed', 'session');
+  await store.seal('receipt');
+  await store.failed('receipt', 'connection_failed', true);
+  await store.waitForReply(1);
+  await store.rememberContext('context', Date.now(), 'two');
+  await store.waitForReply(2, { operation: 'send', httpStatus: 200, ret: -54321 });
+  await store.rememberContext('context', Date.now(), 'three');
+  await store.retry();
+  const item = (await store.read()).pending[0] as PendingText;
+  await store.sent(item.id, item.parts[0]!.id);
 });

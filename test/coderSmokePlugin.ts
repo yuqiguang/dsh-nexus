@@ -92,7 +92,7 @@ class FixtureModel extends LlmAdapter {
       ] });
     } else if (step === 2) {
       assert.match(toolResultText(options, 'plan'), /步骤计划/);
-      yield* this.toolCall('dispatch', 'coder_task', { coder: 'claude', description: '列出目录内容并报告', verify_network: 'ask', brief_id: this.briefId, brief_revision: 2, plan_step: 'inspect' });
+      yield* this.toolCall('dispatch', 'coder_task', { coder: 'claude', verify_network: 'ask', brief_id: this.briefId, brief_revision: 2, plan_step: 'inspect' });
     } else if (step === 3) {
       const text = toolResultText(options, 'dispatch');
       assert.ok(text.includes(`实际项目目录：${this.coderCwd}`));
@@ -310,12 +310,13 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.match(await localCheck(ctx, model.coderCwd, sessionId, 'node local-check.cjs', undefined, new AbortController().signal), /native-local/);
     await store.close();
     const reopened = await CoderStore.open(ctx.storageDomain);
-    try { assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage');
+    try { assert.equal(reopened.get(done.id)!.brief?.cwd, done.cwd, 'bound project snapshot survives native storage reopening');
+      assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage');
       assert.deepEqual(reopened.get(done.id)!.retry, done.retry, 'retry state survives native storage reopening');
       assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

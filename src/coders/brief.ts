@@ -4,21 +4,25 @@ import { briefTasks, criterionEvidence, deliveryReport, type AcceptanceReview } 
 import { planSchema, validatePlan } from './plan.js';
 import type { Context } from '@deepseek-ai/cordis';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
-import { defineTool } from '@deepseek-ai/dsh-tools';
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { isActive, type TaskRecord } from './types.js';
 import { dependencyPassed } from './dependencies.js';
 import { taskStatusLabel } from './status.js';
+import { isInside } from './rules.js';
+import { changeSummary } from './change-summary.js';
 
 export const briefSnapshotSchema = z.object({
   id: z.string(), revision: z.number().int().positive(), objective: z.string().min(1).max(4000), constraints: z.string().max(4000),
+  cwd: z.string().min(1).optional(),
   acceptance: z.array(z.object({ id: z.string(), text: z.string().min(1).max(500) })).min(1).max(20),
 });
 export type BriefSnapshot = z.infer<typeof briefSnapshotSchema>;
 const briefSchema = briefSnapshotSchema.extend({ answers: z.array(z.object({ key: z.string(), answers: z.record(z.string(), z.string()) })).optional(), reviews: z.array(z.object({ criterion: z.string(), evidence: z.string(), accepted: z.boolean(), note: z.string(), at: z.number() })).optional(), plan: planSchema.optional(), ownerSession: z.string(), createdAt: z.number(), updatedAt: z.number() });
 export type CoderBrief = z.infer<typeof briefSchema>;
 const inputSchema = z.object({ objective: z.string().trim().min(1).max(4000), constraints: z.string().trim().max(4000).default(''),
+  cwd: z.string().trim().min(1).optional(),
   acceptance: z.array(z.string().trim().min(1).max(500)).min(1).max(20) });
 export const briefDomain = defineDomain({ name: 'nexus_coder_briefs', version: 1, layout: 'per-record',
   tables: { briefs: domainTable<string, CoderBrief>(briefSchema) } });
@@ -39,7 +43,7 @@ export class BriefStore {
     if (id && this.changing.has(id)) throw new Error('说明单正在应用变更，请稍后重试。');
     const existing = id ? this.get(id, owner) : undefined;
     const fieldsInput = input && typeof input === 'object' ? input as Record<string, unknown> : {};
-    const parsed = inputSchema.safeParse({ ...fieldsInput, constraints: fieldsInput.constraints ?? existing?.constraints ?? '' });
+    const parsed = inputSchema.safeParse({ ...fieldsInput, cwd: fieldsInput.cwd ?? existing?.cwd, constraints: fieldsInput.constraints ?? existing?.constraints ?? '' });
     if (!parsed.success) throw new Error('请提供目标、约束和 1 至 20 条验收标准；目标与约束各最多 4000 字，单条标准最多 500 字。');
     const fields = { ...parsed.data, acceptance: parsed.data.acceptance.map((text, index) => ({ id: `a${index + 1}`, text })) };
     if (id) {
@@ -60,6 +64,15 @@ export class BriefStore {
     return this.table.update(id, current => {
       if (current.ownerSession !== owner || current.revision !== revision) throw new Error('任务说明单版本已变化，请重新读取后再保存计划。');
       return { ...current, plan, answers: undefined, reviews: undefined, revision: current.revision + 1, updatedAt: Date.now() };
+    });
+  }
+  /** Bind the first admitted project's directory without changing its goal revision. */
+  async bindDirectory(id: string, owner: string, revision: number, cwd: string): Promise<void> {
+    this.get(id, owner);
+    await this.table.update(id, current => {
+      if (current.ownerSession !== owner || current.revision !== revision || this.changing.has(id)) throw new Error('任务说明单版本已变化，请重新读取后再派发。');
+      if (current.cwd && !isInside(current.cwd, cwd)) throw new Error(`任务目录必须位于说明单绑定的项目目录内：${current.cwd}`);
+      return current.cwd ? current : { ...current, cwd };
     });
   }
   answer(id: string, owner: string, revision: number, key: string): Record<string, string> | undefined {
@@ -107,7 +120,7 @@ export class BriefStore {
 /** Coverage is evidence, never a mechanical claim that the user's whole goal was met. */
 export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
   const tasks = briefTasks(brief, records);
-  const lines = [`任务说明单 ${brief.id}，版本 ${brief.revision}`, `目标：${brief.objective}`, `约束：${brief.constraints || '未补充'}`, '验收覆盖：'];
+  const lines = [`任务说明单 ${brief.id}，版本 ${brief.revision}`, `目标：${brief.objective}`, `项目目录：${brief.cwd ?? '尚未绑定；首次派发的实际目录将固定为本说明单的项目目录'}`, `约束：${brief.constraints || '未补充'}`, '验收覆盖：'];
   for (const criterion of brief.acceptance) {
     const related = tasks.filter(task => task.brief!.acceptance.some(item => item.id === criterion.id));
     const state = !related.length ? '尚未安排' : related.some(isActive) ? '进行中或等待中' : related.some(task => ['failed', 'cancelled', 'interrupted'].includes(task.status))
@@ -117,19 +130,24 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
   if (brief.plan) lines.push('步骤计划（依赖顺序；尚未派发不代表已执行）：', ...brief.plan.map(step => `${step.id}：${step.description}；验收项 ${step.acceptance_ids.join('、')}；前置步骤 ${step.depends_on.join('、') || '无'}；验证 ${step.verify}`));
   const obsolete = records.filter(task => task.ownerSession === brief.ownerSession && task.brief?.id === brief.id && task.brief.revision !== brief.revision && isActive(task));
   if (obsolete.length) lines.push(`旧版本仍有活动任务：${obsolete.map(task => task.id).join('、')}。运行中的任务仍按原说明执行；修改说明单不会自动调整已运行任务，请明确停止或调整它们。`);
-  lines.push('任务结果：', ...(tasks.length ? tasks.slice(0, 50).map(task => `${task.id}${task.planStep ? `（步骤 ${task.planStep}）` : ''} ${taskStatusLabel(task)}：${task.description.slice(0, 160)}${task.verify ? `；验证：${[task.verify, ...(task.verifyCommands ?? [])].join('；')}` : ''}${task.result ? `；改动 ${task.result.changedFiles.length} 个文件；${(task.result.detail || task.result.summary).slice(0, 240)}` : ''}`) : ['尚无本版本的关联任务。']),
+  lines.push('任务结果：', ...(tasks.length ? tasks.slice(0, 50).map(task => {
+    const changes = changeSummary(task.result?.changedFiles ?? []);
+    return `${task.id}${task.planStep ? `（步骤 ${task.planStep}）` : ''} ${taskStatusLabel(task)}：${task.description.slice(0, 160)}${task.verify ? `；验证：${[task.verify, ...(task.verifyCommands ?? [])].join('；')}` : ''}${task.result ? `；项目文件 ${changes.project.length}，依赖 ${changes.dependencies.length}，测试/缓存产物 ${changes.generated.length}；${(task.result.detail || task.result.summary).slice(0, 240)}` : ''}`;
+  }) : ['尚无本版本的关联任务。']),
     ...(tasks.length > 50 ? [`另有 ${tasks.length - 50} 个任务未展开；验收覆盖仍统计全部关联任务。`] : []),
     '以上仅汇总任务与检查证据，不代表完整目标已验收；未关联的要求和实际业务效果仍需主助手核对。');
   return lines.join('\n');
 }
 
-export function coderPrompt(task: Pick<TaskRecord, 'description' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd'>): string {
-  const description = task.description + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件；任何一项失败或未执行都不能报告全部验收通过。` : '');
+export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd'>): string {
+  const description = task.description + (task.continuation ? `\n\n[本次续接说明]\n${task.continuation}\n仍须满足已保存的目标、共同约束和完整验收；不能用续接说明替换或缩小它们。` : '')
+    + (task.brief ? '\n\n[执行前核对]\n先核对实际项目目录和所需运行环境。凭据路径（包括 .env、.env.example 等 .env.*）受硬规则保护，不创建或读取；配置说明写在 README 或源码注释中。发现环境或依赖加载失败，先定位并采用可恢复的修复，不通过删除依赖、改写测试或换技术栈掩盖真实启动失败。' : '')
+    + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件；任何一项失败或未执行都不能报告全部验收通过。` : '');
   if (!task.brief) return description;
   return `${description}\n\n[派发时的任务说明单 ${task.brief.id}，版本 ${task.brief.revision}]\n总体目标：${task.brief.objective}\n共同约束：${task.brief.constraints || '无补充'}\n本任务负责的验收项：\n${task.brief.acceptance.map(item => `${item.id}. ${item.text}`).join('\n')}\n只完成本任务负责的部分，不把单个子任务完成表述为整个目标已完成。已明确的目标不重复澄清；技术细节先查项目，只有影响目标、范围或授权的新问题才反馈。说明单不会扩大工具权限。`;
 }
 
-export async function installBriefs(ctx: Context, records: () => TaskRecord[], stopTasks?: (tasks: TaskRecord[]) => Promise<void>, askUser?: (request: Parameters<typeof ctx.userQuestions.ask>[0]) => ReturnType<typeof ctx.userQuestions.ask>): Promise<BriefStore> {
+export async function installBriefs(ctx: Context, records: () => TaskRecord[], stopTasks?: (tasks: TaskRecord[]) => Promise<void>, askUser?: (request: Parameters<typeof ctx.userQuestions.ask>[0]) => ReturnType<typeof ctx.userQuestions.ask>, resolveDirectory?: (path: string, exec: ToolRunContext) => Promise<string>): Promise<BriefStore> {
   const store = new BriefStore(await ctx.storageDomain.open(briefDomain));
   ctx.effect(() => () => { void store.close(); });
   ctx.effect(() => ctx.tools.register(defineTool({
@@ -139,9 +157,10 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
       action: { type: 'string', enum: ['save', 'plan', 'get', 'list', 'delivery', 'review', 'recover', 'impact', 'amend'], required: true, description: 'save 新建或修改（清除旧步骤计划）；plan 保存完整步骤计划并检查覆盖、引用和循环依赖；get 查询覆盖；list 列表；delivery 交付汇总；review 用户验收；recover 恢复清单；impact 预览变更；amend 停止旧版活动任务后应用新版本。' },
       brief_id: { type: 'string', description: 'get 或修改时必填。' },
       revision: { type: 'integer', description: '修改时填写刚读取的版本；旧版本会被拒绝。' },
+      cwd: { type: 'string', description: 'save 时可指定项目根目录（相对于当前会话工作区）；新项目应在这里绑定目录。省略时首次派发会固定实际目录。后续步骤默认沿用，不能越出项目或会话边界。' },
       criterion: { type: 'string', description: 'review 必填，向用户确认的具体验收项 ID。' },
       note: { type: 'string', description: 'review 可填，向用户说明核验方式与实际结果，最多 1000 字；不能代替用户确认。' },
-      steps: { type: 'array', description: 'plan 必填，完整步骤列表。保存成功会生成新版本；不启动任务。', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, description: { type: 'string', required: true }, acceptance_ids: { type: 'array', items: { type: 'string' }, required: true }, depends_on: { type: 'array', items: { type: 'string' }, required: true }, verify: { type: 'string', required: true } } } },
+      steps: { type: 'array', description: 'plan 必填，完整步骤列表。保存成功会生成新版本；不启动任务。需要已有运行环境的步骤用 preflight 登记环境自检脚本；outputs 列预期文件以便提前检查保护规则。', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, description: { type: 'string', required: true }, acceptance_ids: { type: 'array', items: { type: 'string' }, required: true }, depends_on: { type: 'array', items: { type: 'string' }, required: true }, verify: { type: 'string', required: true }, preflight: { type: 'string' }, outputs: { type: 'array', items: { type: 'string' } } } } },
       objective: { type: 'string', description: '用户目标，不自行扩大范围。save 必填。' },
       constraints: { type: 'string', description: '用户已明确的范围、约束及关键决定。save 时完整填写。' },
       acceptance: { type: 'array', items: { type: 'string' }, description: '1 至 20 条具体可核验的验收标准。save 必填。修改会生成新版本，旧任务不自动计入新版本。' },
@@ -182,7 +201,12 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
         }
         return { text: deliveryReport(store.get(brief.id, owner), records()) };
       }
-      const brief = args.action === 'plan' ? await store.plan(args.brief_id!, owner, args.revision, args.steps) : args.action === 'save' ? await store.save(owner, args, args.brief_id, args.revision) : store.get(args.brief_id!, owner);
+      let cwd: string | undefined;
+      if (args.cwd !== undefined) {
+        if (args.action !== 'save' || !resolveDirectory) throw new Error('项目目录只能通过可验证工作区边界的 save 操作设置。');
+        cwd = await resolveDirectory(args.cwd, exec);
+      }
+      const brief = args.action === 'plan' ? await store.plan(args.brief_id!, owner, args.revision, args.steps) : args.action === 'save' ? await store.save(owner, { ...args, cwd }, args.brief_id, args.revision) : store.get(args.brief_id!, owner);
       return { text: briefReport(brief, records()) };
     },
   })));

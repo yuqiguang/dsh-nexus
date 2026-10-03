@@ -17,6 +17,7 @@ export interface TaskSummary {
   activity?: string;
   pending?: string;
   pendingReason?: string;
+  channelWarning?: string;
   completionNotice?: TaskRecord['completionNotice'];
 }
 

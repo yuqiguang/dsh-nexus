@@ -632,11 +632,16 @@ export class DshChannelBridge {
     if (!chatId || this.stopped) return next();
     const prompts = request.questions.map((question, index) => questionPrompt(question, index, request.questions.length));
     if (prompts.some(prompt => prompt.length > 2500)) {
+      const local = new AbortController();
+      const signal = AbortSignal.any([local.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
       void this.transport.sendText(chatId, '这个问题需要在本机 DSH 查看完整内容并回答。',
-        identity('local-question', request.agent!.id, ...request.questions.map(question => question.id))).catch(() => {});
-      const answer = await next();
-      if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopQuestionReceipt(request, answer), identity('desktop-question', request.agent!.id, crypto.randomUUID()));
-      return answer;
+        identity('local-question', request.agent!.id, ...request.questions.map(question => question.id)), { signal })
+        .catch(() => { if (!signal.aborted) this.promptDeliveryFailed(request, request.agent!.id); });
+      try {
+        const answer = await next(signal);
+        if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopQuestionReceipt(request, answer), identity('desktop-question', request.agent!.id, crypto.randomUUID()), request.agent!.id);
+        return answer;
+      } finally { local.abort(); this.failedInteractions.delete(request); }
     }
     const lifetime = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
@@ -647,7 +652,10 @@ export class DshChannelBridge {
         const pending = this.questions.open(chatId, question, index === request.questions.length - 1, signal);
         // Do not delay native presentation or settlement on a slow channel send.
         void this.transport.sendText(chatId, `${prompts[index]}\n也可在本机 DSH 回答；任一端完成整组回答后另一端失效。\n多项问题同时等待时：回答 ${pending.token} 内容`,
-          identity('question', pending.token)).then(pending.presented, pending.unavailable);
+          identity('question', pending.token), { signal }).then(pending.presented, () => {
+            if (!signal.aborted) this.promptDeliveryFailed(request, request.agent!.id);
+            pending.unavailable();
+          });
         answers.push(await pending.outcome);
       }
       return { answers };
@@ -655,18 +663,32 @@ export class DshChannelBridge {
     const result = await firstAvailable([
       remote().then(value => ({ source: 'channel', value })),
       Promise.resolve().then(() => next(signal)).then(value => ({ source: 'desktop', value })),
-    ], () => true).finally(() => lifetime.abort());
+    ], () => true).finally(() => { lifetime.abort(); this.failedInteractions.delete(request); });
     if (result.source === 'desktop' && !request.signal?.aborted) {
-      this.desktopReceipt(chatId, desktopQuestionReceipt(request, result.value), identity('desktop-question', request.agent!.id, crypto.randomUUID()));
+      this.desktopReceipt(chatId, desktopQuestionReceipt(request, result.value), identity('desktop-question', request.agent!.id, crypto.randomUUID()), request.agent!.id);
     }
     return result.value;
   }
 
   /** Queue a produced result before later turn replies; network delivery cannot block the decision. */
-  private desktopReceipt(chatId: string, text: string | undefined, deliveryId: string): void {
+  private readonly failedInteractions = new Map<object, { sessionId: string; warning: string }>();
+
+  private promptDeliveryFailed(request: object, sessionId: string): void {
+    const channel = this.config.channel === 'wechat' ? '微信' : this.config.channel === 'feishu' ? '飞书' : '企业微信';
+    this.failedInteractions.set(request, { sessionId, warning: `本会话有审批或提问未完整送达${channel}，请在电脑端处理。本次提示不会自动补发；渠道发送状态可在设置中查看。` });
+    this.report('channel_interaction_delivery_failed');
+  }
+
+  interactionWarning(sessionId: string): string | undefined {
+    if (this.stopped) return;
+    return [...this.failedInteractions.values()].find(item => item.sessionId === sessionId)?.warning;
+  }
+
+  private desktopReceipt(chatId: string, text: string | undefined, deliveryId: string, sessionId?: string): void {
     if (!text || this.stopped) return;
     this.outgoing = this.outgoing.then(async () => {
-      if (!this.stopped) await this.transport.sendText(chatId, text, deliveryId, { durable: true });
+      if (!this.stopped) await this.transport.sendText(chatId, text, deliveryId, { durable: true,
+        ...(sessionId ? { batchKey: identity('desktop-receipts', sessionId) } : {}) });
     }).catch(() => { this.report('channel_desktop_receipt_failed'); });
   }
 
@@ -706,11 +728,16 @@ export class DshChannelBridge {
     const prompt = `需要你确认后继续\n操作：${title}\n${request.reason ? `原因：${request.reason}\n` : ''}完整参数：\n${parameters}`;
     // Exact arguments must fit in the remote prompt. Larger or unbound requests remain in the native UI.
     if (!args || prompt.length > 2500) {
+      const local = new AbortController();
+      const signal = AbortSignal.any([local.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
       void this.transport.sendText(chatId, '此操作需要在本机 DSH 查看完整参数并审批。',
-        identity('local-approval', request.agent.id, String(request.callId))).catch(() => {});
-      const outcome = await next();
-      if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopApprovalReceipt(title, outcome), identity('desktop-approval', request.agent.id, String(request.callId), crypto.randomUUID()));
-      return outcome;
+        identity('local-approval', request.agent.id, String(request.callId)), { signal })
+        .catch(() => { if (!signal.aborted) this.promptDeliveryFailed(request, request.agent.id); });
+      try {
+        const outcome = await next(signal);
+        if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopApprovalReceipt(title, outcome), identity('desktop-approval', request.agent.id, String(request.callId), crypto.randomUUID()), request.agent.id);
+        return outcome;
+      } finally { local.abort(); this.failedInteractions.delete(request); }
     }
     const lifetime = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
@@ -719,13 +746,16 @@ export class DshChannelBridge {
       `${prompt}\n\n也可在本机 DSH 审批；任一端处理后另一端失效。\n只有一项待审批时，直接回复“允许”或“拒绝”。\n` +
       `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
       '有效期 10 分钟，仅本次操作。停止当前执行：/cancel',
-      identity('approval', pending.token)).then(pending.presented, () => { this.replies.answer(chatId, pending.token, 'unavailable'); });
+      identity('approval', pending.token), { signal }).then(pending.presented, () => {
+        if (!signal.aborted) this.promptDeliveryFailed(request, request.agent.id);
+        this.replies.answer(chatId, pending.token, 'unavailable');
+      });
     const result = await firstAvailable([
       pending.outcome.then(value => ({ source: 'channel', value })),
       Promise.resolve().then(() => next(signal)).then(value => ({ source: 'desktop', value })),
-    ], result => result.value !== 'unavailable').finally(() => lifetime.abort());
+    ], result => result.value !== 'unavailable').finally(() => { lifetime.abort(); this.failedInteractions.delete(request); });
     if (result.source === 'desktop' && !request.signal?.aborted) {
-      this.desktopReceipt(chatId, desktopApprovalReceipt(title, result.value), identity('desktop-approval', pending.token));
+      this.desktopReceipt(chatId, desktopApprovalReceipt(title, result.value), identity('desktop-approval', pending.token), request.agent.id);
     }
     return result.value;
   }
@@ -781,6 +811,8 @@ export class DshChannelBridge {
   private async beat(session: Session, chatId: string, turn: number): Promise<void> {
     const state = this.heartbeats.get(session.id);
     if (this.stopped || !state || state.turn !== turn) return;
+    // One unsolicited progress reminder per WeChat turn leaves room for approvals and results.
+    if (this.config.channel === 'wechat' && state.count > 0) return;
     const reschedule = () => { state.timer = setTimeout(() => { void this.beat(session, chatId, turn); }, this.heartbeat.everyMs); state.timer.unref?.(); };
     const events = session.snapshotEvents();
     const boundary = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');

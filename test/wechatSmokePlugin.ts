@@ -15,7 +15,7 @@ import { aborted, until } from './helpers.js';
 import { wechatHttpFixture, type WireReply } from './wechatHttpFixture.js';
 
 export const name = 'nexus-wechat-smoke';
-export const inject = ['llm', 'sessionController', 'sessions', 'credentials', 'tools', 'sandboxPolicy', 'agents'];
+export const inject = ['llm', 'sessionController', 'sessions', 'sessionPersistence', 'credentials', 'tools', 'sandboxPolicy', 'agents'];
 const grant: ConnectionRecord = { version: 1, revision: 1, enabled: true, accountId: 'wx-delivery-bot', ownerId: 'wx-delivery-owner',
   secret: 'local-delivery-token', baseUrl: 'https://ilinkai.weixin.qq.com' };
 const owner = { channel: 'wechat' as const, accountId: grant.accountId, ownerId: grant.ownerId };
@@ -115,18 +115,29 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       remainingParts = (saved.pending[0] as PendingText).parts.slice(1);
       await assert.rejects(transport.sendText(owner.ownerId, '仅当前连接有效：/approve local-fixture', 'ephemeral-approval'), /server_unavailable/);
       assert.equal((await store.read()).pending.length, 1, 'interactive prompt must not join the durable outbox');
+      http.rejectSends(-54321); // Synthetic code; do not infer a production quota number from it.
+      await assert.rejects(transport.sendText(owner.ownerId, 'live question', 'quota-prompt'), /wechat_send_rejected/);
+      assert.equal((await store.read()).replyWait?.diagnostic?.ret, -54321);
       await bridge.close();
       checks.push('wechat_loopback_http_transport', 'wechat_cursor_after_native_flush', 'wechat_partial_progress_persisted',
         'wechat_transient_retry_keeps_wire_payload', 'wechat_interactive_prompt_not_persisted',
-        'wechat_rejected_poll_recovers', 'wechat_connects_without_typing_configuration', 'wechat_numeric_message_id_native_admission');
+        'wechat_rejected_poll_recovers', 'wechat_connects_without_typing_configuration', 'wechat_numeric_message_id_native_admission', 'wechat_reply_rejection_diagnostics_persisted');
     } else {
       const previous = JSON.parse(await readFile(join(dirname(config.reportFile), 'phase-5.json'), 'utf8'));
-      await until(async () => http.replies.length === 2 && (await store.read()).pending.length === 0,
+      await until(() => states.some(state => state.phase === 'connected'), 'restart authentication');
+      assert.equal(http.replies.length, 0, 're-authentication must not reset the reply hold');
+      assert.equal((await store.read()).replyWait?.diagnostic?.ret, -54321);
+      const refresh = update('refresh-reply', 'durable-cursor-refresh');
+      refresh.msgs[0]!.item_list[0]!.text_item.text = '状态';
+      http.enqueue(refresh); // Same token, new owner message; control reply does not launch a model turn.
+      await until(async () => http.replies.length === 3 && (await store.read()).pending.length === 0,
         'restart did not deliver exactly the remaining parts', 10_000);
+      const recovered = http.replies.slice(1); // The first send answers the explicit status request.
+      assert.match(http.replies[0]!.item_list[0]!.text_item.text, /当前没有执行中的任务，上一轮已完成/);
       assert.equal(model.calls, 0);
       assert.equal(http.cursors[0], 'durable-cursor-1');
       assert.ok(http.replies.every(reply => reply.client_id !== previous.firstPart.client_id));
-      assert.deepEqual(http.replies.map(reply => ({ id: reply.client_id.slice('nexus:'.length), text: reply.item_list[0]!.text_item.text })),
+      assert.deepEqual(recovered.map(reply => ({ id: reply.client_id.slice('nexus:'.length), text: reply.item_list[0]!.text_item.text })),
         previous.remainingParts);
       assert.ok(http.replies.every(reply => reply.context_token === 'local-durable-context'));
       assert.ok(http.replies.every(reply => !reply.item_list.some(item => item.text_item.text.includes('/approve'))));
@@ -137,18 +148,19 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       await found.agent.whenIdle();
       await bridge.drain();
       assert.equal(model.calls, 0);
-      assert.equal(http.replies.length, 2);
+      assert.equal(http.replies.length, 3);
       http.enqueue(update('delivery-message-2', 'durable-cursor-2'));
       await until(async () => (await store.read()).received.includes('delivery-message-2'), 'new message was not admitted', 10_000);
       await found.agent.whenIdle();
       await bridge.drain();
-      await until(() => http.replies.length === 3, 'new native result was not delivered', 10_000);
+      await until(() => http.replies.length === 4, 'new native result was not delivered', 10_000);
       assert.equal(model.calls, 1);
       assert.equal(model.restoredHistory, true);
-      assert.equal(http.replies[2]!.item_list[0]!.text_item.text, '沿用原生历史的新回复');
+      assert.equal(http.replies[3]!.item_list[0]!.text_item.text, '沿用原生历史的新回复');
       await bridge.close();
       checks.push('wechat_outbox_restored_after_process_restart', 'wechat_remaining_parts_only', 'wechat_recovery_zero_model_calls',
-        'wechat_no_old_approval_replay', 'wechat_native_dedup_after_delivery_restart', 'wechat_history_continues_after_delivery_restart');
+        'wechat_no_old_approval_replay', 'wechat_native_dedup_after_delivery_restart', 'wechat_history_continues_after_delivery_restart',
+        'wechat_reply_hold_survives_process_restart', 'wechat_same_token_new_message_resumes_outbox', 'wechat_cold_status_reads_native_history');
     }
     assert.deepEqual(http.failures, []);
     assert.deepEqual(failures, []);

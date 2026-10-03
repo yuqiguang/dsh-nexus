@@ -154,7 +154,7 @@ export async function prepareReview(task: TaskRecord, request: CoderRequest, hos
     if (operation.length > 16_000) return unavailable('去重后的请求仍超过自动审核长度上限（16000 字符），需要你确认');
     if (task.description.length > 8000) return unavailable('任务说明超过自动审核长度上限（8000 字符），需要你确认');
     if (evidence.join('').length > 256 * 1024) return unavailable('关联文件证据超过自动审核容量上限，需要你确认');
-    return { input: { securityMode: standard ? 'standard' : 'strict', task: redact(task.description), ...(task.brief ? { goal: redact(task.brief.objective), constraints: redact(task.brief.constraints) } : {}), scope, operation, evidence, ...(evidenceComplete !== undefined ? { evidenceComplete } : {}) } };
+    return { input: { securityMode: standard ? 'standard' : 'strict', task: redact(task.description + (task.continuation ? `\n本次续接说明（不改变目标或权限）：${task.continuation}` : '')), ...(task.brief ? { goal: redact(task.brief.objective), constraints: redact(task.brief.constraints) } : {}), scope, operation, evidence, ...(evidenceComplete !== undefined ? { evidenceComplete } : {}) } };
   } catch (error) {
     const reasons: Record<string, string> = {
       'outside review boundary': '请求涉及审核边界之外或受保护的路径，需要你确认',

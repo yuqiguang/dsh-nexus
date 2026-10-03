@@ -1,12 +1,16 @@
 export const channelIds = ['wechat', 'feishu', 'wecom'] as const;
 export type ChannelId = typeof channelIds[number];
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+/** Numeric protocol diagnostics only; never response bodies, URLs or credentials. */
+export interface WechatDiagnostic { operation: 'send' | 'poll' | 'other'; httpStatus: number; ret?: number; errcode?: number }
 export interface ConnectionState {
   phase: ConnectionPhase;
   error?: string;
   retryAfterMs?: number;
   pendingDeliveries?: number;
   deliveryError?: string;
+  deliveryDiagnostic?: WechatDiagnostic;
+  waitingForReply?: boolean;
 }
 
 /** One connection grant; only the host may read the secret. */

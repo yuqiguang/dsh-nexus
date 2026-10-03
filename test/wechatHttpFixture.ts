@@ -19,6 +19,7 @@ export async function wechatHttpFixture(failAfterFirstSend: boolean) {
   const waiting: ServerResponse[] = [];
   const failures: string[] = [];
   let rejectFirstPoll = failAfterFirstSend;
+  let sendRejection: number | undefined;
   const respond = (response: ServerResponse, value: unknown, status = 200) => {
     response.writeHead(status, { 'Content-Type': 'application/json' });
     response.end(typeof value === 'string' ? value : JSON.stringify(value));
@@ -35,6 +36,7 @@ export async function wechatHttpFixture(failAfterFirstSend: boolean) {
       }
       if (request.url === '/ilink/bot/sendmessage') {
         replies.push(body.msg);
+        if (sendRejection !== undefined) return respond(response, { ret: sendRejection, errmsg: 'local reply refusal fixture' });
         return respond(response, { ret: 0 }, failAfterFirstSend && replies.length > 1 ? 503 : 200);
       }
       assert.equal(request.url, '/ilink/bot/getupdates');
@@ -66,6 +68,7 @@ export async function wechatHttpFixture(failAfterFirstSend: boolean) {
   };
   return {
     replies, cursors, failures, fetchImpl,
+    rejectSends(code: number) { sendRejection = code; },
     enqueue(update: WechatUpdates | string) {
       const response = waiting.shift();
       if (response) respond(response, update);

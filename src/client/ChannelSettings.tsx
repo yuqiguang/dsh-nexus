@@ -28,7 +28,8 @@ export const errors: Record<string, string> = {
   wechat_poller_conflict: '微信拒绝了轮询（403）：这个账号很可能同时被另一个程序（另一套桥接、OpenClaw 等）接收消息，微信只允许一个接收方。停掉那个程序后点“重新连接”；确认没有别的程序时再重新扫码。已停止轮询，凭据保留。',
   rate_limited: '微信请求过于频繁，请稍后重试。',
   server_unavailable: '微信服务暂时不可用，请稍后重试。',
-  wechat_request_failed: '微信暂未接受请求，请稍后重试。',
+  wechat_request_failed: '微信拒绝了请求，当前记录不能确定具体原因；请查看接口诊断，勿反复重试。',
+  wechat_send_rejected: '微信未接受本轮发送，已暂停自动发送。请用原绑定微信账号发一条新消息，收到后会继续尝试未送达部分。若仍失败，请查看接口诊断。',
   invalid_delivery_state: '本机的微信投递记录无法读取，请在本机检查数据版本。',
   delivery_queue_full: '待发回复已达到上限，请先重试发送；本次结果仍可在本机查看。',
   wechat_context_stale: '微信的回复上下文已超过 19 小时，待发消息会在你下次发消息给助理后送达。',
@@ -91,7 +92,9 @@ export const channelApi: ChannelApi = async (method, payload = {}, signal) => {
 
 type Action = (method: string, payload?: unknown) => Promise<boolean>;
 function Status({ connection }: { connection: ConnectionView }) {
-  return <span className={`nexus-channel-state ${connection.phase}`}>{phases[connection.phase]}</span>;
+  const label = connection.channel === 'wechat' && connection.phase === 'connected' && connection.deliveryError
+    ? connection.waitingForReply ? '等待微信回复' : '发送异常' : phases[connection.phase];
+  return <span className={`nexus-channel-state ${connection.phase}`}>{label}</span>;
 }
 
 function WorkspaceField({ connection, action, busy }: { connection: ConnectionView; action: Action; busy: boolean }) {
@@ -217,10 +220,14 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
         : !connection.enabled ? '请先连接原绑定账号，再查看待发状态。'
         : connection.phase === 'error' ? '请先处理连接错误并重新连接，再查看待发状态。'
         : connection.phase !== 'connected' ? '正在等待连接通过认证，恢复连接后再查看待发状态。'
-        : connection.deliveryError === 'wechat_context_stale' ? '请用原绑定微信账号发送一条新消息，恢复回复窗口后再查看待发状态。'
-        : '连接已通过认证，可点击“重试发送”重新尝试补发。'}</p>
+        : connection.waitingForReply || connection.deliveryError === 'wechat_context_stale' ? '收消息连接已认证，发送已暂停。请用原绑定微信账号发送一条新消息后再尝试。电脑端可以继续审批；旧审批提示不会补发。'
+        : connection.deliveryError ? '收消息连接已认证，但仍有消息发送失败。请先查看下方原因。'
+        : '收消息连接已认证，待发结果尚未全部送达，可点击“重试发送”重新尝试补发。'}</p>
     </section>}
     {connection.deliveryError && <p role="alert">{explain(connection.deliveryError)}</p>}
+    {connection.deliveryDiagnostic && <p className="nexus-channel-hint">接口诊断：HTTP {connection.deliveryDiagnostic.httpStatus}
+      {connection.deliveryDiagnostic.ret !== undefined ? `，ret=${connection.deliveryDiagnostic.ret}` : ''}
+      {connection.deliveryDiagnostic.errcode !== undefined ? `，errcode=${connection.deliveryDiagnostic.errcode}` : ''}。连接认证成功不代表消息发送成功。</p>}
     <p className="nexus-channel-hint">支持文字、图片、文件、审批和提问回复。请用一个专门给助理的微信号扫码：同一个号只能有一个程序接收消息，别的桥接同时在线会互相抢消息。</p>
     <footer>
       <button className="primary" disabled={busy || waiting} onClick={() => void action('qr/start', { revision: connection.revision })}>
@@ -230,7 +237,7 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
         <button disabled={busy || waiting} onClick={() => void action('connect', { channel: 'wechat', revision: connection.revision })}>重新连接</button>}
       {connection.configured && <button disabled={busy} onClick={() => void action(connection.enabled ? 'disconnect' : 'connect', { channel: 'wechat', revision: connection.revision })}>
         {connection.enabled ? '断开' : '连接'}</button>}
-      {!!connection.pendingDeliveries && <button disabled={busy || waiting || !connection.enabled || connection.phase !== 'connected' || connection.deliveryError === 'wechat_context_stale'}
+      {!!connection.pendingDeliveries && <button disabled={busy || waiting || !connection.enabled || connection.phase !== 'connected' || connection.waitingForReply || connection.deliveryError === 'wechat_context_stale'}
         onClick={() => void action('retry-delivery', { channel: 'wechat', revision: connection.revision })}>重试发送</button>}
     </footer>
     <WorkspaceField connection={connection} action={action} busy={busy} />

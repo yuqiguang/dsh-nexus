@@ -61,7 +61,7 @@ export function parseCommand(text: string): Command | undefined {
 /** `path` is the workspace-relative source so a channel with a durable outbox can re-read the file later instead of storing its bytes. */
 export interface OutboundFile { name: string; bytes: Buffer; path?: string }
 /** Only already-produced results may survive restart; interactive approval prompts must stay live. */
-export interface DeliveryOptions { durable?: boolean }
+export interface DeliveryOptions { durable?: boolean; signal?: AbortSignal; /** Only complete, already-produced receipts may be combined within this scope. */ batchKey?: string }
 export interface ChannelTransport {
   start(receive: (message: InboundMessage) => Promise<void>): Promise<void>;
   stop(): void | Promise<void>;

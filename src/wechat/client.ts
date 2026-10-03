@@ -4,6 +4,7 @@ import { wechatBaseUrl } from '../channels/store.js';
 import { retryable, wait, type Wait } from './retry.js';
 import { downloadUrl, ItemType, UploadType, WECHAT_CDN_BASE_URL, type PreparedUpload, type WechatItem, type WechatMediaRef } from './media.js';
 import { dualStackFetch } from './http.js';
+import { WechatRequestError } from './errors.js';
 
 export interface WechatMessage {
   message_id?: string | number;
@@ -143,17 +144,26 @@ export class WechatClient {
     try {
       response = await this.fetchImpl(`${this.baseUrl}${path}`, { method, headers, redirect: 'error',
         ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
-      if (response.status === 401) throw new ChannelError('authentication_failed');
-      // iLink allows one poller per token: a 403 means another client (a second bridge, OpenClaw) holds this account, not that the token expired.
-      if (response.status === 403) throw new ChannelError('wechat_poller_conflict');
-      if (response.status === 429) throw new ChannelError('rate_limited');
-      if (response.status >= 500) throw new ChannelError('server_unavailable');
-      if (!response.ok) throw new ChannelError('wechat_request_failed');
-      // Keep opaque 64-bit message IDs exact before JSON number rounding loses their identity.
-      const value = JSON.parse(await response.text(), (key: string, value: unknown, context?: { source?: string }) =>
-        key === 'message_id' && typeof value === 'number' && context?.source ? context.source : value) as Record<string, unknown>;
-      if (value.errcode === -14 || value.ret === -14) throw new ChannelError('authentication_failed');
-      if ((value.ret !== undefined && value.ret !== 0) || (value.errcode !== undefined && value.errcode !== 0)) throw new ChannelError('wechat_request_failed');
+      const operation = path === '/ilink/bot/sendmessage' ? 'send' : path === '/ilink/bot/getupdates' ? 'poll' : 'other';
+      const rejected = operation === 'send' ? 'wechat_send_rejected' : 'wechat_request_failed';
+      let value: Record<string, unknown> = {};
+      try {
+        // Keep opaque 64-bit message IDs exact. Error bodies contribute numeric codes only.
+        const parsed = JSON.parse(await response.text(), (key: string, value: unknown, context?: { source?: string }) =>
+          key === 'message_id' && typeof value === 'number' && context?.source ? context.source : value);
+        if (parsed && typeof parsed === 'object') value = parsed;
+        else if (response.ok) throw new Error('invalid response');
+      } catch (error) { if (response.ok) throw error; }
+      const numeric = (v: unknown): number | undefined => typeof v === 'number' && Number.isSafeInteger(v) ? v
+        : typeof v === 'string' && /^-?\d{1,15}$/.test(v) && Number.isSafeInteger(Number(v)) ? Number(v) : undefined;
+      const ret = numeric(value.ret), errcode = numeric(value.errcode);
+      const codes = { operation, httpStatus: response.status, ...(ret !== undefined ? { ret } : {}), ...(errcode !== undefined ? { errcode } : {}) } as const;
+      if (response.status === 401 || errcode === -14 || ret === -14) throw new WechatRequestError('authentication_failed', codes);
+      // Polling conflict is specific to the receive endpoint; a send refusal is not proof of a second poller.
+      if (response.status === 403 && operation === 'poll') throw new WechatRequestError('wechat_poller_conflict', codes);
+      if (response.status === 429) throw new WechatRequestError('rate_limited', codes);
+      if (response.status >= 500) throw new WechatRequestError('server_unavailable', codes);
+      if (!response.ok || (value.ret !== undefined && ret !== 0) || (value.errcode !== undefined && errcode !== 0)) throw new WechatRequestError(rejected, codes);
       return value as T;
     } catch (error) {
       if (signal.aborted) throw new ChannelError('connection_cancelled');

@@ -91,6 +91,7 @@ export interface TaskResult {
   detail?: string;
   execution?: 'completed' | 'failed' | 'stopped';
   verification?: 'passed' | 'failed' | 'not-run';
+  preflightCheck?: { command: string; ok: boolean; executed: boolean; output: string };
 }
 
 export interface TaskRecord {
@@ -99,6 +100,8 @@ export interface TaskRecord {
   id: string;
   coder: CoderKind;
   description: string;
+  continuation?: string;
+  preflight?: string;
   brief?: BriefSnapshot;
   planStep?: string;
   cwd: string;
@@ -111,6 +114,7 @@ export interface TaskRecord {
   permissions?: TaskPermissions;
   safetyReviews?: (ReviewAudit & { at: number })[];
   stopReason?: string;
+  stopCause?: 'user-wait-timeout';
   retry?: TaskRetry;
   status: TaskStatus;
   /** DSH session that dispatched the task; escalations are asked on its live agent. */

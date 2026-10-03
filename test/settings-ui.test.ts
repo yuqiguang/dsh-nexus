@@ -124,6 +124,20 @@ test('WeChat pending replies expose a revision-scoped retry and clear after deli
   assert.doesNotMatch(card.textContent!, /回复待发送|微信服务暂时不可用|重试发送/);
 });
 
+test('authenticated WeChat with refused sends shows reply recovery and numeric diagnostics without enabling blind retry', async t => {
+  const view = initial();
+  view.connections[0] = { ...view.connections[0]!, enabled: true, configured: true, secretConfigured: true, phase: 'connected',
+    pendingDeliveries: 4, waitingForReply: true, deliveryError: 'wechat_send_rejected',
+    deliveryDiagnostic: { operation: 'send', httpStatus: 200, ret: -54321 } };
+  const ui = await page(t, async () => view);
+  const card = ui.dom.window.document.querySelector('article')!;
+  assert.match(card.textContent!, /收消息连接已认证，发送已暂停/);
+  assert.match(card.textContent!, /原绑定微信账号发送一条新消息/);
+  assert.match(card.textContent!, /HTTP 200，ret=-54321/);
+  assert.match(card.textContent!, /旧审批提示不会补发/);
+  assert.equal([...card.querySelectorAll('button')].find(button => button.textContent === '重试发送')!.disabled, true);
+});
+
 test('pending delivery cannot retry before authentication or with an expired reply window', async t => {
   for (const state of [
     { phase: 'reconnecting' as const, error: 'connection_failed', deliveryError: 'server_unavailable', expected: /等待连接通过认证/ },

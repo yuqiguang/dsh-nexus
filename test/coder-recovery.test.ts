@@ -71,3 +71,13 @@ test('waiting approvals and in-flight verification direct the user to existing w
   assert.match(taskRecovery(task({ status: 'verifying' }), []).nextStep, /不代表验证和总体目标已经完成/);
   assert.equal(taskRecovery(task({ status: 'running' }), []).context, undefined);
 });
+
+test('timeout and preflight failure explain the stopped boundary without automatic redispatch', () => {
+  const timeout = task({ stopCause: 'user-wait-timeout', result: { ...passed, verification: 'not-run', verifyOk: false } });
+  assert.match(taskRecovery(timeout, []).nextStep, /等待用户明确.*不自动重复派发/);
+  const preflight = task({ status: 'failed', result: { ...passed, execution: 'failed', verification: 'not-run', verifyOk: undefined,
+    preflightCheck: { command: 'node check.cjs', ok: false, executed: true, output: 'environment failure' } } });
+  assert.equal(taskRecovery(preflight, []).title, '执行前环境预检未通过');
+  assert.match(taskRecovery(preflight, []).context!, /编码工具尚未启动/);
+  assert.match(taskRecovery(task({ status: 'failed', result: { ...passed, verification: 'failed', verifyOk: false } }), []).nextStep, /verification_only=true/);
+});

@@ -41,7 +41,11 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
     : task.result?.outsideRoots.length ? '检测到工作区外改动'
     : task.result?.verification === 'failed' ? '独立验证未通过'
     : task.result?.verification === 'not-run' || task.status === 'completed' ? '尚未独立验证' : '任务失败，需核对原因';
-  view.context = task.coderSessionId
+  if (task.result?.preflightCheck && !task.result.preflightCheck.ok) {
+    view.title = '执行前环境预检未通过';
+    view.context = '编码工具尚未启动。先核对预检输出并修复运行条件，保留原目标和最终验收，不能通过缩小测试范围让预检变绿。';
+  }
+  view.context ??= task.coderSessionId
     ? '记录中保留了编码会话标识，可尝试在原上下文续接；实际是否可恢复由编码工具检查。'
     : '没有可续接的编码会话标识。若需重试，将开始新的编码执行，先核对已有文件与任务记录。';
   try { assertRetry(task, own); } catch (error) { view.blockers.push((error as Error).message); }
@@ -58,6 +62,8 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
   const blocked = dependencies.filter(id => { const prior = own.find(record => record.id === id); return !prior || !dependencyPassed(prior); });
   if (blocked.length) view.blockers.push(`前置任务尚未通过或不可用：${blocked.join('、')}。先修复前置步骤，再核对最新任务依赖。`);
   view.nextStep = view.blockers.length ? '先在所属会话处理以下阻塞，再查看恢复清单。'
+    : task.stopCause === 'user-wait-timeout' ? '等待用户明确要求继续；先解释未解决的具体审批原因，不自动重复派发，不将超时表述为用户拒绝。新请求仍需本次授权。'
+    : task.result?.execution === 'completed' ? '编码已完成，先核对验证条件；仅复验时使用 verification_only=true，沿用计划中的 verify，无需再次启动编码工具。'
     : '回到所属会话说明继续要求，先核对停止原因、已有改动和验证结果，只恢复需要处理的步骤。';
   return view;
 }
@@ -71,7 +77,8 @@ export function recoveryReport(brief: CoderBrief, records: TaskRecord[], forDisp
     const blockers = task ? taskRecovery(task, records, brief).blockers : [];
     const state = task && dependencyPassed(task) ? '保留已通过的结果，无需重做' : task && isActive(task) ? '仍在执行或等待，先查看状态' : dependencies.some(task => !task || !dependencyPassed(task))
       ? '前置步骤尚未通过，暂不重试' : blockers.length ? blockers.join('；')
-      : task ? forDisplay ? `可在所属会话中恢复（任务 ${task.id}）` : `可重试：retry_task_id=${task.id}` : '可首次派发';
+      : task?.stopCause === 'user-wait-timeout' ? '等待用户明确续接；先处理上次审批原因，不自动重派'
+      : task ? forDisplay ? `可在所属会话中恢复（任务 ${task.id}）` : `可重试：retry_task_id=${task.id}${task.result?.execution === 'completed' ? '；仅需复验时 verification_only=true，沿用计划验证' : ''}` : '可首次派发';
     lines.push(`${step.id}：${state}；任务说明：${step.description}${task?.stopReason ? `；停止原因：${task.stopReason}` : task?.result?.detail ? `；执行说明：${task.result.detail}` : ''}`);
   }
   if (!brief.plan) for (const task of tasks) {

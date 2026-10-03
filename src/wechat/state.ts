@@ -1,15 +1,16 @@
 import type { Records } from '../channels/records.js';
 import { identity, sessionIdFor } from '../channels/protocol.js';
-import { ChannelError } from '../channels/types.js';
+import { ChannelError, type WechatDiagnostic } from '../channels/types.js';
+import { safeDiagnostic } from './errors.js';
 
 export const MAX_DELIVERY_ATTEMPTS = 12;
 const MAX_PENDING = 50;
 const MAX_PENDING_BYTES = 1024 * 1024;
 const RECEIPT_LIMIT = 200;
 export interface TextPart { id: string; text: string }
-export interface PendingText { id: string; parts: TextPart[]; nextPart: number; attempts: number; error?: string }
+export interface PendingText { id: string; parts: TextPart[]; nextPart: number; attempts: number; error?: string; diagnostic?: WechatDiagnostic; batchKey?: string; sourceIds?: string[]; sealed?: boolean }
 /** A presented file waits as a workspace reference, never as bytes inside the credentials file; it is re-read when sent. */
-export interface PendingFile { id: string; file: { name: string; path: string }; attempts: number; error?: string }
+export interface PendingFile { id: string; file: { name: string; path: string }; attempts: number; error?: string; diagnostic?: WechatDiagnostic }
 export type PendingDelivery = PendingText | PendingFile;
 export function isFileDelivery(item: PendingDelivery): item is PendingFile { return 'file' in item; }
 export interface WechatState {
@@ -20,6 +21,9 @@ export interface WechatState {
   contextToken?: string;
   /** When the current context token arrived; iLink silently drops sends whose token is too old. */
   contextAt?: number;
+  contextRevision?: number;
+  contextMessageId?: string;
+  replyWait?: { contextRevision: number; diagnostic?: WechatDiagnostic };
   received: string[];
   pending: PendingDelivery[];
   delivered: string[];
@@ -64,16 +68,27 @@ export class WechatStateStore {
     if (!state || state.version !== 1 || state.accountId !== this.accountId || state.ownerId !== this.ownerId ||
       typeof state.cursor !== 'string' || (state.contextToken !== undefined && typeof state.contextToken !== 'string') ||
       (state.contextAt !== undefined && !Number.isSafeInteger(state.contextAt)) ||
+      (state.contextRevision !== undefined && (!Number.isSafeInteger(state.contextRevision) || state.contextRevision < 0)) ||
+      (state.contextMessageId !== undefined && typeof state.contextMessageId !== 'string') ||
+      (state.replyWait !== undefined && (!Number.isSafeInteger(state.replyWait.contextRevision) || state.replyWait.contextRevision < 0)) ||
       !Array.isArray(state.received) || !state.received.every(id => typeof id === 'string') ||
       !Array.isArray(state.delivered) || !state.delivered.every(id => typeof id === 'string') ||
       !Array.isArray(state.pending) || !state.pending.every(item => item && typeof item.id === 'string' &&
         Number.isSafeInteger(item.attempts) && item.attempts >= 0 && (isFileDelivery(item)
           ? item.file && typeof item.file.name === 'string' && typeof item.file.path === 'string'
           : Number.isSafeInteger(item.nextPart) && item.nextPart >= 0 && Array.isArray(item.parts) && item.nextPart < item.parts.length &&
-            item.parts.every(part => part && typeof part.id === 'string' && typeof part.text === 'string')))) {
+            item.parts.every(part => part && typeof part.id === 'string' && typeof part.text === 'string') &&
+            (item.batchKey === undefined || typeof item.batchKey === 'string') && (item.sealed === undefined || typeof item.sealed === 'boolean') &&
+            (item.sourceIds === undefined || Array.isArray(item.sourceIds) && item.sourceIds.length <= 8 && item.sourceIds.every(id => typeof id === 'string'))))) {
       throw new ChannelError('invalid_delivery_state');
     }
-    return structuredClone(state);
+    const result = structuredClone(state);
+    for (const item of [...result.pending, ...(result.replyWait ? [result.replyWait] : [])]) {
+      const diagnostic = safeDiagnostic(item.diagnostic);
+      if (diagnostic) item.diagnostic = diagnostic;
+      else delete item.diagnostic;
+    }
+    return result;
   }
 
   async read(): Promise<WechatState> { return this.decode(await this.records.read(this.key)); }
@@ -86,14 +101,24 @@ export class WechatStateStore {
     }));
   }
 
-  /** Every inbound message refreshes the token's age; a new token also gives paused deliveries another chance. */
-  async rememberContext(token: string, at = Date.now()): Promise<void> {
+  /** A new admitted owner message refreshes reply allowance even if its token is unchanged. */
+  async rememberContext(token: string, at = Date.now(), messageId?: string): Promise<void> {
     await this.update(state => {
+      if (messageId && (state.contextMessageId === messageId || state.received.includes(messageId))) return;
       state.contextAt = at;
-      if (state.contextToken !== token) {
-        state.contextToken = token;
-        for (const item of state.pending) { item.attempts = 0; delete item.error; }
-      }
+      state.contextToken = token;
+      state.contextRevision = (state.contextRevision ?? 0) + 1;
+      if (messageId) state.contextMessageId = messageId;
+      delete state.replyWait;
+      for (const item of state.pending) { item.attempts = 0; delete item.error; delete item.diagnostic; }
+    });
+  }
+
+  async waitForReply(revision: number, diagnostic?: WechatDiagnostic): Promise<void> {
+    await this.update(state => {
+      // A late rejection from an older request must not consume a newer reply allowance.
+      const safe = safeDiagnostic(diagnostic);
+      if ((state.contextRevision ?? 0) === revision) state.replyWait = { contextRevision: revision, ...(safe ? { diagnostic: safe } : {}) };
     });
   }
 
@@ -110,13 +135,30 @@ export class WechatStateStore {
       : item.parts.reduce((n, part) => n + Buffer.byteLength(part.text), 0)), 0);
   }
 
-  async enqueue(id: string, text: string): Promise<void> {
+  async enqueue(id: string, text: string, batchKey?: string): Promise<void> {
     if (!text) return;
     await this.update(state => {
-      if (state.delivered.includes(id) || state.pending.some(item => item.id === id)) return;
+      if (state.delivered.includes(id) || state.pending.some(item => item.id === id || !isFileDelivery(item) && item.sourceIds?.includes(id))) return;
+      const tail = state.pending.at(-1);
+      if (batchKey && tail && !isFileDelivery(tail) && tail.batchKey === batchKey && !tail.sealed && !tail.attempts && !tail.nextPart &&
+        (tail.sourceIds?.length ?? 1) < 8 && tail.parts.length === 1 && Array.from(tail.parts[0]!.text + '\n\n' + text).length <= 800) {
+        if (WechatStateStore.queued(state) + Buffer.byteLength(text) + 2 > MAX_PENDING_BYTES) throw new ChannelError('delivery_queue_full');
+        tail.sourceIds = [...(tail.sourceIds ?? [tail.id]), id];
+        tail.parts = textParts(tail.parts[0]!.text + '\n\n' + text, tail.id);
+        return;
+      }
       if (state.pending.length >= MAX_PENDING || WechatStateStore.queued(state) + Buffer.byteLength(text) > MAX_PENDING_BYTES) throw new ChannelError('delivery_queue_full');
-      state.pending.push({ id, parts: textParts(text, id), nextPart: 0, attempts: 0 });
+      state.pending.push({ id, parts: textParts(text, id), nextPart: 0, attempts: 0, ...(batchKey ? { batchKey, sourceIds: [id] } : {}) });
     });
+  }
+
+  /** Freeze wire content before any request; failed or partially sent messages are never rewritten. */
+  async seal(id: string): Promise<PendingDelivery | undefined> {
+    const state = await this.update(state => {
+      const item = state.pending.find(item => item.id === id);
+      if (item && !isFileDelivery(item)) item.sealed = true;
+    });
+    return state.pending.find(item => item.id === id);
   }
 
   async enqueueFile(id: string, file: { name: string; path: string }): Promise<void> {
@@ -138,10 +180,11 @@ export class WechatStateStore {
         item.nextPart++;
         item.attempts = 0;
         delete item.error;
+        delete item.diagnostic;
         if (item.nextPart < item.parts.length) return;
       }
       state.pending = state.pending.filter(item => item.id !== id);
-      state.delivered = [...state.delivered, id].slice(-RECEIPT_LIMIT);
+      state.delivered = [...state.delivered, ...(!isFileDelivery(item) && item.sourceIds ? item.sourceIds : [id])].slice(-RECEIPT_LIMIT);
     });
   }
 
@@ -154,14 +197,23 @@ export class WechatStateStore {
     });
   }
 
-  async failed(id: string, code: string, retryable: boolean): Promise<void> {
+  async failed(id: string, code: string, retryable: boolean, diagnostic?: WechatDiagnostic, revision?: number): Promise<void> {
     await this.update(state => {
+      if (revision !== undefined && revision !== (state.contextRevision ?? 0)) return;
       const item = state.pending.find(item => item.id === id);
-      if (item) { item.attempts = retryable ? item.attempts + 1 : MAX_DELIVERY_ATTEMPTS; item.error = code; }
+      if (item) {
+        item.attempts = retryable ? item.attempts + 1 : MAX_DELIVERY_ATTEMPTS; item.error = code;
+        const safe = safeDiagnostic(diagnostic);
+        if (safe) item.diagnostic = safe;
+        else delete item.diagnostic;
+      }
     });
   }
 
   async retry(): Promise<void> {
-    await this.update(state => { for (const item of state.pending) { item.attempts = 0; delete item.error; } });
+    await this.update(state => {
+      if (state.replyWait) throw new ChannelError('wechat_send_rejected');
+      for (const item of state.pending) { item.attempts = 0; delete item.error; delete item.diagnostic; }
+    });
   }
 }

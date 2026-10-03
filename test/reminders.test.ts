@@ -65,7 +65,7 @@ test('resumeBound resolves the pre-registered session so native runtimes attach'
 
 const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-test('a long user turn sends heartbeats with the last tool step; pushed turns and finished turns stay silent', async t => {
+test('a long WeChat user turn sends one progress reminder; pushed turns and finished turns stay silent', async t => {
   const { bridge, texts, push, session, advance } = fixture({ firstMs: 15, everyMs: 60 });
   t.after(() => bridge.close());
   // A reminder-started turn: no heartbeat however long it runs.
@@ -77,7 +77,7 @@ test('a long user turn sends heartbeats with the last tool step; pushed turns an
   bridge.onEvent(session as never, push('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await bridge.drain();
   texts.length = 0;
-  // A user turn: first beat after firstMs names the running tool, later beats follow everyMs, the end stops them.
+  // A user turn: one beat names the running tool; later steps cannot spend more unsolicited replies.
   push('turn/start', { turn: 2 });
   push('user/message', { id: 'u2', role: 'user', content: [{ type: 'text', text: '整理一下仓库' }], source: { kind: 'user' } });
   bridge.onEvent(session as never, push('step/start', { turn: 2, step: 1 }));
@@ -89,13 +89,15 @@ test('a long user turn sends heartbeats with the last tool step; pushed turns an
   bridge.onEvent(session as never, push('step/start', { turn: 2, step: 2 }));
   advance(300_000);
   await tick(70);
-  assert.equal(texts.length, 2, 'a second step of the same turn does not restart the schedule');
-  assert.match(texts[1]!, /已用 7 分钟/);
+  assert.equal(texts.length, 1, 'a second step must not send another unsolicited WeChat reminder');
+  bridge.onEvent(session as never, push('step/start', { turn: 2, step: 3 }));
+  await tick(25);
+  assert.equal(texts.length, 1, 'a later step must not re-arm the consumed reminder');
   push('assistant/message', { turn: 2, message: { content: [{ type: 'text', text: '整理好了。' }] } });
   bridge.onEvent(session as never, push('turn/end', { turn: 2, reason: { kind: 'completed' } }));
   await bridge.drain();
   await tick(80);
-  assert.deepEqual(texts.slice(2), ['整理好了。'], 'no heartbeat after the turn ended');
+  assert.deepEqual(texts.slice(1), ['整理好了。'], 'no heartbeat after the turn ended');
 });
 
 test('heartbeat text picks a readable detail from the tool arguments and truncates', () => {

@@ -14,6 +14,7 @@ const run = promisify(execFile);
 export class SnapshotError extends Error {}
 
 export interface VerifyResult {
+  preflightCheck?: { command: string; ok: boolean; executed: boolean; output: string };
   changedFiles: string[];
   commits?: string[];
   outsideRoots: string[];
@@ -224,7 +225,7 @@ export async function runVerifyCommand(command: string, cwd: string, signal?: Ab
 }
 
 /** The supervisor's own check after the coder reports completion; never trusts the coder's summary. */
-export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'verifyCommands' | 'verifyCwd'>, roots: readonly string[], baseline?: WorkTreeSnapshot, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv): Promise<VerifyResult> {
+export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'verifyCommands' | 'verifyCwd'>, roots: readonly string[], baseline?: WorkTreeSnapshot, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv, onCheck?: (check: NonNullable<VerifyResult['verifyChecks']>[number]) => void): Promise<VerifyResult> {
   const result: VerifyResult = { changedFiles: [], outsideRoots: [] };
   if (task.verify) {
     const directory = await canonical(task.verifyCwd ?? task.cwd);
@@ -238,6 +239,8 @@ export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'veri
       const problem = await verifyPreflight(command, directory);
       const verify = problem ? { ok: false, executed: false, output: problem } : await runVerifyCommand(command, directory, signal, confine, extraEnv);
       checks.push({ command, ok: verify.ok, executed: verify.executed !== false, output: verify.output });
+      // Preserve preflight evidence even if cancellation interrupts the following filesystem audit.
+      onCheck?.(checks.at(-1)!);
     }
     result.verifyChecks = checks;
     result.verifyOk = checks.every(check => check.ok);

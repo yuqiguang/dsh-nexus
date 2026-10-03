@@ -1,5 +1,7 @@
 /** Push a message to the chat that owns a DSH session, without a user message to reply to. */
 export interface ChannelNotifier {
+  /** Live delivery metadata, separate from task and approval state. */
+  interactionWarning?(sessionId: string): string | undefined;
   /** Resolves `true` when a channel held a route for the session and accepted the text; `false` when no channel knows it. */
   notify(sessionId: string, text: string, deliveryId: string): Promise<boolean>;
 }
@@ -12,6 +14,7 @@ export interface PushGate {
 
 /** Anything that can route one session to one chat; the DSH bridge implements it. */
 export interface SessionNotifier {
+  interactionWarning?(sessionId: string): string | undefined;
   notify(sessionId: string, text: string, deliveryId: string): Promise<boolean>;
   /** Sessions this notifier can reach right now. */
   bound(): string[];
@@ -51,6 +54,11 @@ export class BridgeRegistry implements ChannelNotifier {
   }
 
   bound(): string[] { return [...new Set([...this.bridges].flatMap(bridge => bridge.bound()))]; }
+
+  interactionWarning(sessionId: string): string | undefined {
+    for (const bridge of this.bridges) { const warning = bridge.interactionWarning?.(sessionId); if (warning) return warning; }
+    return undefined;
+  }
 
   sameChat(first: string, second: string): boolean {
     return this.bridges.size > 0 && [...this.bridges].some(bridge => bridge.sameChat?.(first, second) ?? first === second);

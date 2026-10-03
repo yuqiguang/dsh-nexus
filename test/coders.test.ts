@@ -1939,6 +1939,7 @@ test('user wait timeout interrupts the coder and releases its workspace for the 
     await Promise.all(harness.jobs.map(job => job.done));
     assert.equal(harness.tasks.get(first.task_id!)!.status, 'interrupted');
     assert.match(harness.tasks.get(first.task_id!)!.stopReason!, /等待用户超过时限/);
+    assert.equal(harness.tasks.get(first.task_id!)!.stopCause, 'user-wait-timeout');
     assert.equal(harness.tasks.get(next.task_id!)!.status, 'completed');
     assert.equal(starts, 2);
   } finally { clearInterval(keepAlive); for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(workdir, { recursive: true, force: true }); }
@@ -2268,7 +2269,7 @@ test('task list and notice routes require an owner, bound completed summaries an
   t.after(() => rm(workdir, { recursive: true, force: true }));
   const harness = coderHarness();
   let rpc!: (method: string, payload: unknown) => Promise<unknown>;
-  await installCoders(harness.ctx, { roots: [workdir], registerRpc: (_family, _methods, handle) => { rpc = handle; } });
+  await installCoders(harness.ctx, { roots: [workdir], notifier: { notify: async () => false, interactionWarning: owner => owner === task().ownerSession ? '微信未送达，请在电脑处理' : undefined }, registerRpc: (_family, _methods, handle) => { rpc = handle; } });
   const own = task().ownerSession;
   for (let i = 1; i <= 25; i++) harness.tasks.set(`ct-${i}`, task({ id: `ct-${i}`, status: 'completed', createdAt: i, updatedAt: i,
     ...(i === 1 ? { completionNotice: { seq: 4, at: 30, messageId: 'm' } } : {}), trace: [{ at: 1, text: 'process detail' }] }));
@@ -2276,6 +2277,10 @@ test('task list and notice routes require an owner, bound completed summaries an
   harness.tasks.set('foreign', task({ id: 'foreign', ownerSession: 'foreign', status: 'running' }));
   const list = await rpc('list', { ownerSession: own }) as import('../src/coders/presentation.js').TaskSummary[];
   assert.equal(list.length, 21); assert.equal(list[0]!.id, 'active'); assert.equal(list[0]!.pending, 'allow');
+  assert.equal(list[0]!.channelWarning, '微信未送达，请在电脑处理');
+  assert.equal((await rpc('get', { id: 'active', brief: true }) as { channelWarning?: string }).channelWarning, list[0]!.channelWarning);
+  assert.equal((await rpc('get', { id: 'foreign', brief: true }) as { channelWarning?: string }).channelWarning, undefined);
+  assert.ok(!('channelWarning' in harness.tasks.get('active')!), 'channel metadata must not be persisted as task state');
   assert.ok(list.every(item => item.ownerSession === own && !('trace' in item) && !('transcript' in item) && !('decisions' in item)));
   assert.equal((await rpc('notice', { ownerSession: own, seq: 4 }) as { id: string }).id, 'ct-1', 'old results can resolve outside the recent-list limit');
   assert.equal(await rpc('notice', { ownerSession: 'foreign', seq: 4 }), null);
@@ -2352,4 +2357,142 @@ test('retry rejects a removed verification directory before dispatch and accepts
   assert.equal(harness.tasks.get(corrected.task_id!)!.verificationOnly, true);
   assert.equal(harness.tasks.get(corrected.task_id!)!.verifyCwd, root);
   assert.equal(harness.tasks.get(corrected.task_id!)!.result?.verification, 'passed');
+});
+
+test('planned dispatch binds the first project directory and verification-only recovery preserves the plan', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-plan-recovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, 'kb-service'); await mkdir(project);
+  await writeFile(join(project, 'check.cjs'), 'process.exit(1)');
+  const harness = coderHarness(undefined, root);
+  let codingRuns = 0;
+  const prompts: string[] = [];
+  const query: ClaudeQuery = async function* ({ prompt, options }) {
+    codingRuns++; prompts.push(prompt);
+    assert.equal(options.cwd, project);
+    yield { type: 'system', subtype: 'init', session_id: `plan-coder-${codingRuns}` };
+    yield { type: 'result', subtype: 'success', result: 'fixture code complete' };
+  };
+  await installCoders(harness.ctx, { roots: [root], query, defaultCoder: 'claude', safetyReviewer: async () => ({ safe: true, reason: 'fixture check' }) });
+  const saved = await harness.run('coder_brief', { action: 'save', objective: 'service', acceptance: ['API', 'UI'] });
+  const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  await harness.run('coder_brief', { action: 'plan', brief_id: id, revision: 1, steps: [
+    { id: 'api', description: 'API task', acceptance_ids: ['a1'], depends_on: [], verify: 'node check.cjs' },
+    { id: 'ui', description: 'UI task', acceptance_ids: ['a2'], depends_on: ['api'], verify: 'true' },
+  ] });
+  const base = { brief_id: id, brief_revision: 2 };
+  const first = await harness.run('coder_task', { ...base, cwd: 'kb-service', plan_step: 'api' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(first.task_id!)!.description, 'API task');
+  assert.equal(harness.tasks.get(first.task_id!)!.result?.verifyOk, false);
+  assert.match((await harness.run('coder_brief', { action: 'get', brief_id: id })).text!, /项目目录：.*kb-service/);
+  await assert.rejects(harness.run('coder_task', { ...base, retry_task_id: first.task_id, verification_only: true, verify_commands: ['true'] }), /保留计划/);
+  await writeFile(join(project, 'check.cjs'), 'process.exit(0)');
+  const retried = await harness.run('coder_task', { ...base, retry_task_id: first.task_id, verification_only: true,
+    continuation: 'Only recheck the repaired validation environment', verify_commands: ['node check.cjs', 'true'] });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(codingRuns, 1, 'verification-only recovery must not restart a coder');
+  assert.equal(harness.tasks.get(retried.task_id!)!.result?.verifyChecks?.length, 2);
+  assert.equal(harness.tasks.get(retried.task_id!)!.result?.verifyOk, true);
+  const second = await harness.run('coder_task', { ...base, plan_step: 'ui' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(second.cwd, project);
+  assert.deepEqual(harness.tasks.get(second.task_id!)!.dependsOn, [retried.task_id]);
+  assert.equal(codingRuns, 2);
+  assert.ok(prompts[0]!.startsWith('API task'));
+  await assert.rejects(harness.run('coder_task', { ...base, plan_step: 'ui', cwd: '..' }), /工作区|项目目录/);
+});
+
+test('planned continuation keeps original requirements and explicit brief directory stays within the session', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-plan-continuation-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  const prompts: string[] = [];
+  const query: ClaudeQuery = async function* ({ prompt }) {
+    prompts.push(prompt);
+    yield { type: 'system', subtype: 'init', session_id: 'continuation-fixture' };
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  };
+  await installCoders(harness.ctx, { roots: [root], query, defaultCoder: 'claude', safetyReviewer: async () => ({ safe: true, reason: 'fixture' }) });
+  await assert.rejects(harness.run('coder_brief', { action: 'save', objective: 'x', acceptance: ['x'], cwd: '..' }), /工作区/);
+  const saved = await harness.run('coder_brief', { action: 'save', objective: 'service', acceptance: ['API'], cwd: 'app' });
+  const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  await assert.rejects(harness.run('coder_brief', { action: 'plan', brief_id: id, revision: 1, steps: [
+    { id: 'api', description: 'Create config', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['.env.example'] },
+  ] }), /受凭据保护/);
+  await harness.run('coder_brief', { action: 'plan', brief_id: id, revision: 1, steps: [
+    { id: 'api', description: 'Original API requirements', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['README.md'] },
+  ] });
+  const first = await harness.run('coder_task', { brief_id: id, brief_revision: 2, plan_step: 'api', verify_commands: ['true', 'node --version'] });
+  await harness.jobs.at(-1)!.done;
+  await assert.rejects(harness.run('coder_task', { resume_task_id: first.task_id, verify_commands: ['true'] }), /不能缩小验收范围/);
+  const resumed = await harness.run('coder_task', { resume_task_id: first.task_id, description: 'Finish documentation without changing requirements' });
+  await harness.jobs.at(-1)!.done;
+  const record = harness.tasks.get(resumed.task_id!)!;
+  assert.equal(record.description, 'Original API requirements');
+  assert.equal(record.continuation, 'Finish documentation without changing requirements');
+  assert.deepEqual(record.result?.verifyChecks?.map(check => check.command), ['true', 'node --version']);
+  assert.equal(record.cwd, join(root, 'app'));
+  assert.match(prompts[1]!, /Original API requirements[\s\S]*Finish documentation/);
+  assert.equal(record.brief?.revision, 2);
+});
+
+test('environment preflight failure prevents coding and remains distinct from final verification', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-preflight-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  let codingRuns = 0;
+  const reviewed: string[] = [];
+  const query = scriptedQuery(async function* () { codingRuns++; yield { type: 'result', subtype: 'success', result: 'done' }; });
+  await writeFile(join(root, 'environment.cjs'), 'console.log("fixture SSL import failed"); process.exit(1)');
+  await installCoders(harness.ctx, { roots: [root], query, defaultCoder: 'claude', safetyReviewer: async (_task, input) => {
+    reviewed.push(input.operation); return { safe: true, reason: 'explicit fixture preflight' };
+  } });
+  const first = await harness.run('coder_task', { description: 'Implement service', preflight: 'node environment.cjs', verify: 'true' });
+  await harness.jobs.at(-1)!.done;
+  const failed = harness.tasks.get(first.task_id!)!;
+  assert.equal(codingRuns, 0);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.result?.preflightCheck?.ok, false);
+  assert.match(failed.result?.preflightCheck?.output ?? '', /SSL import failed/);
+  assert.equal(failed.result?.verification, 'not-run');
+  assert.ok(reviewed.some(command => command.includes('environment.cjs')));
+  await writeFile(join(root, 'environment.cjs'), 'console.log("environment ready")');
+  const retry = await harness.run('coder_task', { retry_task_id: first.task_id, continuation: 'Environment repaired; use the original contract' });
+  await harness.jobs.at(-1)!.done;
+  const passed = harness.tasks.get(retry.task_id!)!;
+  assert.equal(codingRuns, 1);
+  assert.equal(passed.result?.preflightCheck?.ok, true);
+  assert.equal(passed.result?.verifyOk, true);
+});
+
+test('denied or cancelled preflight never launches its command or the coder', async t => {
+  for (const cancel of [false, true]) await t.test(cancel ? 'cancel' : 'deny', async t => {
+    const root = await mkdtemp(join(tmpdir(), 'nexus-preflight-denied-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const harness = coderHarness(questions => questions.map(q => ({ id: q.id, selected: ['拒绝'] })), root);
+    let codingRuns = 0;
+    const query = scriptedQuery(async function* () { codingRuns++; yield { type: 'result', subtype: 'success', result: 'done' }; });
+    if (cancel) harness.ctx.userQuestions.ask = (async (request: { signal?: AbortSignal }) => {
+      await new Promise<void>((_resolve, reject) => {
+        if (request.signal?.aborted) reject(request.signal.reason);
+        else request.signal?.addEventListener('abort', () => reject(request.signal!.reason), { once: true });
+      });
+      return { answers: [] };
+    }) as typeof harness.ctx.userQuestions.ask;
+    await writeFile(join(root, 'environment.cjs'), 'require("fs").writeFileSync("executed.txt", "unexpected")');
+    await installCoders(harness.ctx, { roots: [root], query, defaultCoder: 'claude', safetyReviewer: async () => ({ safe: false, reason: 'fixture requires user decision' }) });
+    const dispatched = await harness.run('coder_task', { description: 'Implement service', preflight: 'node environment.cjs', verify: 'true' });
+    if (cancel) {
+      await until(() => harness.tasks.get(dispatched.task_id!)?.status === 'waiting-user', 'preflight approval');
+      harness.jobs[0]!.cancel('fixture cancellation');
+    }
+    await harness.jobs[0]!.done;
+    const record = harness.tasks.get(dispatched.task_id!)!;
+    assert.equal(record.status, cancel ? 'cancelled' : 'failed');
+    assert.equal(record.result?.preflightCheck?.executed, false);
+    assert.equal(record.result?.verification, 'not-run');
+    assert.equal(codingRuns, 0);
+    await assert.rejects(readFile(join(root, 'executed.txt')), { code: 'ENOENT' });
+  });
 });
