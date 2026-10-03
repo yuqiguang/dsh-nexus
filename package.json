@@ -1,7 +1,16 @@
 {
   "name": "dsh-nexus",
-  "version": "0.2.40",
-  "private": true,
+  "version": "0.2.41",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "next"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "coding-assistant"
+  ],
   "type": "module",
   "exports": {
     ".": "./dist/src/plugin.js",

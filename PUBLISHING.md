@@ -2,11 +2,11 @@
 
 本仓库是公开源码目录。产品名为 **Nexus 个人编码助理 / Nexus for DSH**，GitHub 仓库为 `yuqiguang/dsh-nexus`，npm 包标识为 `dsh-nexus`。旧包 `nexus-next` 的迁移方式见 [RENAME.md](RENAME.md)。组件 ID 和数据存储标识保持不变。
 
-`private: true` 用于阻止误发布到 npm，不影响 GitHub 源码或本地 `.tgz` 分发。当前使用 GitHub Release 分发安装包。
+公开发行包从 0.2.41 起同时通过 npm 和 GitHub Release 分发。`publishConfig` 固定 npm 官方源、公开访问和实验版 `next` 标签；只从经过检查的公开源码目录发布。私有开发目录继续保留 `private: true`，不从那里发布 npm 包。
 
 ## 验证和打包
 
-更新版本时同步 `package.json`、`package-lock.json`、README、CHANGELOG 和第三方依赖说明。以下以 0.2.39 为例；仅文档和包元信息变化时，可沿用编译产物，但必须核对运行源码与产物均未变化，并重新计算安装包摘要。
+更新版本时同步 `package.json`、`package-lock.json`、README、CHANGELOG 和第三方依赖说明。以下以 0.2.41 为例；仅文档和包元信息变化时，可沿用编译产物，但必须核对运行源码与产物均未变化，并重新计算安装包摘要。
 
 源码发生变化时，在干净工作树中串行执行：
 
@@ -23,11 +23,11 @@ npm run smoke
 使用已验证的 `dist` 打包；下面的目录和摘要命令适用于 Linux / WSL：
 
 ```bash
-mkdir -p release/0.2.39
-npm pack --ignore-scripts --pack-destination release/0.2.39
-tar -tzf release/0.2.39/dsh-nexus-0.2.39.tgz
-cd release/0.2.39
-sha256sum dsh-nexus-0.2.39.tgz > SHA256SUMS
+mkdir -p release/0.2.41
+npm pack --ignore-scripts --pack-destination release/0.2.41
+tar -tzf release/0.2.41/dsh-nexus-0.2.41.tgz
+cd release/0.2.41
+sha256sum dsh-nexus-0.2.41.tgz > SHA256SUMS
 sha256sum -c SHA256SUMS
 ```
 
@@ -35,11 +35,27 @@ sha256sum -c SHA256SUMS
 
 不应包含 `.git`、`.nexus`、`.dsh`、真实环境变量文件、工作区、私有文档、测试数据或 `node_modules`。检查跟踪文件及 Git 历史中的敏感信息，不能只检查当前安装包。
 
+## npm 发布
+
+先完成源码提交和安装包校验，再将同一个 `.tgz` 发布到 npm 和 GitHub，避免重复打包产生不同字节。仅文档和发行元信息变化时，允许复用上版编译文件：逐文件核对运行源码及编译内容，更新发行构建身份，并在说明中记录复用来源。
+
+首次发布前登录 npm CLI（仅在网站登录不够）；WSL 可禁用自动打开浏览器并手动完成授权：
+
+```bash
+npm login --registry=https://registry.npmjs.org/ --browser=false
+npm whoami --registry=https://registry.npmjs.org/
+npm publish ./release/0.2.41/dsh-nexus-0.2.41.tgz --access public --tag next --registry=https://registry.npmjs.org/ --ignore-scripts
+```
+
+若 npm 要求二次验证，在本机终端按提示完成。不要提交凭据或授权链接。实验版使用 `next`，不主动设置 `latest`；用户在 DSH“添加插件”中填写 `dsh-nexus@next` 或指定版本。
+
+npm 发布成功后核对版本、`next` 标签、registry 的 integrity，并下载 npm tarball 比对本地 SHA256。再发布包含同一安装包的 GitHub Release，等待固定入口工作流完成并验证下载。npm 已发布版本不可覆盖；若 GitHub 后续步骤失败，保留 npm 版本并补完 GitHub 发布，不重复改包。插件内更新仍依赖 GitHub 版本附件与固定入口，发布 npm 本身不会更新插件的更新源。
+
 ## GitHub Release
 
-1. 审阅并推送公开源码提交；从实际用于打包的源码提交创建 `v0.2.39` 标签。
-2. 创建 Release，标题使用 `Nexus 0.2.39（实验版）`，勾选预发布选项。说明使用 CHANGELOG 中对应版本的内容。
-3. **先上传** `dsh-nexus-0.2.39.tgz` 和 `SHA256SUMS`，再发布 Release。校验文件必须包含该安装包的 SHA256。
+1. 审阅并推送公开源码提交；从实际用于打包的源码提交创建 `v0.2.41` 标签。
+2. 创建 Release，标题使用 `Nexus 0.2.41（实验版）`，勾选预发布选项。说明使用 CHANGELOG 中对应版本的内容。
+3. **先上传** `dsh-nexus-0.2.41.tgz` 和 `SHA256SUMS`，再发布 Release。校验文件必须包含该安装包的 SHA256。
 4. 发布后，GitHub Actions 的 **Update fixed installation link** 工作流自动校验这份已发布安装包，将相同字节同步到固定入口。它不重新构建安装包；运行失败时先查看日志，修正后通过 **Run workflow** 输入对应版本标签重试。
 5. 下载已发布版本附件及固定入口附件，检查 SHA256 与已验证安装包一致。源码公开和创建标签不会自动生成版本安装包。
 
