@@ -22,7 +22,9 @@ export async function desktopRestore(home: string, dshVersion?: string): Promise
   const executable = process.execPath;
   const shell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   try {
-    await access(join(dirname(executable), 'resources', 'app.asar'));
+    // Electron's virtual filesystem accepts entries inside ASAR, but access() on
+    // the archive root itself can return ENOENT even in a running packaged Host.
+    await access(join(dirname(executable), 'resources', 'app.asar', 'package.json'));
     await access(join(home, 'profiles', 'desktop', 'package.json'));
     await access(shell);
   } catch { return undefined; }
