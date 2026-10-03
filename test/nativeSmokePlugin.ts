@@ -107,10 +107,12 @@ export async function apply(ctx: Context, config: {
   const nativeApprovals: AbortSignal[] = [];
   ctx.on('approval/request', (request, next) => !isNativeMirror(request) ? next() : new Promise(resolve => {
     nativeApprovals.push(request.signal!);
+    if (config.phase === 2) resolve('allowed-once');
     request.signal!.addEventListener('abort', () => resolve('cancelled'), { once: true });
   }), { prepend: true });
   // Force a real native approval for the fixture's write. No tool or loop is replaced.
   ctx.on('tools/pre-execute', async (execution, next) => {
+    if (execution.callId === 'fixture-2-0') return { kind: 'ask', reason: 'Desktop receipt fixture.' };
     if (execution.callId === 'fixture-1-3') {
       setApprovalPolicy(execution.agent!.session, 'never');
       return { kind: 'ask', reason: 'The native never policy must reject this request.' };
@@ -215,6 +217,13 @@ export async function apply(ctx: Context, config: {
       assert.equal(model.calls, 2);
       assert.equal(model.restoredToolHistory, true);
       assert.ok(texts.includes('已恢复原会话并重新读取文件。'));
+      const receipt = texts.findIndex(text => text.startsWith('已在电脑端允许'));
+      assert.ok(receipt >= 0 && receipt < texts.indexOf('已恢复原会话并重新读取文件。'));
+      assert.match(texts[receipt]!, /允许“read”（仅本次）.*\n当前审批已失效/);
+      const audited = agent.session.snapshotEvents().filter(event => event.type === 'approval/asked' && event.data.callId === 'fixture-2-0');
+      assert.equal(audited.length, 1);
+      assert.equal(nativeApprovals.length, 1);
+      assert.equal(nativeApprovals[0]!.aborted, true);
       assert.equal(files.length, 0);
       assert.equal(await readFile(join(config.workspace, filePath), 'utf8'), fileContent);
     }
@@ -232,7 +241,7 @@ export async function apply(ctx: Context, config: {
         ? ['dual_approval_single_native_audit', 'owner_filter', 'group_filter', 'native_read_error_recovery', 'native_approval_order', 'chinese_approval_stays_in_current_turn', 'write_then_continue',
           'explicit_file_delivery', 'native_message_deduplication', 'remote_session_keeps_its_permission',
           'native_never_policy_rejects', 'remote_full_access_runs', 'invalid_approval_replies_do_not_grant', 'closed_bridge_rejects_admission']
-        : ['same_native_session', 'restart_message_deduplication', 'no_old_reply_replay', 'native_tool_history_restored', 'continued_file_read'],
+        : ['desktop_approval_receipt_precedes_final_reply', 'same_native_session', 'restart_message_deduplication', 'no_old_reply_replay', 'native_tool_history_restored', 'continued_file_read'],
     }, null, 2));
   }
 }

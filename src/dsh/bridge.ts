@@ -1,4 +1,5 @@
 import { firstAvailable, isNativeMirror, nativeApproval, nativeQuestion } from './interaction.js';
+import { desktopApprovalReceipt, desktopQuestionReceipt } from './receipts.js';
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
 import type { ScheduleCatalogEntry } from '@deepseek-ai/dsh-schedule';
 import type { Context } from '@deepseek-ai/cordis';
@@ -633,7 +634,9 @@ export class DshChannelBridge {
     if (prompts.some(prompt => prompt.length > 2500)) {
       void this.transport.sendText(chatId, '这个问题需要在本机 DSH 查看完整内容并回答。',
         identity('local-question', request.agent!.id, ...request.questions.map(question => question.id))).catch(() => {});
-      return next();
+      const answer = await next();
+      if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopQuestionReceipt(request, answer), identity('desktop-question', request.agent!.id, crypto.randomUUID()));
+      return answer;
     }
     const lifetime = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
@@ -649,8 +652,22 @@ export class DshChannelBridge {
       }
       return { answers };
     };
-    try { return await firstAvailable([remote(), Promise.resolve().then(() => next(signal))], () => true); }
-    finally { lifetime.abort(); }
+    const result = await firstAvailable([
+      remote().then(value => ({ source: 'channel', value })),
+      Promise.resolve().then(() => next(signal)).then(value => ({ source: 'desktop', value })),
+    ], () => true).finally(() => lifetime.abort());
+    if (result.source === 'desktop' && !request.signal?.aborted) {
+      this.desktopReceipt(chatId, desktopQuestionReceipt(request, result.value), identity('desktop-question', request.agent!.id, crypto.randomUUID()));
+    }
+    return result.value;
+  }
+
+  /** Queue a produced result before later turn replies; network delivery cannot block the decision. */
+  private desktopReceipt(chatId: string, text: string | undefined, deliveryId: string): void {
+    if (!text || this.stopped) return;
+    this.outgoing = this.outgoing.then(async () => {
+      if (!this.stopped) await this.transport.sendText(chatId, text, deliveryId, { durable: true });
+    }).catch(() => { this.report('channel_desktop_receipt_failed'); });
   }
 
   private async status(base: SessionId, sessionId: SessionId, chatId: string): Promise<string> {
@@ -691,7 +708,9 @@ export class DshChannelBridge {
     if (!args || prompt.length > 2500) {
       void this.transport.sendText(chatId, '此操作需要在本机 DSH 查看完整参数并审批。',
         identity('local-approval', request.agent.id, String(request.callId))).catch(() => {});
-      return next();
+      const outcome = await next();
+      if (!request.signal?.aborted) this.desktopReceipt(chatId, desktopApprovalReceipt(title, outcome), identity('desktop-approval', request.agent.id, String(request.callId), crypto.randomUUID()));
+      return outcome;
     }
     const lifetime = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
@@ -701,8 +720,14 @@ export class DshChannelBridge {
       `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
       '有效期 10 分钟，仅本次操作。停止当前执行：/cancel',
       identity('approval', pending.token)).then(pending.presented, () => { this.replies.answer(chatId, pending.token, 'unavailable'); });
-    try { return await firstAvailable([pending.outcome, Promise.resolve().then(() => next(signal))], value => value !== 'unavailable'); }
-    finally { lifetime.abort(); }
+    const result = await firstAvailable([
+      pending.outcome.then(value => ({ source: 'channel', value })),
+      Promise.resolve().then(() => next(signal)).then(value => ({ source: 'desktop', value })),
+    ], result => result.value !== 'unavailable').finally(() => lifetime.abort());
+    if (result.source === 'desktop' && !request.signal?.aborted) {
+      this.desktopReceipt(chatId, desktopApprovalReceipt(title, result.value), identity('desktop-approval', pending.token));
+    }
+    return result.value;
   }
 
   onEvent(session: Session, event: SessionEvent): void {

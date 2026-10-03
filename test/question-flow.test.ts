@@ -144,7 +144,9 @@ test('an oversized plan stays in the native UI without dropping its details', as
     undefined, async () => result as never);
   assert.deepEqual(answer, result);
   assert.equal(f.questions().length, 0);
-  assert.match(f.texts.at(-1)!, /本机 DSH.*完整/);
+  assert.ok(f.texts.some(text => /本机 DSH.*完整/.test(text)));
+  await f.bridge.drain();
+  assert.match(f.texts.at(-1)!, /已在电脑端完成回答/);
 });
 
 test('failed answer acknowledgments cannot settle the following question', async t => {
@@ -199,4 +201,14 @@ test('channel answers cancel the desktop question lifetime', async t => {
   await f.bridge.receive(inbound('remote-wins', '回答 2'));
   assert.deepEqual((await result).answers, [{ id: 'format', selected: ['PDF'] }]);
   assert.equal(cancelled, true);
+});
+
+test('desktop coder approval selections get a short receipt without details or free text', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  const question = { id: 'approve', header: '编码任务 ct-fixture', question: 'Codex 请求：安装依赖', detail: '完整命令和参数不应重复出现在回执', options: [{ label: '允许' }, { label: '拒绝' }] };
+  await f.ask([question], undefined, async () => ({ answers: [{ id: 'approve', selected: ['允许'], custom: 'private free-text answer' }] }));
+  await f.bridge.drain();
+  assert.match(f.texts.at(-1)!, /已在电脑端完成回答.*\n.*编码任务 ct-fixture：Codex 请求：安装依赖：允许/);
+  assert.match(f.texts.at(-1)!, /这组提示已失效/);
+  assert.doesNotMatch(f.texts.at(-1)!, /private free-text|完整命令和参数/);
 });

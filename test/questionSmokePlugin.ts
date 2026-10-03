@@ -113,6 +113,11 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     await agent.whenIdle();
     await bridge.drain();
     assert.equal(native[1]!.signal?.aborted, true);
+    const receipts = texts.filter(text => text.startsWith('已在电脑端完成回答'));
+    assert.equal(receipts.length, 1);
+    assert.match(receipts[0]!, /PDF/);
+    assert.doesNotMatch(receipts[0]!, /本地验收报告/);
+    assert.ok(texts.indexOf(receipts[0]!) < texts.lastIndexOf('按回答完成原任务。'));
     assert.equal(texts.filter(text => text === '按回答完成原任务。').length, beforeDesktop + 1, 'desktop-initiated final reply is forwarded');
     assert.ok(!texts.includes('电脑继续生成报告'), 'desktop user text is not mirrored');
     await bridge.receive(inbound('late-answer', '回答 2'));
@@ -130,7 +135,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.deepEqual(failures, []);
     await bridge.close();
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls,
-      checks: ['dual_question_presentation', 'channel_answer_dismisses_desktop', 'desktop_answer_invalidates_channel', 'desktop_reply_forwarded_only_in_bound_session', 'native_ask_user_question_tool', 'question_batch_answers_in_native_history', 'question_answer_resumes_same_turn',
+      checks: ['desktop_question_receipt_precedes_final_reply', 'dual_question_presentation', 'channel_answer_dismisses_desktop', 'desktop_answer_invalidates_channel', 'desktop_reply_forwarded_only_in_bound_session', 'native_ask_user_question_tool', 'question_batch_answers_in_native_history', 'question_answer_resumes_same_turn',
         'question_duplicate_and_invalid_replies_isolated', 'native_waiting_and_completed_status'],
     }, null, 2));
   }

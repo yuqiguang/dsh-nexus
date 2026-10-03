@@ -13,6 +13,7 @@ const inbound = (messageId: string, text: string): InboundMessage => ({ messageI
 async function fixture() {
   const prompts: unknown[] = [];
   const texts: string[] = [];
+  const deliveries: { chatId: string; text: string; id: string; durable?: boolean }[] = [];
   const errors: string[] = [];
   const calls: { type: 'tool/call'; data: { callId: string; arguments: string } }[] = [];
   const session = { id: sessionIdFor(owner.accountId, owner.ownerId, owner.ownerId, 'wechat'), snapshotEvents: () => calls };
@@ -24,7 +25,7 @@ async function fixture() {
   } as unknown as Context;
   let send: (text: string) => Promise<void> = async () => {};
   const transport: ChannelTransport = { async start() {}, stop() {}, async sendFile() {},
-    async sendText(_chatId, text) { texts.push(text); await send(text); } };
+    async sendText(chatId, text, id, options) { texts.push(text); deliveries.push({ chatId, text, id, durable: options?.durable }); await send(text); } };
   const bridge = new DshChannelBridge(ctx, transport, owner, '/local-approval-fixture', code => errors.push(code));
   await bridge.receive(inbound('initial-task', '创建本地测试文件'));
   prompts.length = 0;
@@ -34,7 +35,7 @@ async function fixture() {
     return bridge.approve({ agent, callId, toolName: 'bash', reason: '需要在沙盒外执行这一次操作。' } as unknown as ApprovalRequest,
       local);
   }
-  return { bridge, prompts, texts, errors, ask, setSend: (handler: typeof send) => { send = handler; },
+  return { bridge, prompts, texts, deliveries, errors, ask, setSend: (handler: typeof send) => { send = handler; },
     setPrompt: (handler: () => void) => { onPrompt = handler; } };
 }
 
@@ -185,4 +186,53 @@ test('failed channel delivery falls back to the desktop approval', async t => {
   f.setSend(async () => { throw new Error('offline fixture'); });
   const result = await f.ask('desktop-fallback', undefined, async () => { await new Promise(resolve => setImmediate(resolve)); return 'allowed-once'; });
   assert.equal(result, 'allowed-once');
+});
+
+for (const outcome of ['allowed-once', 'rejected'] as const) {
+  test(`desktop ${outcome} sends one durable, scoped receipt without arguments`, async t => {
+    const f = await fixture(); t.after(() => f.bridge.close());
+    assert.equal(await f.ask('desktop-receipt', undefined, async () => outcome), outcome);
+    await f.bridge.drain();
+    const receipts = f.deliveries.filter(item => item.text.startsWith('已在电脑端'));
+    assert.equal(receipts.length, 1);
+    assert.equal(receipts[0]!.chatId, owner.ownerId);
+    assert.equal(receipts[0]!.durable, true);
+    assert.match(receipts[0]!.text, outcome === 'allowed-once' ? /允许“写入测试文件”（仅本次）/ : /拒绝“写入测试文件”/);
+    assert.match(receipts[0]!.text, /审批已失效/);
+    assert.doesNotMatch(receipts[0]!.text, /printf|sandbox_permissions|require_escalated/);
+    assert.equal(f.prompts.length, 0);
+  });
+}
+
+test('a channel winner never produces a desktop receipt even if the losing desktop resolves later', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  let decide!: (value: ApprovalOutcome) => void;
+  const outcome = f.ask('remote-first', undefined, () => new Promise(resolve => { decide = resolve; }));
+  await until(() => f.texts.length === 1, 'approval missing');
+  await f.bridge.receive(inbound('remote-reject', '拒绝'));
+  assert.equal(await outcome, 'rejected');
+  decide('allowed-once');
+  await new Promise(resolve => setImmediate(resolve));
+  await f.bridge.drain();
+  assert.equal(f.texts.filter(text => text.startsWith('已在电脑端')).length, 0);
+});
+
+test('receipt delivery failure does not change approval or queue another task', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  f.setSend(async text => { if (text.startsWith('已在电脑端')) throw new Error('fixture send failure'); });
+  assert.equal(await f.ask('receipt-offline', undefined, async () => 'allowed-once'), 'allowed-once');
+  await f.bridge.drain();
+  assert.deepEqual(f.errors, ['channel_desktop_receipt_failed']);
+  assert.equal(f.prompts.length, 0);
+});
+
+test('cancelled native dialogs do not claim a desktop approval; oversized native-only approvals get receipts', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  assert.equal(await f.ask('cancelled', undefined, async () => 'cancelled'), 'cancelled');
+  await f.bridge.drain();
+  assert.equal(f.texts.filter(text => text.startsWith('已在电脑端')).length, 0);
+  assert.equal(await f.ask('long-command', { command: 'private-command '.repeat(250), description: '很长的操作', sandbox_permissions: 'require_escalated' }, async () => 'rejected'), 'rejected');
+  await f.bridge.drain();
+  assert.match(f.texts.at(-1)!, /已在电脑端拒绝“bash”/);
+  assert.doesNotMatch(f.texts.at(-1)!, /private-command/);
 });
