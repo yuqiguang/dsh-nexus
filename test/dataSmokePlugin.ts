@@ -15,6 +15,7 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
 import { access, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import JSZip from 'jszip';
+import { decryptArchive } from '../src/data/encryption.js';
 import { parse } from 'yaml';
 import { installBridge } from '../src/dsh/bridge.js';
 import { storedEvents } from '../src/dsh/history.js';
@@ -111,12 +112,13 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       const exportUrl = `${origin}/api/nexus-data/export`;
       assert.equal((await fetch(exportUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401, 'the export needs the login');
       assert.equal((await fetch(exportUrl, { method: 'POST', headers: { 'Content-Type': 'text/plain', cookie }, body: '{}' })).status, 415);
-      const response = await fetch(exportUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: '{}' });
+      const secret = 'fixture-backup-password';
+      const response = await fetch(exportUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ includeCredentials: true, includeSettings: true, password: secret }) });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('content-type'), 'application/zip');
       const archive = Buffer.from(await response.arrayBuffer());
       await writeFile(archivePath, archive, { mode: 0o600 });
-      const zip = await JSZip.loadAsync(archive);
+      const zip = await JSZip.loadAsync(await decryptArchive(archive, secret));
       const names = Object.keys(zip.files);
       // The chat's session log, flushed before the read, is in it, as are native storage, the credentials and the profile's settings.
       assert.ok(names.some(path => path.startsWith('sessions/') && path.includes(`/${sessionId}/`)), 'the chat session is exported');
@@ -133,7 +135,8 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       assert.equal((await fetch(importUrl, { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: archive })).status, 401, 'the import needs the login');
       assert.equal((await fetch(importUrl, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', cookie }, body: archive })).status, 415);
       assert.deepEqual(await (await fetch(importUrl, { method: 'POST', headers: { 'Content-Type': 'application/zip', cookie }, body: Buffer.from('not a zip') })).json(), { ok: false, error: { code: 'archive_unreadable' } });
-      const staged = await (await fetch(importUrl, { method: 'POST', headers: { 'Content-Type': 'application/zip', cookie }, body: archive })).json() as { ok: boolean; value: { restarting: boolean; pending: { replacedDir: string; summary: { sessions: number; credentials: number } } } };
+      const preview = await (await fetch(`${origin}/api/nexus-data/preview`, { method: 'POST', headers: { 'Content-Type': 'application/zip', cookie, 'X-Nexus-Archive-Password': secret }, body: archive })).json() as { value: { digest: string } };
+      const staged = await (await fetch(importUrl, { method: 'POST', headers: { 'Content-Type': 'application/zip', cookie, 'X-Nexus-Archive-Password': secret, 'X-Nexus-Preview': preview.value.digest }, body: archive })).json() as { ok: boolean; value: { restarting: boolean; pending: { replacedDir: string; summary: { sessions: number; credentials: number } } } };
       assert.equal(staged.ok, true, JSON.stringify(staged));
       assert.equal(staged.value.restarting, false);
       assert.equal(restarts, 1);

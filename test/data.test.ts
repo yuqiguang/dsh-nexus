@@ -4,9 +4,16 @@ import { mkdir, mkdtemp, readdir, readFile, rename, stat, symlink, writeFile } f
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import JSZip from 'jszip';
-import { DataError, MANIFEST, PENDING_FILE, STAGING_DIR, allowedPath, applyPendingImport, exportData, importedReason, stageImport } from '../src/data/archive.js';
+import { DataError, MANIFEST, PENDING_FILE, STAGING_DIR, allowedPath, applyPendingImport, exportData as exportSelectedData, previewData, boundedBuffer, importedReason, stageImport } from '../src/data/archive.js';
 import { restartNotice } from '../src/service/lifecycle.js';
 
+// Existing replacement fixtures inspect the decoded ZIP; the public exporter encrypts selected credentials.
+const exportData: typeof exportSelectedData = async (dir, meta, options = { includeCredentials: true, includeSettings: true }) => {
+  const { decryptArchive } = await import('../src/data/encryption.js');
+  const result = await exportSelectedData(dir, meta, { ...options, password: 'fixture-password' });
+  const { encrypted: _, ...summary } = result.summary;
+  return { zip: await decryptArchive(result.zip, 'fixture-password'), summary };
+};
 const T0 = Date.parse('2026-09-27T10:00:00+08:00');
 const CREDENTIALS = 'version: 1\nrecords:\n  nexus-channels/wechat:\n    kind: grant\n    payload:\n      secret: fixture-secret-token\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      secret: fixture-browser\n';
 
@@ -60,9 +67,9 @@ test('an export carries the sessions, native storage, credentials and DSH settin
   const names = Object.values(archive.files).filter(entry => !entry.dir).map(entry => entry.name).sort();
   assert.deepEqual(names, [...Object.keys(DATA), MANIFEST].sort(), 'nothing else, and no link is followed');
   const manifest = JSON.parse(await archive.file(MANIFEST)!.async('string'));
-  assert.deepEqual([manifest.format, manifest.version, manifest.createdAt, manifest.dshVersion, manifest.commit], ['nexus-data', 1, T0, '0.1.7-rc.1', 'abc1234']);
+  assert.deepEqual([manifest.format, manifest.version, manifest.createdAt, manifest.dshVersion, manifest.commit], ['nexus-data', 2, T0, '0.1.7-rc.1', 'abc1234']);
   assert.match((await archive.file('.credentials.yaml')!.async('string')), /fixture-secret-token/, 'the secrets travel in plain text, as the user chose');
-  assert.deepEqual(summary, { createdAt: T0, dshVersion: '0.1.7-rc.1', commit: 'abc1234', sessions: 3, records: 3, credentials: 2,
+  assert.deepEqual(summary, { roots: ['sessions', 'storages', '.credentials.yaml', 'profiles/nexus/cordis.patch.yml'], createdAt: T0, dshVersion: '0.1.7-rc.1', commit: 'abc1234', sessions: 3, records: 3, credentials: 2,
     bytes: Object.values(DATA).reduce((sum, text) => sum + Buffer.byteLength(text), 0) });
   // Into a home that has nothing yet: staged beside it, then swapped in at the next start.
   const target = await home({});
@@ -142,7 +149,7 @@ test('anything but an intact archive of this format is refused before a byte is 
   unlisted.remove(MANIFEST);
   await refused(await unlisted.generateAsync({ type: 'nodebuffer' }), 'manifest_invalid');
   await refused(await edit((_zip, manifest) => { manifest.format = 'something-else'; }), 'not_a_nexus_archive');
-  await refused(await edit((_zip, manifest) => { manifest.version = 2; }), 'archive_version_unsupported');
+  await refused(await edit((_zip, manifest) => { manifest.version = 99; }), 'archive_version_unsupported');
   // A path out of the home, or anywhere but the data roots, whether listed or merely present.
   for (const path of ['../evil', 'sessions/../../evil', '/etc/passwd', 'attachments/x', 'profiles/nexus/package.json', 'sessions', 'storages/session_projcache/x.json']) {
     await refused(await edit((zip, manifest) => { zip.file(path, 'x'); manifest.files.push({ path, size: 1, sha256: '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881' }); }), 'archive_path_rejected');
@@ -162,11 +169,10 @@ test('anything but an intact archive of this format is refused before a byte is 
   // JSZip normalises `..` in the names it writes, so the check on the listed path is what stops a crafted manifest.
   for (const path of ['sessions/../../evil', 'sessions/a/../../../x', 'storages/./x', 'sessions/..']) assert.equal(allowedPath(path), false, path);
   assert.equal(allowedPath('storages/nexus_mail/cursor/inbox.json.bak.1'), false);
-  // A second good upload replaces the first staged one.
+  // A pending import remains intact until applied.
   const first = await stageImport(target, good, T0);
-  const second = await stageImport(target, good, T0 + 1);
-  assert.notEqual(first.replacedDir, second.replacedDir);
-  assert.equal(JSON.parse(await readFile(join(target, PENDING_FILE), 'utf8')).replacedDir, second.replacedDir);
+  await assert.rejects(stageImport(target, good, T0 + 1), /import_in_progress/);
+  assert.equal(JSON.parse(await readFile(join(target, PENDING_FILE), 'utf8')).replacedDir, first.replacedDir);
 });
 
 test('the routes insist on their content types, cap a streamed upload, wait for a running update, and restart only after staging', async () => {
@@ -203,7 +209,7 @@ test('the routes insist on their content types, cap a streamed upload, wait for 
   assert.ok(sent <= 258 * 1024 * 1024, 'reading stops at the cap');
   assert.deepEqual(await (await post(Buffer.from('nope'))).json(), { ok: false, error: { code: 'archive_unreadable' } });
   assert.equal(restarts, 0);
-  const staged = await (await post(zip)).json() as { ok: boolean; value: { restarting: boolean; pending: { summary: { sessions: number } } } };
+  const staged = await (await post(zip, 'application/zip', { 'x-nexus-preview': (await previewData(zip)).digest })).json() as { ok: boolean; value: { restarting: boolean; pending: { summary: { sessions: number } } } };
   assert.deepEqual([staged.ok, staged.value.restarting, staged.value.pending.summary.sessions], [true, true, 3]);
   assert.equal(restarts, 1);
   assert.ok((await readdir(target)).includes(PENDING_FILE));
@@ -229,4 +235,66 @@ test('a host without the startup importer rejects uploads before staging or rest
   assert.equal(response.status, 409);
   assert.deepEqual(await response.json(), { ok: false, error: { code: 'import_unavailable' } });
   assert.equal((await readdir(target)).includes(PENDING_FILE), false);
+});
+
+test('v2 defaults omit credentials/settings and restore leaves those roots untouched; v1 archives remain readable', async () => {
+  const source = await home(DATA), target = await home(DATA);
+  const exported = await exportSelectedData(source, { now: T0 });
+  const checked = await previewData(exported.zip);
+  assert.equal(checked.summary.credentials, 0);
+  assert.deepEqual(checked.summary.roots, ['sessions', 'storages']);
+  assert.equal((await readdir(target)).includes(PENDING_FILE), false);
+  await stageImport(target, exported.zip, T0);
+  await applyPendingImport(target);
+  assert.equal(await readFile(join(target, '.credentials.yaml'), 'utf8'), CREDENTIALS);
+  assert.equal(await readFile(join(target, 'profiles/nexus/cordis.patch.yml'), 'utf8'), DATA['profiles/nexus/cordis.patch.yml']);
+  const zip = await JSZip.loadAsync((await exportData(source, { now: T0 })).zip);
+  const manifest = JSON.parse(await zip.file(MANIFEST)!.async('string'));
+  manifest.version = 1; delete manifest.roots;
+  zip.file(MANIFEST, JSON.stringify(manifest));
+  assert.equal((await previewData(await zip.generateAsync({ type: 'nodebuffer' }))).summary.credentials, 2);
+});
+
+test('credential exports require encryption; wrong passwords/tampering leave no staging and the exact encrypted archive restores', async () => {
+  const source = await home(DATA), target = await home({});
+  await assert.rejects(exportSelectedData(source, { now: T0 }, { includeCredentials: true, includeSettings: true }), /archive_password_weak/);
+  const encrypted = await exportSelectedData(source, { now: T0 }, { includeCredentials: true, includeSettings: true, password: 'fixture-long-password' });
+  assert.equal(encrypted.zip.includes(Buffer.from('fixture-secret-token')), false);
+  await assert.rejects(stageImport(target, encrypted.zip, T0), /archive_password_required/);
+  await assert.rejects(stageImport(target, encrypted.zip, T0, 'wrong-password'), /archive_decrypt_failed/);
+  const changed = Buffer.from(encrypted.zip); changed[changed.length - 1]! ^= 1;
+  await assert.rejects(stageImport(target, changed, T0, 'fixture-long-password'), /archive_decrypt_failed/);
+  assert.deepEqual(await readdir(target), []);
+  const preview = await previewData(encrypted.zip, 'fixture-long-password');
+  assert.equal(preview.summary.encrypted, true);
+  await stageImport(target, encrypted.zip, T0, 'fixture-long-password');
+  await applyPendingImport(target);
+  assert.deepEqual(await tree(target), DATA);
+});
+
+test('the generated-archive collector refuses oversized output at the same byte boundary used for uploads', async () => {
+  const { Readable } = await import('node:stream');
+  assert.equal((await boundedBuffer(Readable.from([Buffer.alloc(6), Buffer.alloc(4)]), 10)).length, 10);
+  await assert.rejects(boundedBuffer(Readable.from([Buffer.alloc(6), Buffer.alloc(5)]), 10), /archive_too_large/);
+});
+
+test('restore requires a matching preview and an idle host, including tasks started during staging', async () => {
+  const { installDataRoutes } = await import('../src/data/index.js');
+  const routes = new Map<string, (request: Request) => Promise<Response>>();
+  const ctx = { connection: { fetch: { register(route: { path: string; fetch(request: Request): Promise<Response> }) { routes.set(route.path, route.fetch); } } }, sessionPersistence: { async flush() {} } } as never;
+  const target = await home(DATA), zip = (await exportSelectedData(target, { now: T0 })).zip;
+  let checks = 0, busyAfter = Infinity, restarts = 0;
+  installDataRoutes({ ctx, home: target, importEnabled: true, isIdle: () => ++checks < busyAfter, restart: () => { restarts++; return true; } });
+  const post = (digest = '') => routes.get('/api/nexus-data/import')!(new Request('http://x', { method: 'POST', headers: { 'Content-Type': 'application/zip', 'X-Nexus-Preview': digest }, body: new Uint8Array(zip) }));
+  assert.equal((await (await post()).json() as any).error.code, 'preview_required');
+  const previewResponse = await routes.get('/api/nexus-data/preview')!(new Request('http://x', { method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: new Uint8Array(zip) }));
+  const preview = (await previewResponse.json() as any).value;
+  assert.equal((await readdir(target)).includes(STAGING_DIR), false);
+  checks = 0; busyAfter = 1;
+  assert.equal((await (await post(preview.digest)).json() as any).error.code, 'tasks_running');
+  checks = 0; busyAfter = 3;
+  assert.equal((await (await post(preview.digest)).json() as any).error.code, 'tasks_running');
+  assert.equal((await readdir(target)).includes(PENDING_FILE), false);
+  assert.equal((await readdir(target)).includes(STAGING_DIR), false);
+  assert.equal(restarts, 0);
 });

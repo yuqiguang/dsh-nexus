@@ -2,21 +2,18 @@ import { createHash, randomBytes } from 'node:crypto';
 import { chmod, lstat, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, sep } from 'node:path';
 import JSZip from 'jszip';
+import { Readable } from 'node:stream';
+import { decryptArchive, encryptArchive, encryptedArchive, ENCRYPTION_OVERHEAD } from './encryption.js';
 import { parse } from 'yaml';
 import { formatLocal } from '../assistant/clock.js';
 import { DEFAULT_TIME_ZONE } from '../assistant/settings.js';
 import type { RestartReason } from '../service/lifecycle.js';
 
-/**
- * The user's data as one zip: every session log, every native storage domain, the credentials document with
- * its secrets in plain text (the user chose a package that restores without reconnecting anything), and the
- * profile's DSH settings. Attachments and workspace files stay out. An import replaces all of it at once: it is
- * checked and unpacked beside the live data while the service runs, and swapped in by the next start, before
- * DSH opens any of it; what it replaced is kept whole in `replaced-<time>/`.
- */
+/** Version 2 explicitly lists replacement roots. Credentials require password encryption;
+ * older v1 ZIPs remain readable. Restore swaps data only before DSH opens storage. */
 
 export const DATA_FORMAT = 'nexus-data';
-export const DATA_VERSION = 1;
+export const DATA_VERSION = 2;
 export const MANIFEST = 'manifest.json';
 export const STAGING_DIR = 'import-staging';
 export const PENDING_FILE = 'import-pending.json';
@@ -36,14 +33,15 @@ const SKIP = [/^storages\/session_projcache(\/|$)/, /\.bak\.[^/]*$/, /\.tmp$/, /
 export interface ManifestFile { path: string; size: number; sha256: string }
 export interface DataManifest {
   format: typeof DATA_FORMAT;
-  version: typeof DATA_VERSION;
+  version: 1 | 2;
+  roots?: string[];
   createdAt: number;
   dshVersion?: string;
   commit?: string;
   files: ManifestFile[];
 }
-export interface DataSummary { createdAt: number; dshVersion?: string; commit?: string; sessions: number; records: number; credentials: number; bytes: number }
-export interface PendingImport { stagedAt: number; replacedDir: string; summary: DataSummary }
+export interface DataSummary { createdAt: number; dshVersion?: string; commit?: string; sessions: number; records: number; credentials: number; bytes: number; roots?: string[]; encrypted?: boolean }
+export interface PendingImport { stagedAt: number; replacedDir: string; summary: DataSummary; roots?: string[] }
 
 export class DataError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -77,30 +75,50 @@ async function dataFiles(home: string): Promise<string[]> {
 }
 
 /** Build the archive from the DSH home. The caller flushes live sessions first. */
-export async function exportData(home: string, meta: { now: number; dshVersion?: string; commit?: string }): Promise<{ zip: Buffer; summary: DataSummary }> {
+export interface DataExportOptions { includeCredentials: boolean; includeSettings: boolean; password?: string }
+
+/** Keep generated archives within the same limit as the importer, including encryption overhead. */
+export async function boundedBuffer(source: NodeJS.ReadableStream, limit: number): Promise<Buffer> {
+  // JSZip uses readable-stream v2, which predates Symbol.asyncIterator.
+  const stream = new Readable({ read() {} }).wrap(source);
+  let total = 0; const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); total += bytes.length;
+    if (total > limit) { stream.destroy(); throw new DataError('archive_too_large'); }
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+export async function exportData(home: string, meta: { now: number; dshVersion?: string; commit?: string }, options: DataExportOptions = { includeCredentials: false, includeSettings: false }): Promise<{ zip: Buffer; summary: DataSummary }> {
+  if ((options.includeCredentials || options.password) && (!options.password || options.password.length < 10 || options.password.length > 1024)) throw new DataError('archive_password_weak');
   const zip = new JSZip();
   const files: ManifestFile[] = [];
-  let total = 0;
+  let total = 0, credentials = 0;
+  const roots: string[] = [...DIRECTORIES, ...(options.includeCredentials ? ['.credentials.yaml'] : []), ...(options.includeSettings ? ['profiles/nexus/cordis.patch.yml'] : [])];
   for (const path of await dataFiles(home)) {
+    if (!roots.some(root => path === root || path.startsWith(root + '/'))) continue;
     const bytes = await readFile(join(home, ...path.split('/')));
     total += bytes.length;
+    if (path === '.credentials.yaml') credentials = await credentialCount(bytes.toString('utf8'));
     if (total > MAX_DATA_BYTES) throw new DataError('data_too_large');
+    if (files.length >= 30000) throw new DataError('data_too_large');
     files.push({ path, size: bytes.length, sha256: sha256(bytes) });
     zip.file(path, bytes, { date: new Date(meta.now) });
   }
-  if (!files.some(file => file.path === '.credentials.yaml')) throw new DataError('credentials_missing');
-  const manifest: DataManifest = { format: DATA_FORMAT, version: DATA_VERSION, createdAt: meta.now,
+  if (options.includeCredentials && !files.some(file => file.path === '.credentials.yaml')) throw new DataError('credentials_missing');
+  const manifest: DataManifest = { format: DATA_FORMAT, version: DATA_VERSION, roots: roots.filter(root => root !== 'profiles/nexus/cordis.patch.yml' || files.some(file => file.path === root)), createdAt: meta.now,
     ...(meta.dshVersion ? { dshVersion: meta.dshVersion } : {}), ...(meta.commit ? { commit: meta.commit } : {}), files };
   zip.file(MANIFEST, JSON.stringify(manifest, null, 2), { date: new Date(meta.now) });
-  const bytes = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-  return { zip: bytes, summary: summarize(manifest, await credentialCount(await readFile(join(home, '.credentials.yaml'), 'utf8'))) };
+  const bytes = await boundedBuffer(zip.generateNodeStream({ streamFiles: true, compression: 'DEFLATE', compressionOptions: { level: 6 } }), MAX_ARCHIVE_BYTES - (options.password ? ENCRYPTION_OVERHEAD : 0));
+  return { zip: options.password ? await encryptArchive(bytes, options.password) : bytes, summary: { ...summarize(manifest, credentials), ...(options.password ? { encrypted: true } : {}) } };
 }
 
 function summarize(manifest: DataManifest, credentials: number): DataSummary {
   const sessions = new Set(manifest.files.flatMap(file => /^sessions\/[^/]+\/[^/]+\//.test(file.path) ? [file.path.split('/').slice(0, 3).join('/')] : []));
   return { createdAt: manifest.createdAt, ...(manifest.dshVersion ? { dshVersion: manifest.dshVersion } : {}), ...(manifest.commit ? { commit: manifest.commit } : {}),
     sessions: sessions.size, records: manifest.files.filter(file => file.path.startsWith('storages/') && file.path.endsWith('.json')).length,
-    credentials, bytes: manifest.files.reduce((sum, file) => sum + file.size, 0) };
+    ...(manifest.roots ? { roots: manifest.roots } : {}), credentials, bytes: manifest.files.reduce((sum, file) => sum + file.size, 0) };
 }
 
 /** How many records the credentials document holds; throws when it is not one. */
@@ -116,56 +134,85 @@ function parseManifest(text: string | undefined): DataManifest {
   let manifest: DataManifest;
   try { manifest = JSON.parse(text ?? '') as DataManifest; } catch { throw new DataError('manifest_invalid'); }
   if (manifest?.format !== DATA_FORMAT) throw new DataError('not_a_nexus_archive');
-  if (manifest.version !== DATA_VERSION) throw new DataError('archive_version_unsupported');
-  if (!Number.isSafeInteger(manifest.createdAt) || !Array.isArray(manifest.files)) throw new DataError('manifest_invalid');
+  if (manifest.version !== 1 && manifest.version !== DATA_VERSION) throw new DataError('archive_version_unsupported');
+  if (!Number.isSafeInteger(manifest.createdAt) || !Array.isArray(manifest.files) || manifest.files.length > 30000) throw new DataError('manifest_invalid');
+  if (manifest.version === 2 && (!Array.isArray(manifest.roots) || !DIRECTORIES.every(root => manifest.roots!.includes(root)) || new Set(manifest.roots).size !== manifest.roots.length || manifest.roots.some(root => !(DATA_ROOTS as readonly string[]).includes(root)))) throw new DataError('manifest_invalid');
+  if ((manifest.dshVersion !== undefined && typeof manifest.dshVersion !== 'string') || (manifest.commit !== undefined && typeof manifest.commit !== 'string')) throw new DataError('manifest_invalid');
   const seen = new Set<string>();
   let total = 0;
   for (const file of manifest.files) {
     if (typeof file?.path !== 'string' || !allowedPath(file.path) || seen.has(file.path)) throw new DataError('archive_path_rejected');
     if (!Number.isSafeInteger(file.size) || file.size < 0 || typeof file.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(file.sha256)) throw new DataError('manifest_invalid');
+    if (manifest.version === 2 && !manifest.roots!.some(root => file.path === root || file.path.startsWith(root + '/'))) throw new DataError('archive_path_rejected');
     seen.add(file.path);
     total += file.size;
   }
   if (total > MAX_DATA_BYTES) throw new DataError('data_too_large');
-  if (!seen.has('.credentials.yaml')) throw new DataError('credentials_missing');
+  if ((manifest.version === 1 || manifest.roots?.includes('.credentials.yaml')) && !seen.has('.credentials.yaml')) throw new DataError('credentials_missing');
   return manifest;
 }
 
 /**
  * Check an uploaded archive and unpack it beside the live data, for the next start to swap in. Nothing live is
  * touched. Every entry must be listed in the manifest with its size and hash, and every listed file present;
- * the credentials document must be one. A second upload replaces an earlier staged one.
+ * a credentials document, when selected, must be valid. Pending imports are not overwritten.
  */
-export async function stageImport(home: string, archive: Buffer, now: number): Promise<PendingImport> {
+export interface DataPreview { summary: DataSummary; digest: string }
+
+async function inspectArchive(archive: Buffer, password: string, visit?: (path: string, bytes: Buffer) => Promise<void>): Promise<DataPreview> {
   if (archive.length > MAX_ARCHIVE_BYTES) throw new DataError('archive_too_large');
+  const encrypted = encryptedArchive(archive);
+  let decoded = archive;
+  if (encrypted) {
+    if (!password) throw new DataError('archive_password_required');
+    try { decoded = await decryptArchive(archive, password); } catch { throw new DataError('archive_decrypt_failed'); }
+  }
   let zip: JSZip;
-  try { zip = await JSZip.loadAsync(archive, { checkCRC32: true }); } catch { throw new DataError('archive_unreadable'); }
-  const manifest = parseManifest(await zip.file(MANIFEST)?.async('string'));
+  try { zip = await JSZip.loadAsync(decoded); } catch { throw new DataError('archive_unreadable'); }
+  const manifestEntry = zip.file(MANIFEST);
+  const manifest = parseManifest(manifestEntry ? (await boundedBuffer(manifestEntry.nodeStream(), 4 * 1024 * 1024)).toString('utf8') : undefined);
   const listed = new Map(manifest.files.map(file => [file.path, file]));
   const entries = Object.values(zip.files).filter(entry => !entry.dir && entry.name !== MANIFEST);
+  for (const entry of Object.values(zip.files)) {
+    const original = (entry as JSZip.JSZipObject & { unsafeOriginalName?: string }).unsafeOriginalName;
+    if (original && original !== entry.name) throw new DataError('archive_path_rejected');
+  }
   for (const entry of entries) if (!listed.has(entry.name)) throw new DataError('archive_path_rejected');
   if (entries.length !== listed.size) throw new DataError('archive_incomplete');
+  let credentials = 0;
+  for (const entry of entries) {
+    const file = listed.get(entry.name)!;
+    let bytes: Buffer;
+    try { bytes = await boundedBuffer(entry.nodeStream(), file.size); } catch { throw new DataError('archive_corrupt'); }
+    if (bytes.length !== file.size || sha256(bytes) !== file.sha256) throw new DataError('archive_corrupt');
+    if (file.path === '.credentials.yaml') credentials = await credentialCount(bytes.toString('utf8'));
+    if (visit) await visit(file.path, bytes);
+  }
+  return { digest: sha256(archive), summary: { ...summarize(manifest, credentials), ...(encrypted ? { encrypted: true } : {}) } };
+}
+
+/** Preview validates every file without staging data or scheduling a restart. */
+export const previewData = (archive: Buffer, password = '') => inspectArchive(archive, password);
+
+export async function stageImport(home: string, archive: Buffer, now: number, password = ''): Promise<PendingImport> {
+  // Fully validate first: a refused upload must not remove a previous valid staging area.
+  const preview = await previewData(archive, password);
   const staging = join(home, STAGING_DIR);
+  try { await lstat(join(home, PENDING_FILE)); throw new DataError('import_in_progress'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   await rm(staging, { recursive: true, force: true });
   await mkdir(staging, { recursive: true, mode: 0o700 });
-  let credentials = 0;
   try {
-    for (const entry of entries) {
-      const file = listed.get(entry.name)!;
-      const bytes = await entry.async('nodebuffer');
-      if (bytes.length !== file.size || sha256(bytes) !== file.sha256) throw new DataError('archive_corrupt');
-      if (file.path === '.credentials.yaml') credentials = await credentialCount(bytes.toString('utf8'));
-      const target = join(staging, ...file.path.split('/'));
+    await inspectArchive(archive, password, async (path, bytes) => {
+      const target = join(staging, ...path.split('/'));
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await writeFile(target, bytes, { mode: 0o600 });
-    }
-  } catch (error) {
-    await rm(staging, { recursive: true, force: true });
-    throw error;
-  }
-  const pending: PendingImport = { stagedAt: now, replacedDir: `replaced-${stamp(now)}-${randomBytes(3).toString('hex')}`, summary: summarize(manifest, credentials) };
-  await writeFile(join(home, PENDING_FILE), JSON.stringify(pending), { mode: 0o600 });
-  return pending;
+    });
+    const pending: PendingImport = { stagedAt: now, replacedDir: `replaced-${stamp(now)}-${randomBytes(3).toString('hex')}`, summary: preview.summary,
+      ...(preview.summary.roots ? { roots: preview.summary.roots } : {}) };
+    await writeFile(join(home, PENDING_FILE), JSON.stringify(pending), { mode: 0o600 });
+    return pending;
+  } catch (error) { await rm(staging, { recursive: true, force: true }); throw error; }
 }
 
 /** `20260927-071530`, local to the machine, for the name of the directory the replaced data moves to. */
@@ -190,12 +237,13 @@ export async function applyPendingImport(home: string): Promise<PendingImport | 
     await rm(join(home, PENDING_FILE), { force: true });
     throw new DataError('pending_import_invalid');
   }
+  if (pending.roots && (!Array.isArray(pending.roots) || pending.roots.some(root => !(DATA_ROOTS as readonly string[]).includes(root)))) throw new DataError('pending_import_invalid');
   const staging = join(home, STAGING_DIR);
   const replaced = join(home, pending.replacedDir);
   const exists = async (path: string) => { try { await lstat(path); return true; } catch { return false; } };
   if (!await exists(staging)) { await rm(join(home, PENDING_FILE), { force: true }); return undefined; }
   await mkdir(replaced, { recursive: true, mode: 0o700 });
-  for (const root of DATA_ROOTS) {
+  for (const root of pending.roots ?? DATA_ROOTS) {
     const parts = root.split('/');
     const live = join(home, ...parts);
     const staged = join(staging, ...parts);

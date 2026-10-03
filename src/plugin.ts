@@ -179,9 +179,15 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   // and the start script swaps a staged import in before DSH opens anything; run by hand, the user restarts it.
   const dshVersion = hostVersion();
   installDataRoutes({ ctx, home: dshHomePath(), importEnabled: process.env.NEXUS_IMPORT_HOME === dshHomePath(), ...(dshVersion ? { dshVersion } : {}), ...(build?.commit ? { commit: build.commit } : {}), report,
+    isIdle: () => runningTurns() === 0 && coders.active().length === 0,
     restart: () => {
       if (!process.env.INVOCATION_ID) return false;
-      setTimeout(() => process.kill(process.pid, 'SIGTERM'), 1000).unref();
+      // A task may start after staging. Check again immediately before signaling the host.
+      const restartWhenIdle = () => setTimeout(() => {
+        if (runningTurns() > 0 || coders.active().length > 0) restartWhenIdle();
+        else process.kill(process.pid, 'SIGTERM');
+      }, 1000).unref();
+      restartWhenIdle();
       return true;
     } });
   installHealth(ctx, { startedAt, heldPushes: () => assistant?.heldPushes() ?? 0, coders: () => coders.active().map(task => task.id), runningTurns, lastActivityAt: () => lastActivityAt,
@@ -221,7 +227,7 @@ export async function installMemorySettings(ctx: Context, seams: { now?: () => n
   });
   if (seams.enabled !== false) installMemory(ctx, service);
   else ctx.effect(() => () => service.close());
-  registerRpc(ctx, 'nexus-memory', ['list', 'export', 'policy', 'profile/set', 'profile/delete', 'event/add', 'event/delete', 'proposal/settle', 'legacy/copy'],
+  registerRpc(ctx, 'nexus-memory', ['list', 'export', 'policy', 'profile/set', 'profile/delete', 'event/add', 'event/edit', 'event/delete', 'proposal/settle', 'legacy/copy', 'import/preview', 'import/apply', 'records/delete'],
     async (method, payload) => ({ ...await service.handle(method, payload), moduleEnabled: seams.moduleEnabled?.() ?? seams.enabled !== false }));
   return service;
 }

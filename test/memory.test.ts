@@ -159,7 +159,7 @@ test('the settings routes write with user provenance, validate input, and export
   await assert.rejects(service.handle('nope', { scopeId: scopeId(TEST_SCOPE),}), /unknown_action/);
   await assert.rejects(service.handle('policy', 'bad'), /invalid_configuration/);
   const exported = JSON.parse((await service.handle('export', { scopeId: scopeId(TEST_SCOPE),})).exportJson!);
-  assert.deepEqual(Object.keys(exported).sort(), ['events', 'exportedAt', 'policy', 'profile', 'proposals', 'scope']);
+  assert.deepEqual(Object.keys(exported).sort(), ['events', 'exportedAt', 'format', 'profile', 'proposals', 'scope', 'version']);
   assert.equal(exported.events[0].text, '国庆去成都');
   await service.handle('event/delete', { scopeId: scopeId(TEST_SCOPE), id: view.events[0]!.id });
   assert.deepEqual((await service.handle('list', { scopeId: scopeId(TEST_SCOPE),})).events, []);

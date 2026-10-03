@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { installBridge } from '../src/dsh/bridge.js';
 import { installAssistantPrompt } from '../src/assistant/prompt.js';
 import { installMemorySettings } from '../src/plugin.js';
-import { MEMORY_PLUGIN } from '../src/memory/index.js';
+import { MEMORY_PLUGIN, type MemoryView } from '../src/memory/index.js';
 import { projectScope, scopeId, LEGACY_SCOPE } from '../src/memory/scope.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 
@@ -113,7 +113,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       assert.equal(response.status, 200);
       const body = await response.json();
       assert.equal(body.result.ok, true, body.result.error?.code);
-      return body.result.value as { profile: { key: string; value: string; source: string }[]; events: { id: string; text: string }[]; injections: { sessionId: string; profile: boolean; eventIds: string[] }[]; counts: { profile: number; events: number } };
+      return body.result.value as MemoryView;
     };
     const turn = async (messageId: string, text: string) => {
       await bridge.receive(inbound(messageId, text));
@@ -150,6 +150,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       assert.equal(audit[0]!.sessionId, sessionId);
       assert.equal(audit[0]!.profile, true);
       assert.equal(audit[0]!.eventIds.length, 1);
+      assert.match(audit[0]!.content!, /称呼：老于/);
       // The injected message is part of the durable session: a resume must find it.
       const found = await ctx.sessionController.resolveAgent(sessionId);
       if ('error' in found) throw found.error;
@@ -227,6 +228,22 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     const complete = await service.handle('export', { scopeId: scopeId(localScope), eventQuery: '旧记录标签', eventPage: 5 });
     assert.equal(JSON.parse(complete.exportJson!).events.length, 221);
     checks.push('native_memory_paging_and_full_search', 'native_memory_export_unfiltered', 'native_memory_pages_owner_isolated');
+    const destination = scopeId(await projectScope(other));
+    if (config.phase === 17) {
+      await rpc('policy', { scopeId: destination, target: 'scope', remember: 'off', summary: 'ask', inject: true });
+      const payload = { scopeId: destination, json: JSON.stringify({ exportedAt: 1, profile: [], events: [{ text: 'portable-fixture', at: 123 }], proposals: [] }),
+        selection: { profile: false, events: true, proposals: false }, conflict: 'keep' };
+      const preview = (await rpc('import/preview', payload)).importPreview!;
+      assert.equal(preview.add, 1);
+      await rpc('import/apply', { ...payload, token: preview.token });
+      const imported = (await rpc('list', { scopeId: destination })).events.find(item => item.text === 'portable-fixture')!;
+      await rpc('event/edit', { scopeId: destination, id: imported.id, expectedText: imported.text, text: 'portable-fixture-edited' });
+    }
+    const migrated = await rpc('list', { scopeId: destination });
+    assert.equal(migrated.policyOverride, true);
+    assert.equal(migrated.policy.remember, 'off'); assert.equal(migrated.policy.summary, 'ask');
+    assert.ok(migrated.events.some(item => item.text === 'portable-fixture-edited' && item.at === 123));
+    checks.push('native_scope_policy_and_migration_persist', 'native_memory_preview_import_edit_routes');
     assert.deepEqual(failures, []);
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls, checks }, null, 2));
   }

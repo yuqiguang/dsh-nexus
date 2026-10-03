@@ -6,6 +6,10 @@ const titles = { wechat: '微信', feishu: '飞书', wecom: '企业微信' };
 const phases = { disconnected: '未连接', connecting: '连接中', connected: '已连接', reconnecting: '重连中', error: '连接失败' };
 export const errors: Record<string, string> = {
   memory_limit: '超出记忆容量或长度限制，请精简或先删除旧条目。',
+  memory_import_invalid: '记忆文件格式不正确或超过 2 MiB，请选择 Nexus 导出的记忆 JSON。',
+  memory_import_changed: '目标记忆或导入选项已变化，请重新预览后确认。',
+  memory_export_too_large: '所选记忆超过 2 MiB，请分开导出画像、事件和待确认，或先整理内容。',
+  memory_import_failed: '导入未能全部保存，可能已有部分生效。请重新预览后重试，重复记录会跳过。',
   not_found: '条目已不存在，页面已刷新。',
   missing_credentials: '请填写账号和密钥，并先完成用户绑定。',
   missing_application_credentials: '请填写飞书 App ID 和 App Secret。',

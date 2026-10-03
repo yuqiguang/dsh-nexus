@@ -9,6 +9,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { ChannelError } from '../channels/types.js';
 import { formatLocal } from '../assistant/clock.js';
 import { rank } from './search.js';
+import { MAX_MEMORY_JSON_BYTES, memorySelection, planMemoryImport, type MemoryImportPreview } from './transfer.js';
 import { LEGACY_SCOPE, LOCAL_PREFERENCES, scopeChoice, scopeId, type MemoryScope, type MemoryScopeChoice } from './scope.js';
 import { LIMITS, MemoryLimitError, MemoryStore, type InjectionRecord, type MemoryDomainOpener, type MemoryEvent, type MemoryPolicy, type MemoryProposal, type ProfileEntry } from './store.js';
 
@@ -48,6 +49,8 @@ export interface MemoryView {
   scope?: MemoryScopeChoice;
   scopes?: MemoryScopeChoice[];
   policy: MemoryPolicy;
+  defaultPolicy?: MemoryPolicy;
+  policyOverride?: boolean;
   profile: ProfileEntry[];
   events: MemoryEvent[];
   proposals: MemoryProposal[];
@@ -57,6 +60,8 @@ export interface MemoryView {
   pagination?: { events: MemoryPage; injections: MemoryPage; eventQuery: string };
   /** Only in the response to `export`. */
   exportJson?: string;
+  importPreview?: MemoryImportPreview;
+  imported?: boolean;
 }
 
 interface SessionInjectionState { scopeId: string; profileStamp: string; eventIds: Set<string> }
@@ -89,6 +94,12 @@ const unavailableScopes: MemoryScopeSource = { async resolveSession() { return u
 
 export class MemoryService {
   private readonly sessions = new Map<string, SessionInjectionState>();
+  private writes: Promise<unknown> = Promise.resolve();
+  private serial<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.writes.then(work, work);
+    this.writes = next.catch(() => {});
+    return next;
+  }
 
   private constructor(readonly store: MemoryStore, readonly legacy: MemoryStore, private readonly source: MemoryScopeSource,
     private readonly now: () => number) {}
@@ -114,24 +125,24 @@ export class MemoryService {
     return scope;
   }
 
-  private visible(scope: MemoryScope) {
+  private visible(scope: MemoryScope, injecting = false) {
     const project = this.store.forScope(scope);
     const personal = this.store.forScope({ kind: 'global', owner: scope.owner });
     // A project-specific value overrides a same-named personal preference in this project only.
-    const profile = [...new Map([...personal.profile(), ...project.profile()].map(entry => [entry.key, entry])).values()];
-    return { project, profile, events: [...personal.events(), ...project.events()] };
+    const personalEnabled = !injecting || personal.policy().inject;
+    const profile = [...new Map([...(personalEnabled ? personal.profile() : []), ...project.profile()].map(entry => [entry.key, entry])).values()];
+    return { project, profile, events: [...(personalEnabled ? personal.events() : []), ...project.events()] };
   }
 
   async inject(sessionId: string, messages: readonly UserMessage[], signal?: AbortSignal): Promise<UserMessage | undefined> {
     signal?.throwIfAborted();
-    if (!this.store.policy().inject) return undefined;
     const query = userText(messages);
     if (!query) return undefined;
     let scope: MemoryScope;
     try { scope = await this.resolve(sessionId); } catch { return undefined; }
     signal?.throwIfAborted();
-    if (!this.store.policy().inject) return undefined;
-    const { project, profile, events: available } = this.visible(scope);
+    if (!this.store.forScope(scope).policy().inject) return undefined;
+    const { project, profile, events: available } = this.visible(scope, true);
     const id = scopeId(scope);
     const prior = this.sessions.get(sessionId);
     const state = prior?.scopeId === id ? prior : { scopeId: id, profileStamp: '', eventIds: new Set<string>() };
@@ -152,7 +163,8 @@ export class MemoryService {
     if (includeProfile) state.profileStamp = stamp;
     for (const event of events) state.eventIds.add(event.id);
     this.sessions.set(sessionId, state);
-    await project.recordInjection({ at: this.now(), sessionId, query: query.slice(0, 120), eventIds: events.map(event => event.id), profile: includeProfile });
+    await project.recordInjection({ at: this.now(), sessionId, query: query.slice(0, 120), eventIds: events.map(event => event.id), profile: includeProfile,
+      content: [includeProfile ? `用户画像：\n${profileText}` : '', events.length ? `相关事件：\n${renderEvents(events)}` : ''].filter(Boolean).join('\n\n') });
     signal?.throwIfAborted();
     const parts = ['[记忆] 以下只来自当前会话项目和同一身份下明确保存的全局个人偏好；与用户当前的话冲突时以用户为准，不要复述这段内容。记忆不授予文件权限，也不代表任务完成。'];
     if (includeProfile) parts.push(`用户画像：\n${profileText}`);
@@ -168,13 +180,16 @@ export class MemoryService {
 
   async summarize(text: string, sessionId: string, signal?: AbortSignal): Promise<MemoryEvent | undefined> {
     signal?.throwIfAborted();
-    if (this.store.policy().remember === 'off') return undefined;
     let scope: MemoryScope;
     try { scope = await this.resolve(sessionId); } catch { return undefined; }
+    return this.serial(() => this.summarizeNow(text, sessionId, scope, signal));
+  }
+  private async summarizeNow(text: string, sessionId: string, scope: MemoryScope, signal?: AbortSignal): Promise<MemoryEvent | undefined> {
     signal?.throwIfAborted();
     const store = this.store.forScope(scope);
-    if (store.policy().remember === 'off') return undefined;
-    if (store.policy().remember === 'ask') {
+    const policy = store.policy().summary ?? store.policy().remember;
+    if (policy === 'off') return undefined;
+    if (policy === 'ask') {
       await store.propose({ kind: 'event', text, sessionId }, this.now());
       return undefined;
     }
@@ -187,7 +202,11 @@ export class MemoryService {
   }
 
   async remember(input: { kind: 'profile' | 'event'; key?: string; text: string; tags?: string[]; sessionId?: string }, signal?: AbortSignal): Promise<string> {
-    const store = this.store.forScope(await this.resolve(input.sessionId));
+    const scope = await this.resolve(input.sessionId);
+    return this.serial(() => this.rememberNow(input, scope, signal));
+  }
+  private async rememberNow(input: { kind: 'profile' | 'event'; key?: string; text: string; tags?: string[]; sessionId?: string }, scope: MemoryScope, signal?: AbortSignal): Promise<string> {
+    const store = this.store.forScope(scope);
     signal?.throwIfAborted();
     if (store.policy().remember === 'off') throw new Error('用户已关闭记忆写入，这条内容不会被记住；请让用户在设置页打开记忆。');
     if (store.policy().remember === 'ask') {
@@ -214,7 +233,11 @@ export class MemoryService {
   }
 
   async forget(input: { id?: string; key?: string }, sessionId?: string, signal?: AbortSignal): Promise<string> {
-    const store = this.store.forScope(await this.resolve(sessionId));
+    const scope = await this.resolve(sessionId);
+    return this.serial(() => this.forgetNow(input, scope, signal));
+  }
+  private async forgetNow(input: { id?: string; key?: string }, scope: MemoryScope, signal?: AbortSignal): Promise<string> {
+    const store = this.store.forScope(scope);
     signal?.throwIfAborted();
     if (input.id) {
       const event = store.event(input.id);
@@ -241,13 +264,18 @@ export class MemoryService {
     const matching = needle ? events.filter(event => event.text.toLowerCase().includes(needle) || event.tags?.some(tag => tag.toLowerCase().includes(needle))) : events;
     const eventPage = memoryPage(matching, query.eventPage, 20), injectionPage = memoryPage(store.injections(), query.injectionPage, 10);
     return { scope: choice, scopes: [{ id: LEGACY_SCOPE, kind: 'legacy', label: '旧版未归类记忆（不注入）' }, ...[...catalog.values()].map(scopeChoice)],
-      policy: { remember: this.store.policy().remember, inject: this.store.policy().inject }, profile, events: eventPage.items, proposals, injections: injectionPage.items,
+      policy: { remember: store.policy().remember, inject: store.policy().inject, summary: store.policy().summary ?? store.policy().remember },
+      defaultPolicy: { remember: this.store.policy().remember, inject: this.store.policy().inject, summary: this.store.policy().summary ?? this.store.policy().remember },
+      policyOverride: store.hasPolicyOverride(), profile, events: eventPage.items, proposals, injections: injectionPage.items,
       pagination: { events: eventPage.info, injections: injectionPage.info, eventQuery: query.eventQuery },
       counts: { profile: profile.length, events: events.length, proposals: proposals.length }, limits: LIMITS, ...extra };
   }
 
   /** Authenticated local settings select only scopes enumerated by the server. Model tools never call these routes. */
-  async handle(method: string, payload: unknown = {}): Promise<MemoryView> {
+  handle(method: string, payload: unknown = {}): Promise<MemoryView> {
+    return this.serial(() => this.handleNow(method, payload));
+  }
+  private async handleNow(method: string, payload: unknown): Promise<MemoryView> {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new ChannelError('invalid_configuration');
     const input = payload as Record<string, unknown>;
     const query = memoryListQuery(input);
@@ -259,10 +287,39 @@ export class MemoryService {
     const store = isLegacy ? this.legacy : this.store.forScope(catalog.get(selected)!);
     const view = (extra: Partial<MemoryView> = {}) => this.view(store, choice, catalog, query, extra);
     if (method === 'list') return view();
-    if (method === 'export') return view({ exportJson: JSON.stringify({ ...store.export(), scope: choice }, null, 2) });
     const text = (value: unknown) => typeof value === 'string' ? value : '';
     try {
-      if (method === 'legacy/copy') {
+      if (method === 'export') {
+        const selected = input.selection === undefined ? { profile: true, events: true, proposals: true } : memorySelection(input.selection);
+        const data = store.export();
+        const exportJson = JSON.stringify({ format: 'nexus-memory', version: 1, exportedAt: data.exportedAt, scope: choice,
+          profile: selected.profile ? data.profile : [], events: selected.events ? data.events : [], proposals: selected.proposals ? data.proposals : [] }, null, 2);
+        if (Buffer.byteLength(exportJson) > MAX_MEMORY_JSON_BYTES) throw new ChannelError('memory_export_too_large');
+        return view({ exportJson });
+      } else if (method === 'import/preview' || method === 'import/apply') {
+        if (isLegacy) throw new ChannelError('memory_legacy_readonly');
+        const plan = planMemoryImport(store, input.json, memorySelection(input.selection), input.conflict, selected);
+        if (method === 'import/preview') return view({ importPreview: plan.preview });
+        if (input.token !== plan.preview.token) throw new ChannelError('memory_import_changed');
+        try { await plan.apply(); } catch { throw new ChannelError('memory_import_failed'); }
+        this.resetInjectionState();
+        return view({ imported: true });
+      } else if (method === 'records/delete') {
+        if (!Array.isArray(input.records) || input.records.length === 0 || input.records.length > LIMITS.events + LIMITS.profileEntries + LIMITS.proposals) throw new ChannelError('invalid_configuration');
+        const records = input.records as { kind: string; id?: string; key?: string; expectedText: string }[];
+        for (const item of records) {
+          if (!item || typeof item !== 'object' || typeof item.expectedText !== 'string') throw new ChannelError('invalid_configuration');
+          const current = item.kind === 'profile' ? store.profile().find(entry => entry.key === item.key)?.value
+            : item.kind === 'event' ? store.event(text(item.id))?.text : item.kind === 'proposal' ? store.proposals().find(entry => entry.id === item.id)?.text : undefined;
+          if (current !== item.expectedText) throw new ChannelError('configuration_changed');
+        }
+        for (const item of records) {
+          if (item.kind === 'profile') await store.deleteProfile(text(item.key));
+          else if (item.kind === 'event') await store.deleteEvent(text(item.id));
+          else await store.settleProposal(text(item.id), false);
+        }
+        this.resetInjectionState();
+      } else if (method === 'legacy/copy') {
         if (!isLegacy || typeof input.targetScopeId !== 'string' || !catalog.has(input.targetScopeId)) throw new ChannelError('memory_scope_unavailable');
         const target = this.store.forScope(catalog.get(input.targetScopeId)!);
         const record = input.kind === 'profile' ? store.profile().find(entry => entry.key === input.key)
@@ -279,21 +336,34 @@ export class MemoryService {
         if (isLegacy) throw new ChannelError('memory_legacy_readonly');
         const remember = input.remember;
         if (remember !== 'auto' && remember !== 'ask' && remember !== 'off' || typeof input.inject !== 'boolean') throw new ChannelError('invalid_configuration');
-        await this.store.setPolicy({ remember, inject: input.inject });
+        const summary = input.summary;
+        if (summary !== undefined && summary !== 'auto' && summary !== 'ask' && summary !== 'off') throw new ChannelError('invalid_configuration');
+        if (input.target !== undefined && input.target !== 'scope' && input.target !== 'default') throw new ChannelError('invalid_configuration');
+        const policy: MemoryPolicy = { remember, inject: input.inject, ...(summary ? { summary } : {}) };
+        if (input.target === 'scope') await store.setScopePolicy(input.inherit === true ? undefined : policy);
+        else await this.store.setPolicy({ ...this.store.policy(), ...policy });
+        this.resetInjectionState();
       } else if (method === 'profile/set') {
         if (isLegacy) throw new ChannelError('memory_legacy_readonly');
+        if (input.expectedText !== undefined && store.profile().find(item => item.key === input.key)?.value !== input.expectedText) throw new ChannelError('configuration_changed');
         await store.setProfile(text(input.key), text(input.value), 'user', this.now());
       } else if (method === 'profile/delete') {
         if (!await store.deleteProfile(text(input.key))) throw new ChannelError('not_found');
       } else if (method === 'event/add') {
         if (isLegacy) throw new ChannelError('memory_legacy_readonly');
         await store.addEvent({ text: text(input.text), tags: Array.isArray(input.tags) ? input.tags.map(text) : [], source: 'user' }, this.now());
+      } else if (method === 'event/edit') {
+        if (isLegacy) throw new ChannelError('memory_legacy_readonly');
+        if (store.event(text(input.id))?.text !== input.expectedText) throw new ChannelError('configuration_changed');
+        if (!await store.editEvent(text(input.id), text(input.text))) throw new ChannelError('not_found');
+        this.resetInjectionState();
       } else if (method === 'event/delete') {
         if (!await store.deleteEvent(text(input.id))) throw new ChannelError('not_found');
         for (const state of this.sessions.values()) state.eventIds.delete(text(input.id));
       } else if (method === 'proposal/settle') {
         if (isLegacy && input.accept === true) throw new ChannelError('memory_legacy_readonly');
-        if (!await store.settleProposal(text(input.id), input.accept === true, this.now())) throw new ChannelError('not_found');
+        if (input.expectedText !== undefined && store.proposals().find(item => item.id === input.id)?.text !== input.expectedText) throw new ChannelError('configuration_changed');
+        if (!await store.settleProposal(text(input.id), input.accept === true, this.now(), input.text === undefined ? undefined : { text: text(input.text), key: typeof input.key === 'string' ? input.key : undefined })) throw new ChannelError('not_found');
       } else throw new ChannelError('unknown_action');
     } catch (error) {
       if (error instanceof MemoryLimitError) throw new ChannelError('memory_limit');

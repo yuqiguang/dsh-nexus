@@ -79,7 +79,7 @@ test('the memory page shows profile, events, proposals and injections, and every
     return structuredClone(view);
   };
   const ui = await page(t, api);
-  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['写入策略', '待确认', '画像', '事件', '最近注入']);
+  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['写入策略', '待确认', '画像', '事件', '最近注入', '记忆迁移']);
   assert.match(ui.text(), /画像 1\/60，事件 2\/1000/);
   assert.match(ui.text(), /称呼：老于/);
   assert.match(ui.text(), /王总谈了合作/);
@@ -89,7 +89,7 @@ test('the memory page shows profile, events, proposals and injections, and every
   await ui.click('采纳');
   assert.deepEqual(calls.at(-1), { method: 'proposal/settle', payload: { id: 'mp-1', accept: true } });
   assert.match(ui.text(), /公司：Nexus/);
-  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['写入策略', '画像', '事件', '最近注入']);
+  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['写入策略', '画像', '事件', '最近注入', '记忆迁移']);
   await ui.click('删除画像 称呼');
   assert.deepEqual(calls.at(-1), { method: 'profile/delete', payload: { key: '称呼' } });
   assert.doesNotMatch(ui.text(), /称呼：老于/);
@@ -224,4 +224,34 @@ test('legacy classification requires an explicit target and copies the exact vis
   assert.equal(service.store.forScope(scope).profile()[0]?.value, 'legacy-A');
   await ui.click('复制到所选范围');
   assert.match(ui.text(), /目标范围已有同名画像/);
+});
+
+test('the page edits memories with revision checks and previews migration before writing', async t => {
+  const scope: MemoryScope = { kind: 'project', owner: 'local', project: '/fixture/edit' };
+  const service = await MemoryService.open(fakeMemoryDomain().opener, () => T0,
+    { async resolveSession() { return scope; }, async projects() { return [scope]; } });
+  t.after(() => service.close());
+  const store = service.store.forScope(scope);
+  await store.setProfile('数据库', '旧配置', 'user');
+  const event = await store.addEvent({ text: '旧事件', source: 'model' });
+  const proposal = await store.propose({ kind: 'event', text: '待修订' });
+  const ui = await page(t, (method, payload) => service.handle(method, payload));
+  await ui.enter('memory-scope', scopeId(scope));
+  await ui.click('编辑画像 数据库'); await ui.enter('memory-edit-text', '新配置'); await ui.click('保存修改');
+  assert.equal(store.profile()[0]!.value, '新配置');
+  await ui.click(`编辑事件 ${event.id}`); await ui.enter('memory-edit-text', '新事件'); await ui.click('保存修改');
+  assert.equal(store.event(event.id)!.text, '新事件');
+  await ui.click(`编辑提案 ${proposal.id}`); await ui.enter('memory-edit-text', '确认后的内容'); await ui.click('保存并采纳');
+  assert.equal(store.proposals().length, 0);
+  assert.ok(store.events().some(item => item.text === '确认后的内容'));
+  const incoming = JSON.stringify({ exportedAt: 1, profile: [{ key: '导入画像', value: '导入内容' }], events: [], proposals: [] });
+  await ui.enter('memory-import-json', incoming); await ui.click('预览记忆导入');
+  assert.match(ui.text(), /新增 1 条/);
+  assert.equal(store.profile().length, 1);
+  await ui.click('确认导入记忆');
+  assert.equal(store.profile().length, 2);
+  assert.match(ui.text(), /记忆已导入当前范围/);
+  await ui.enter('memory-summary', 'off');
+  assert.equal(store.policy().summary, 'off');
+  assert.equal((await service.handle('list', { scopeId: scopeId(scope) })).policyOverride, true);
 });

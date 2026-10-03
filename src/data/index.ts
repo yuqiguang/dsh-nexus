@@ -1,9 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-session-persistence';
-import { access } from 'node:fs/promises';
+import { access, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { DataError, MAX_ARCHIVE_BYTES, exportData, stageImport, type DataSummary, type PendingImport } from './archive.js';
+import { DataError, MAX_ARCHIVE_BYTES, PENDING_FILE, STAGING_DIR, exportData, previewData, stageImport, type DataSummary, type PendingImport } from './archive.js';
 
 export interface DataRoutesDeps {
   ctx: Context;
@@ -12,6 +12,7 @@ export interface DataRoutesDeps {
   now?: () => number;
   /** True only when a launcher applies staged imports before DSH opens its storage. */
   importEnabled?: boolean;
+  isIdle?: () => boolean;
   dshVersion?: string;
   commit?: string;
   /** Restart the service so the next start swaps a staged import in; `false` where this process cannot restart itself. */
@@ -68,19 +69,47 @@ export function installDataRoutes(deps: DataRoutesDeps): void {
     path: '/api/nexus-data/export', methods: ['POST'], requestBody: 'buffered',
     async fetch(request) {
       if (request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') return new Response('content type must be application/json', { status: 415 });
+      if (importing) return failure('import_in_progress');
+      importing = true;
       try {
+        if (deps.isIdle?.() === false) throw new DataError('tasks_running');
+        let options;
+        try { options = JSON.parse((await readLimited(request, 4096)).toString() || '{}'); } catch { throw new DataError('invalid_options'); }
+        if (!options || typeof options !== 'object' || Array.isArray(options)
+          || (options.includeCredentials !== undefined && typeof options.includeCredentials !== 'boolean')
+          || (options.includeSettings !== undefined && typeof options.includeSettings !== 'boolean')
+          || (options.password !== undefined && (typeof options.password !== 'string' || options.password.length > 1024))) throw new DataError('invalid_options');
+        if ((options.includeCredentials || options.password) && (!options.password || options.password.length < 10)) throw new DataError('archive_password_weak');
         // Every live session's buffered events reach its log before the logs are read.
         await ctx.sessionPersistence.flush();
         const at = now();
-        const { zip, summary } = await exportData(deps.home, { now: at, ...(deps.dshVersion ? { dshVersion: deps.dshVersion } : {}), ...(deps.commit ? { commit: deps.commit } : {}) });
+        const { zip, summary } = await exportData(deps.home, { now: at, ...(deps.dshVersion ? { dshVersion: deps.dshVersion } : {}), ...(deps.commit ? { commit: deps.commit } : {}) },
+          { includeCredentials: options.includeCredentials === true, includeSettings: options.includeSettings === true, password: options.password });
+        if (deps.isIdle?.() === false) throw new DataError('tasks_running');
         return new Response(new Uint8Array(zip), { headers: { 'Content-Type': 'application/zip', 'Content-Length': String(zip.length), 'Cache-Control': 'no-store',
-          'Content-Disposition': `attachment; filename="nexus-data-${new Date(at).toISOString().slice(0, 10)}.zip"`, 'X-Nexus-Summary': encodeURIComponent(JSON.stringify(summary satisfies DataSummary)) } });
+          'Content-Disposition': `attachment; filename="nexus-data-${new Date(at).toISOString().slice(0, 10)}.${options.password ? 'nxb' : 'zip'}"`, 'X-Nexus-Summary': encodeURIComponent(JSON.stringify(summary satisfies DataSummary)) } });
       } catch (error) {
-        report(`data export failed: ${(error as Error)?.message ?? error}`);
+        report(`data export failed: ${error instanceof DataError ? error.code : 'export_failed'}`);
         return failure(error instanceof DataError ? error.code : 'export_failed', 500);
-      }
+      } finally { importing = false; }
     },
   });
+  const password = (request: Request) => {
+    try {
+      const value = decodeURIComponent(request.headers.get('x-nexus-archive-password') ?? '');
+      if (value.length > 1024) throw new Error();
+      return value;
+    } catch { throw new DataError('invalid_options'); }
+  };
+  ctx.connection.fetch.register({ path: '/api/nexus-data/preview', methods: ['POST'], requestBody: 'streaming',
+    async fetch(request) {
+      if (request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/zip') return refuse(request, new Response('unsupported content type', { status: 415 }));
+      if (importing) return refuse(request, failure('import_in_progress'));
+      importing = true;
+      try { return json({ ok: true, value: await previewData(await readLimited(request, MAX_ARCHIVE_BYTES), password(request)) }); }
+      catch (error) { return failure(error instanceof DataError ? error.code : 'import_failed'); }
+      finally { importing = false; }
+    } });
   ctx.connection.fetch.register({
     path: '/api/nexus-data/import', methods: ['POST'], requestBody: 'streaming',
     async fetch(request) {
@@ -91,12 +120,22 @@ export function installDataRoutes(deps: DataRoutesDeps): void {
       try {
         // The updater swaps builds and restarts on its own schedule; an import must not race it.
         if (await access(join(deps.home, 'update.lock')).then(() => true, () => false)) return await refuse(request, failure('update_in_progress'));
-        const pending = await stageImport(deps.home, await readLimited(request, MAX_ARCHIVE_BYTES), now());
+        if (deps.isIdle?.() === false) return await refuse(request, failure('tasks_running'));
+        const archive = await readLimited(request, MAX_ARCHIVE_BYTES), secret = password(request);
+        const preview = await previewData(archive, secret);
+        if (request.headers.get('x-nexus-preview') !== preview.digest) throw new DataError('preview_required');
+        if (deps.isIdle?.() === false) throw new DataError('tasks_running');
+        const pending = await stageImport(deps.home, archive, now(), secret);
+        if (deps.isIdle?.() === false) {
+          await rm(join(deps.home, PENDING_FILE), { force: true });
+          await rm(join(deps.home, STAGING_DIR), { recursive: true, force: true });
+          throw new DataError('tasks_running');
+        }
         const restarting = deps.restart();
         report(`data import staged: ${pending.summary.sessions} sessions, ${pending.summary.records} records, ${pending.summary.credentials} credentials${restarting ? '; restarting' : ''}`);
         return json({ ok: true, value: { pending, restarting } satisfies ImportResult });
       } catch (error) {
-        if (!(error instanceof DataError)) report(`data import failed: ${(error as Error)?.message ?? error}`);
+        if (!(error instanceof DataError)) report('data import failed');
         return failure(error instanceof DataError ? error.code : 'import_failed');
       } finally { importing = false; }
     },

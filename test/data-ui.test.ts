@@ -29,7 +29,12 @@ async function page(t: TestContext, api: DataApi) {
     Object.defineProperty(input, 'files', { value: [file], configurable: true });
     await act(async () => { input.dispatchEvent(new dom.window.Event('change', { bubbles: true })); });
   };
-  return { click, choose, buttons, text: () => dom.window.document.body.textContent ?? '' };
+  const enter = async (id: string, value: string) => {
+    const input = dom.window.document.getElementById(id)!;
+    await act(async () => { Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value')!.set!.call(input, value); input.dispatchEvent(new dom.window.Event('input', { bubbles: true })); });
+  };
+  const check = async (index: number) => { await act(async () => { (dom.window.document.querySelectorAll('input[type=checkbox]')[index] as HTMLInputElement).click(); }); };
+  return { click, choose, enter, check, buttons, text: () => dom.window.document.body.textContent ?? '' };
 }
 
 const summary: DataSummary = { createdAt: Date.parse('2026-09-27T10:00:00+08:00'), sessions: 14, records: 81, credentials: 9, bytes: 5 * 1024 * 1024 };
@@ -41,6 +46,7 @@ test('the data page exports a download with a plain warning, and imports only af
   const api: DataApi = {
     async capabilities() { return { importEnabled: true }; },
     async exportData() { if (fail) throw new Error(fail); return { blob: new Blob(['zip']), filename: 'nexus-data-2026-09-27.zip', summary }; },
+    async previewData() { if (fail) throw new Error(fail); return { summary, digest: 'fixture-digest' }; },
     async importData(file) {
       if (fail) throw new Error(fail);
       imported.push(file.size);
@@ -49,7 +55,7 @@ test('the data page exports a download with a plain warning, and imports only af
     save(blob, filename) { saved.push({ size: blob.size, filename }); },
   };
   const ui = await page(t, api);
-  assert.match(ui.text(), /明文的微信登录、邮箱授权码和模型 API key，等于你所有账号的钥匙/);
+  assert.match(ui.text(), /默认不包含凭据/);
   assert.match(ui.text(), /收到的附件和工作区里的文件不在里面/);
   await ui.click('导出数据');
   assert.deepEqual(saved, [{ size: 3, filename: 'nexus-data-2026-09-27.zip' }]);
@@ -58,28 +64,27 @@ test('the data page exports a download with a plain warning, and imports only af
   assert.equal(ui.buttons().includes('导入并重启'), false);
   await ui.choose(new File(['x'.repeat(2048)], 'nexus-data-2026-09-20.zip', { type: 'application/zip' }));
   assert.match(ui.text(), /nexus-data-2026-09-20\.zip（0\.0 MiB）/);
+  await ui.click('检查并预览备份');
   await ui.click('导入并重启');
-  assert.match(ui.text(), /确定用 nexus-data-2026-09-20\.zip 替换现在的全部数据吗？/);
+  assert.match(ui.text(), /确定用 nexus-data-2026-09-20\.zip 替换以上范围的数据吗？/);
   await ui.click('取消');
   assert.deepEqual(imported, []);
   await ui.click('导入并重启');
   await ui.click('确定替换');
   assert.deepEqual(imported, [2048]);
-  assert.match(ui.text(), /已检查并准备好：.*导出，14 个会话、81 条存储记录、9 条凭据，共 5\.0 MiB。服务正在重启，半分钟左右后刷新页面。原来的数据会在 \.nexus\/replaced-20260927-101500-abcdef\/ 里。/);
+  assert.match(ui.text(), /已检查并准备好：.*14 个会话.*已安排服务重启.*replaced-20260927-101500-abcdef/);
   assert.equal(ui.buttons().includes('确定替换'), false, 'the choice is spent');
   // A refused archive says why in words, and nothing is left half-confirmed.
   fail = 'archive_corrupt';
   await ui.choose(new File(['y'], 'bad.zip'));
-  await ui.click('导入并重启');
-  await ui.click('确定替换');
+  await ui.click('检查并预览备份');
   assert.match(ui.text(), /数据包里有文件和清单对不上，可能损坏或被改过。/);
   // Past the upload cap it is refused before anything is sent.
   fail = undefined;
   const huge = new File(['z'], 'huge.zip');
   Object.defineProperty(huge, 'size', { value: 300 * 1024 * 1024 });
   await ui.choose(huge);
-  await ui.click('导入并重启');
-  await ui.click('确定替换');
+  await ui.click('检查并预览备份');
   assert.match(ui.text(), /文件太大（上限 256 MiB）。/);
   assert.deepEqual(imported, [2048]);
   fail = 'session_expired';
@@ -94,6 +99,7 @@ test('an installed plugin keeps export available and hides import without a star
   const ui = await page(t, {
     async capabilities() { return { importEnabled: false }; },
     async exportData() { exports++; return { blob: new Blob(['zip']), filename: 'backup.zip' }; },
+    async previewData() { return { summary, digest: 'fixture' }; },
     async importData() { throw new Error('must not be called'); },
     save() {},
   });
@@ -101,4 +107,41 @@ test('an installed plugin keeps export available and hides import without a star
   assert.equal(ui.buttons().includes('导入并重启'), false);
   await ui.click('导出数据');
   assert.equal(exports, 1);
+});
+
+
+test('credentials require a password in the UI, and changing the restore password invalidates the preview', async t => {
+  const options: unknown[] = [];
+  const secrets: string[] = [];
+  const ui = await page(t, {
+    async capabilities() { return { importEnabled: true }; },
+    async exportData(option) { options.push(option); return { blob: new Blob(['encrypted']), filename: 'backup.nxb' }; },
+    async previewData(_file, password) { secrets.push(password!); return { summary, digest: 'exact-file' }; },
+    async importData(_file, password, digest) { assert.equal(password, 'restore-password'); assert.equal(digest, 'exact-file'); return { pending: { stagedAt: 1, replacedDir: 'replaced-test', summary }, restarting: true }; },
+    save() {},
+  });
+  await ui.check(0); await ui.click('导出数据');
+  assert.equal(options.length, 0);
+  assert.match(ui.text(), /至少 10 个字符/);
+  await ui.enter('data-password', 'backup-password'); await ui.click('导出数据');
+  assert.deepEqual(options, [{ includeCredentials: true, includeSettings: false, password: 'backup-password' }]);
+  await ui.choose(new File(['enc'], 'backup.nxb'));
+  await ui.enter('data-import-password', 'first-password'); await ui.click('检查并预览备份');
+  assert.ok(ui.buttons().includes('导入并重启'));
+  await ui.enter('data-import-password', 'restore-password');
+  assert.equal(ui.buttons().includes('导入并重启'), false);
+  await ui.click('检查并预览备份'); await ui.click('导入并重启'); await ui.click('确定替换');
+  assert.deepEqual(secrets, ['first-password', 'restore-password']);
+});
+
+test('capability lookup failures are distinguishable from unsupported installations and can be retried', async t => {
+  let failed = true;
+  const ui = await page(t, {
+    async capabilities() { if (failed) throw new Error('session_expired'); return { importEnabled: false }; },
+    async exportData() { throw new Error(); }, async previewData() { throw new Error(); }, async importData() { throw new Error(); }, save() {},
+  });
+  assert.match(ui.text(), /无法确认恢复能力.*登录已过期/);
+  assert.doesNotMatch(ui.text(), /暂不支持整体导入/);
+  failed = false; await ui.click('重试检查');
+  assert.match(ui.text(), /暂不支持整体导入/);
 });
