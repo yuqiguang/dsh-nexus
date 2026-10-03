@@ -60,7 +60,9 @@ class FixtureModel extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
     this.calls++;
-    this.sawDailyRule ||= options.messages.some(message => message.role === 'system' && message.content.some(block => block.type === 'text' && block.text.includes('repeat 选 daily、weekly 或 monthly') && block.text.includes('不要用 schedule_create 一次一次地排下一次')));
+    this.sawDailyRule ||= options.messages.some(message => message.role === 'system' && message.content.some(block => block.type === 'text'
+      && block.text.includes('repeat daily、weekly 或 monthly') && block.text.includes('日历到点只发送已保存的提醒文字')
+      && block.text.includes('需要助理定时执行工作的请求应使用当前会话可用的原生自动化工具')));
     this.toolSets.push((options.tools ?? []).map(tool => tool.name).filter(name => name.startsWith('mail_') || name === 'calendar' || name === 'todo').sort());
     const textOf = (message: GenerateOptions['messages'][number]): string => message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n');
     const answered = (callId: string) => options.messages.some(message => message.role === 'tool' && message.toolCallId === callId);
@@ -98,7 +100,7 @@ class FixtureModel extends LlmAdapter {
     }
     if (askedText === '明天下午三点和张老师开会') {
       if (!answered('cal')) { yield* this.toolCall('cal', 'calendar', { action: 'add', title: '和张老师开会', start: this.tomorrowAt, location: '会议室' }); return; }
-      yield* this.text(result('cal').startsWith('已安排') ? '记下了，明天下午三点和张老师开会。' : `没记上：${result('cal')}`); return;
+      yield* this.text(/^已安排：\[ev-/m.test(result('cal')) ? '记下了，明天下午三点和张老师开会。' : `没记上：${result('cal')}`); return;
     }
     if (askedText === '记个待办，周五前交报告') {
       if (!answered('todo')) { yield* this.toolCall('todo', 'todo', { action: 'add', title: '交报告', due: this.fridayAt }); return; }
@@ -106,7 +108,7 @@ class FixtureModel extends LlmAdapter {
     }
     if (askedText === '每天这个时候叫我起床') {
       if (!answered('wake')) { yield* this.toolCall('wake', 'calendar', { action: 'add', title: '该起床了', start: this.nowAt, duration_minutes: 0, remind_minutes: 0, repeat: 'daily' }); return; }
-      yield* this.text(result('wake').startsWith('已安排') ? '好，每天这个时候叫你。' : `没记上：${result('wake')}`); return;
+      yield* this.text(/^已安排：\[ev-/m.test(result('wake')) ? '好，每天这个时候叫你。' : `没记上：${result('wake')}`); return;
     }
     if (askedText === '今天有什么安排') {
       if (!answered('agenda')) { yield* this.toolCall('agenda', 'calendar', { action: 'list' }); return; }
