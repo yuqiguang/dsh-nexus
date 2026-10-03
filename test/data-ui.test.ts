@@ -145,3 +145,21 @@ test('capability lookup failures are distinguishable from unsupported installati
   failed = false; await ui.click('重试检查');
   assert.match(ui.text(), /暂不支持整体导入/);
 });
+
+test('desktop restore presents the quit-and-wait workflow and can cancel a waiting helper', async t => {
+  let cancellation = '';
+  const waiting = { id:'a'.repeat(32), phase:'waiting' as const, replacedDir:'replaced-fixture', recoveryPath:'C:/fixture/nexus-restore/continue.cmd' };
+  const ui = await page(t, {
+    async capabilities(){return {importEnabled:true,importMode:'desktop'};},
+    async exportData(){throw new Error();},
+    async previewData(){return {summary,digest:'fixture'};},
+    async importData(){return {pending:{stagedAt:1,replacedDir:waiting.replacedDir,summary},restarting:false,desktop:waiting};},
+    async cancelRestore(id){cancellation=id;},save(){},
+  });
+  assert.match(ui.text(),/从托盘菜单完全退出 DSH/);
+  await ui.choose(new File(['zip'],'fixture.zip'));await ui.click('检查并预览备份');
+  await ui.click('准备桌面恢复');await ui.click('确认并启动恢复助手');
+  assert.match(ui.text(),/恢复助手已准备好/);assert.match(ui.text(),/continue.cmd/);
+  assert.doesNotMatch(ui.text(),/重启 Nexus 后生效/);
+  await ui.click('取消等待中的恢复');assert.equal(cancellation,waiting.id);
+});

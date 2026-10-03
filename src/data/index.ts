@@ -4,6 +4,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence';
 import { access, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DataError, MAX_ARCHIVE_BYTES, PENDING_FILE, STAGING_DIR, exportData, previewData, stageImport, type DataSummary, type PendingImport } from './archive.js';
+import { discardStagedImport, type DesktopRestore, type DesktopRestoreStatus } from './desktop.js';
 
 export interface DataRoutesDeps {
   ctx: Context;
@@ -12,6 +13,7 @@ export interface DataRoutesDeps {
   now?: () => number;
   /** True only when a launcher applies staged imports before DSH opens its storage. */
   importEnabled?: boolean;
+  desktopRestore?: DesktopRestore;
   isIdle?: () => boolean;
   dshVersion?: string;
   commit?: string;
@@ -20,7 +22,7 @@ export interface DataRoutesDeps {
   report?: (message: string) => void;
 }
 
-export interface ImportResult { pending: PendingImport; restarting: boolean }
+export interface ImportResult { pending: PendingImport; restarting: boolean; desktop?: DesktopRestoreStatus }
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store' } });
 const failure = (code: string, status = 200) => json({ ok: false, error: { code } }, status);
@@ -64,7 +66,23 @@ export function installDataRoutes(deps: DataRoutesDeps): void {
   const report = deps.report ?? (() => {});
   let importing = false;
   ctx.connection.fetch.register({ path: '/api/nexus-data/capabilities', methods: ['GET'], requestBody: 'buffered',
-    async fetch() { return json({ importEnabled: deps.importEnabled === true }); } });
+    async fetch() { return json({ importEnabled: deps.importEnabled === true || !!deps.desktopRestore,
+      ...(deps.desktopRestore ? { importMode: 'desktop' } : {}) }); } });
+  ctx.connection.fetch.register({ path: '/api/nexus-data/restore-status', methods: ['GET'], requestBody: 'buffered',
+    async fetch() {
+      try { return json({ ok: true, value: await deps.desktopRestore?.status() ?? null }); }
+      catch { return failure('restore_state_invalid'); }
+    } });
+  ctx.connection.fetch.register({ path: '/api/nexus-data/restore-cancel', methods: ['POST'], requestBody: 'buffered',
+    async fetch(request) {
+      if (request.headers.get('content-type')?.split(';', 1)[0] !== 'application/json') return new Response('unsupported content type', { status: 415 });
+      try {
+        const input = JSON.parse((await readLimited(request, 4096)).toString());
+        if (!deps.desktopRestore || typeof input?.id !== 'string') throw new DataError('restore_not_waiting');
+        await deps.desktopRestore.cancel(input.id);
+        return json({ ok: true });
+      } catch (error) { return failure(error instanceof DataError ? error.code : 'restore_not_waiting'); }
+    } });
   ctx.connection.fetch.register({
     path: '/api/nexus-data/export', methods: ['POST'], requestBody: 'buffered',
     async fetch(request) {
@@ -114,7 +132,7 @@ export function installDataRoutes(deps: DataRoutesDeps): void {
     path: '/api/nexus-data/import', methods: ['POST'], requestBody: 'streaming',
     async fetch(request) {
       if (request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/zip') return refuse(request, new Response('content type must be application/zip', { status: 415 }));
-      if (!deps.importEnabled) return refuse(request, failure('import_unavailable', 409));
+      if (!deps.importEnabled && !deps.desktopRestore) return refuse(request, failure('import_unavailable', 409));
       if (importing) return refuse(request, failure('import_in_progress'));
       importing = true;
       try {
@@ -124,12 +142,24 @@ export function installDataRoutes(deps: DataRoutesDeps): void {
         const archive = await readLimited(request, MAX_ARCHIVE_BYTES), secret = password(request);
         const preview = await previewData(archive, secret);
         if (request.headers.get('x-nexus-preview') !== preview.digest) throw new DataError('preview_required');
+        if (deps.desktopRestore) {
+          if (preview.summary.dshVersion !== deps.dshVersion) throw new DataError('desktop_restore_version_mismatch');
+          if (preview.summary.roots?.some(root => root.startsWith('profiles/'))) throw new DataError('desktop_restore_profile_mismatch');
+          const previous = await deps.desktopRestore.status();
+          if (previous && !['completed', 'cancelled', 'rolled-back'].includes(previous.phase)) throw new DataError('import_in_progress');
+        }
         if (deps.isIdle?.() === false) throw new DataError('tasks_running');
         const pending = await stageImport(deps.home, archive, now(), secret);
         if (deps.isIdle?.() === false) {
           await rm(join(deps.home, PENDING_FILE), { force: true });
           await rm(join(deps.home, STAGING_DIR), { recursive: true, force: true });
           throw new DataError('tasks_running');
+        }
+        if (deps.desktopRestore) {
+          try {
+            const desktop = await deps.desktopRestore.prepare(pending);
+            return json({ ok: true, value: { pending: { stagedAt: pending.stagedAt, replacedDir: pending.replacedDir, summary: pending.summary }, restarting: false, desktop } satisfies ImportResult });
+          } catch (error) { await discardStagedImport(deps.home); throw error; }
         }
         const restarting = deps.restart();
         report(`data import staged: ${pending.summary.sessions} sessions, ${pending.summary.records} records, ${pending.summary.credentials} credentials${restarting ? '; restarting' : ''}`);

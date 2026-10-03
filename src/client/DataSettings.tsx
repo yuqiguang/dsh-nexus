@@ -2,22 +2,31 @@ import { useEffect, useRef, useState } from 'react';
 import { saveDownload } from './download.js';
 import { MemoryMigration } from './MemoryTransfer.js';
 import type { DataPreview, DataExportOptions, DataSummary } from '../data/archive.js';
+import type { DesktopRestoreStatus } from '../data/desktop.js';
 import type { ImportResult } from '../data/index.js';
 
 /** The server's upload cap; checked here first because the server can only refuse a larger upload by dropping the connection. */
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 
 export interface DataApi {
-  capabilities(): Promise<{ importEnabled: boolean }>;
+  capabilities(): Promise<{ importEnabled: boolean; importMode?: 'desktop' }>;
   /** The archive as the server built it, with the name to save it under. */
   exportData(options?: DataExportOptions): Promise<{ blob: Blob; filename: string; summary?: DataSummary }>;
   previewData(file: Blob, password?: string): Promise<DataPreview>;
   importData(file: Blob, password?: string, digest?: string): Promise<ImportResult>;
+  restoreStatus?(): Promise<DesktopRestoreStatus | undefined>;
+  cancelRestore?(id: string): Promise<void>;
   /** Hand a blob to the browser as a download. */
   save(blob: Blob, filename: string): void;
 }
 
 const messages: Record<string, string> = {
+  desktop_restore_version_mismatch: '桌面恢复要求备份标注的 DSH 版本与当前版本一致。',
+  desktop_restore_profile_mismatch: '这份备份包含源码服务配置，不能用于桌面整体恢复。请重新导出并取消包含源码配置。',
+  restore_state_invalid: '恢复状态无法读取，请使用恢复助手检查。',
+  restore_not_waiting: '恢复已经开始或状态已变化，无法取消。',
+  restore_launch_failed: '恢复助手启动失败，未修改现有数据。',
+  desktop_restore_path_unsupported: '安装路径含有无法用于恢复快捷入口的字符。',
   tasks_running: '有对话或编码任务正在执行，请等待结束后再备份或恢复。',
   preview_required: '请先重新预览所选备份，再确认恢复。',
   invalid_options: '备份选项无效，请检查输入。',
@@ -78,6 +87,19 @@ export const dataApi: DataApi = {
     if (!body.ok || !body.value) throw new Error(body.error?.code ?? 'connection_failed');
     return body.value;
   },
+  async restoreStatus() {
+    const response = await fetch('/api/nexus-data/restore-status', { credentials: 'same-origin' });
+    if (!response.ok) throw new Error(await failureCode(response));
+    const body = await response.json();
+    if (!body.ok) throw new Error(body.error?.code);
+    return body.value ?? undefined;
+  },
+  async cancelRestore(id) {
+    const response = await fetch('/api/nexus-data/restore-cancel', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+    if (!response.ok) throw new Error(await failureCode(response));
+    const body = await response.json();
+    if (!body.ok) throw new Error(body.error?.code);
+  },
   save: saveDownload,
 };
 
@@ -89,16 +111,32 @@ const counts = (summary: DataSummary) => `${summary.sessions} 个会话、${summ
 export function DataSettings({ api = dataApi }: { api?: DataApi }) {
   const [purpose, setPurpose] = useState('backup');
   const [busy, setBusy] = useState(false);
+  const [importMode, setImportMode] = useState<'desktop'>();
+  const [restore, setRestore] = useState<DesktopRestoreStatus>();
+  const [restoreError, setRestoreError] = useState<string>();
   const [importEnabled, setImportEnabled] = useState<boolean>();
   const [capabilityError, setCapabilityError] = useState<string>();
   const [retry, setRetry] = useState(0);
   useEffect(() => {
     let active = true;
     setCapabilityError(undefined); setImportEnabled(undefined);
-    void api.capabilities().then(value => { if (active) setImportEnabled(value.importEnabled === true); })
+    void api.capabilities().then(value => { if (active) { setImportEnabled(value.importEnabled === true); setImportMode(value.importMode); } })
       .catch(error => { if (active) setCapabilityError(explain(error.message)); });
     return () => { active = false; };
   }, [api, retry]);
+  useEffect(() => {
+    if (importMode !== 'desktop' || !api.restoreStatus) return;
+    let active = true, pending = false;
+    const refresh = async () => {
+      if (pending) return;
+      pending = true;
+      try { const value = await api.restoreStatus!(); if (active) { setRestore(value); setRestoreError(undefined); } }
+      catch { if (active) setRestoreError('恢复状态暂时无法读取，请稍后刷新。'); }
+      finally { pending = false; }
+    };
+    void refresh(); const timer = setInterval(() => void refresh(), 2000);
+    return () => { active = false; clearInterval(timer); };
+  }, [api, importMode]);
   const [error, setError] = useState<string>();
   const [exported, setExported] = useState<string>();
   const [includeCredentials, setIncludeCredentials] = useState(false);
@@ -131,7 +169,8 @@ export function DataSettings({ api = dataApi }: { api?: DataApi }) {
     setConfirming(false);
     if (!importEnabled) throw new Error('import_unavailable');
     if (!preview) throw new Error('preview_required');
-    setImported(await api.importData(file!, importPassword, preview.digest));
+    const result = await api.importData(file!, importPassword, preview.digest);
+    setImported(result); setRestore(result.desktop);
     setFile(undefined); setPreview(undefined); setImportPassword('');
     if (input.current) input.current.value = '';
   });
@@ -143,11 +182,12 @@ export function DataSettings({ api = dataApi }: { api?: DataApi }) {
     </select>
     {purpose === 'memory' ? <MemoryMigration /> : <>
     <p>导出包含会话记录、原生存储；可选择登录凭据和源码 Nexus profile 配置。桌面端本身的配置需要另行备份。收到的附件和工作区里的文件不在里面。</p>
+    {restoreError && <p role="alert">{restoreError}</p>}
     {error && <p role="alert" className="nexus-channel-error">{error}</p>}
     <article className="nexus-channel-card">
       <header><h3>导出</h3></header>
       <label><input type="checkbox" checked={includeCredentials} disabled={busy} onChange={event => setIncludeCredentials(event.target.checked)} style={{ width: 'auto' }} /> 包含登录凭据（必须加密）</label>
-      <label><input type="checkbox" checked={includeSettings} disabled={busy} onChange={event => setIncludeSettings(event.target.checked)} style={{ width: 'auto' }} /> 包含源码 Nexus profile 配置（若存在）</label>
+      <label><input type="checkbox" checked={includeSettings} disabled={busy || importMode === 'desktop'} onChange={event => setIncludeSettings(event.target.checked)} style={{ width: 'auto' }} /> 包含源码 Nexus profile 配置（若存在）</label>
       <label htmlFor="data-password">备份密码{includeCredentials ? '（必填）' : '（可选，填写后加密）'}</label>
       <input id="data-password" type="password" autoComplete="new-password" maxLength={1024} value={password} disabled={busy} onChange={event => setPassword(event.target.value)} />
       <p className="nexus-channel-hint">加密备份使用 .nxb 文件，密码至少 10 个字符，丢失后无法恢复。默认不包含凭据；会话与存储仍可能含个人信息，请妥善保存。</p>
@@ -159,6 +199,7 @@ export function DataSettings({ api = dataApi }: { api?: DataApi }) {
       {capabilityError ? <p role="alert">无法确认恢复能力：{capabilityError}<button onClick={() => setRetry(retry + 1)}>重试检查</button></p>
         : importEnabled === undefined ? <p role="status">正在检查恢复能力…</p>
         : !importEnabled ? <p className="nexus-channel-hint">此安装方式暂不支持整体导入数据；可以导出和检查备份。桌面端可使用上方“迁移指定范围的记忆”。</p>
+        : importMode === 'desktop' ? <p className="nexus-channel-hint">桌面恢复：确认备份后启动恢复助手，再从托盘菜单完全退出 DSH；助手等待退出、替换数据并重新打开桌面端。不会强制停止任务。恢复期间请勿更新 DSH 或启动其他使用相同数据目录的实例。现有桌面配置、插件、附件和工作区文件保留。</p>
         : <p className="nexus-channel-hint">恢复会替换备份包含的会话与存储，原数据保留在运行数据目录的 replaced-时间/ 中。没有包含的凭据与 profile 配置保持现状。请等待运行任务结束，并停止另一台使用相同渠道账号的实例。</p>}
       <label>选择导出的备份 <input ref={input} type="file" accept=".zip,.nxb,application/zip" disabled={busy}
         onChange={event => { setFile(event.currentTarget.files?.[0]); setPreview(undefined); setConfirming(false); setImported(undefined); setImportPassword(''); setError(undefined); }} /></label>
@@ -172,16 +213,23 @@ export function DataSettings({ api = dataApi }: { api?: DataApi }) {
       {preview && <div role="group" aria-label="备份预览">
         <p>{when(preview.summary.createdAt)} 导出；DSH {preview.summary.dshVersion ?? '未标注'}；{counts(preview.summary)}。</p>
         <p>包含：会话、存储{!preview.summary.roots || preview.summary.roots.includes('.credentials.yaml') ? '、登录凭据' : '（保留当前登录凭据）'}{preview.summary.roots?.includes('profiles/nexus/cordis.patch.yml') ? '、源码 profile 配置' : ''}。{preview.summary.encrypted ? '密码与完整性校验通过。' : '未加密备份。'}</p>
-        <p className="nexus-channel-hint">文件校验通过不代表不同 DSH 版本的数据完全兼容；建议在相同版本恢复。</p>
-        {importEnabled && !confirming && <button disabled={busy} onClick={() => setConfirming(true)}>导入并重启</button>}
+        <p className="nexus-channel-hint">{importMode === 'desktop' ? '桌面恢复要求 DSH 版本一致，且备份不包含源码 profile 配置。' : '文件校验通过不代表不同 DSH 版本的数据完全兼容；建议在相同版本恢复。'}</p>
+        {importEnabled && !confirming && <button disabled={busy} onClick={() => setConfirming(true)}>{importMode === 'desktop' ? '准备桌面恢复' : '导入并重启'}</button>}
       </div>}
       {file && preview && confirming && <div className="nexus-channel-actions" role="group" aria-label="确认导入">
         <span>确定用 {file.name} 替换以上范围的数据吗？</span>
-        <button type="button" disabled={busy} onClick={() => void doImport()}>确定替换</button>
+        <button type="button" disabled={busy} onClick={() => void doImport()}>{importMode === 'desktop' ? '确认并启动恢复助手' : '确定替换'}</button>
         <button type="button" disabled={busy} onClick={() => setConfirming(false)}>取消</button></div>}
-      {imported && <p role="status" className="nexus-channel-account">
+      {imported && !imported.desktop && <p role="status" className="nexus-channel-account">
         {`已检查并准备好：${when(imported.pending.summary.createdAt)} 导出，${counts(imported.pending.summary)}。`}
         {imported.restarting ? '已安排服务重启；如有新任务，会等任务结束后生效。请稍后刷新。' : '重启 Nexus 后生效。'}{`原来的数据保留在运行数据目录的 ${imported.pending.replacedDir}/。`}</p>}
+      {restore && <div role="status" aria-label="桌面恢复状态">
+        <p>{{ waiting: '恢复助手已准备好。请从托盘菜单完全退出 DSH；等待程序退出后才开始恢复。', restoring: '正在恢复，请勿启动 DSH 或关闭恢复助手。', completed: '桌面数据恢复完成，原数据已保留。', 'rolled-back': '恢复未完成，已回退到原来的数据。', cancelled: '已取消恢复，现有数据未改变。', failed: '恢复未完成，请重新运行恢复助手继续检查或回退。' }[restore.phase]}</p>
+        {(restore.canCancel || restore.phase === 'waiting') && api.cancelRestore && <button disabled={busy} onClick={() => void run(async () => { await api.cancelRestore!(restore.id); })}>取消等待中的恢复</button>}
+        <p>恢复助手入口：<code>{restore.recoveryPath}</code></p>
+        <p>原数据保留目录：<code>{restore.replacedDir}</code></p>
+        {restore.code === 'restore_restart_failed' && <p>数据处理已完成，自动打开失败，请手动启动 DSH。</p>}
+      </div>}
     </article>
     </>}
   </section>;

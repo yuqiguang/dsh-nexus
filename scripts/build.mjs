@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { rm, writeFile } from 'node:fs/promises';
+import { rm, writeFile, readFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 import { projectRoot } from './setup.mjs';
 import { packBuild } from './pack-build.mjs';
@@ -24,6 +24,8 @@ const compilation = spawnSync(process.execPath, ['--max-old-space-size=640', 'no
   cwd: projectRoot, stdio: 'inherit',
 });
 if (compilation.status !== 0) process.exit(compilation.status ?? 1);
+// Windows PowerShell 5.1 needs a BOM to read the Chinese recovery instructions as UTF-8.
+await writeFile(`${projectRoot}/${outName}/src/data/desktop-restore.ps1`, '\ufeff' + (await readFile(`${projectRoot}/src/data/desktop-restore.ps1`, 'utf8')).replace(/^\ufeff/, ''));
 const result = await build({ entryPoints: ['src/client/index.ts'], absWorkingDir: projectRoot, bundle: true,
   format: 'cjs', platform: 'browser', target: 'es2022', external: ['react', 'react/jsx-runtime'],
   loader: { '.css': 'text' }, write: false });

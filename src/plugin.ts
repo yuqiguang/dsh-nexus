@@ -31,6 +31,7 @@ import { installAutomation } from './dsh/automation.js';
 import { DshRecords } from './dsh/records.js';
 import { installHealth, readBuildInfo } from './service/health.js';
 import { installDataRoutes } from './data/index.js';
+import { desktopRestore } from './data/desktop.js';
 import { createRequire } from 'node:module';
 import { startLifecycle } from './service/lifecycle.js';
 import { ChannelError, type ChannelId, type ConnectionRecord } from './channels/types.js';
@@ -178,13 +179,21 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   // Export and import of the user's data. Under systemd a SIGTERM stops DSH cleanly and the unit starts it again,
   // and the start script swaps a staged import in before DSH opens anything; run by hand, the user restarts it.
   const dshVersion = hostVersion();
+  const desktopRecovery = process.env.NEXUS_IMPORT_HOME === dshHomePath() ? undefined : await desktopRestore(dshHomePath(), dshVersion);
+  const dataIdle = () => {
+    const agents = ctx.agents.list();
+    return runningTurns() === 0 && coders.active().length === 0
+      && !agents.some(agent => agent.status === 'running' || agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0)
+      && ![undefined, ...agents.map(agent => agent.id)].some(id => ctx.jobs.list(id).some(job => job.status === 'running' || job.status === 'stopping'));
+  };
   installDataRoutes({ ctx, home: dshHomePath(), importEnabled: process.env.NEXUS_IMPORT_HOME === dshHomePath(), ...(dshVersion ? { dshVersion } : {}), ...(build?.commit ? { commit: build.commit } : {}), report,
-    isIdle: () => runningTurns() === 0 && coders.active().length === 0,
+    desktopRestore: desktopRecovery,
+    isIdle: dataIdle,
     restart: () => {
       if (!process.env.INVOCATION_ID) return false;
       // A task may start after staging. Check again immediately before signaling the host.
       const restartWhenIdle = () => setTimeout(() => {
-        if (runningTurns() > 0 || coders.active().length > 0) restartWhenIdle();
+        if (!dataIdle()) restartWhenIdle();
         else process.kill(process.pid, 'SIGTERM');
       }, 1000).unref();
       restartWhenIdle();

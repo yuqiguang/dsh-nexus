@@ -41,7 +41,7 @@ export interface DataManifest {
   files: ManifestFile[];
 }
 export interface DataSummary { createdAt: number; dshVersion?: string; commit?: string; sessions: number; records: number; credentials: number; bytes: number; roots?: string[]; encrypted?: boolean }
-export interface PendingImport { stagedAt: number; replacedDir: string; summary: DataSummary; roots?: string[] }
+export interface PendingImport { stagedAt: number; replacedDir: string; summary: DataSummary; roots?: string[]; files?: ManifestFile[] }
 
 export class DataError extends Error {
   constructor(readonly code: string) { super(code); }
@@ -202,13 +202,15 @@ export async function stageImport(home: string, archive: Buffer, now: number, pa
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   await rm(staging, { recursive: true, force: true });
   await mkdir(staging, { recursive: true, mode: 0o700 });
+  const files: ManifestFile[] = [];
   try {
     await inspectArchive(archive, password, async (path, bytes) => {
       const target = join(staging, ...path.split('/'));
       await mkdir(dirname(target), { recursive: true, mode: 0o700 });
       await writeFile(target, bytes, { mode: 0o600 });
+      files.push({ path, size: bytes.length, sha256: sha256(bytes) });
     });
-    const pending: PendingImport = { stagedAt: now, replacedDir: `replaced-${stamp(now)}-${randomBytes(3).toString('hex')}`, summary: preview.summary,
+    const pending: PendingImport = { stagedAt: now, replacedDir: `replaced-${stamp(now)}-${randomBytes(3).toString('hex')}`, summary: preview.summary, files,
       ...(preview.summary.roots ? { roots: preview.summary.roots } : {}) };
     await writeFile(join(home, PENDING_FILE), JSON.stringify(pending), { mode: 0o600 });
     return pending;
