@@ -37,6 +37,8 @@ function saved(value: unknown): SavedUpdates {
     nextCheckAt: typeof input.nextCheckAt === 'number' && Number.isFinite(input.nextCheckAt) ? input.nextCheckAt : undefined };
 }
 const errorCode = (error: unknown) => error instanceof ChannelError ? error.code : 'update_failed';
+// Native grant payloads are JSON values: absent fields must be omitted, never undefined.
+const stored = (value: SavedUpdates): SavedUpdates => Object.fromEntries(Object.entries(value).filter(([, field]) => field !== undefined)) as unknown as SavedUpdates;
 
 /** The UI requests work; timers never grant installation permission. All installs
  * use immutable versioned artifacts and the Host's package manager. */
@@ -54,7 +56,7 @@ export class UpdatesManager {
   private readonly now: () => number;
   constructor(private readonly deps: UpdatesDeps) { this.now = deps.now ?? Date.now; }
   private async persist(patch: Partial<SavedUpdates>) {
-    this.record = saved(await this.deps.records.modify('settings', async current => ({ ...saved(current), ...patch })));
+    this.record = saved(await this.deps.records.modify('settings', async current => stored({ ...saved(current), ...patch })));
   }
   async load() {
     this.record = saved(await this.deps.records.read('settings'));
@@ -107,10 +109,11 @@ export class UpdatesManager {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ChannelError('invalid_configuration');
     if (method === 'save') {
       if (typeof input.autoCheck !== 'boolean' || typeof input.autoInstall !== 'boolean') throw new ChannelError('invalid_configuration');
+      const { autoCheck, autoInstall } = input;
       this.record = saved(await this.deps.records.modify('settings', async current => {
         const before = saved(current);
         if (input.revision !== before.revision) throw new ChannelError('configuration_changed');
-        return { ...before, revision: before.revision + 1, autoCheck: input.autoCheck, autoInstall: input.autoCheck && input.autoInstall };
+        return stored({ ...before, revision: before.revision + 1, autoCheck, autoInstall: autoCheck && autoInstall });
       }));
       if (!this.record.autoInstall && this.automatic) { this.requested = undefined; this.control?.abort('disabled'); }
       if (!this.record.autoCheck && this.phase === 'checking') this.control?.abort();

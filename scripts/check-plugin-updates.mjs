@@ -40,24 +40,35 @@ import {readFile,writeFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {credentialKey} from ${JSON.stringify(pathToFileURL(require.resolve('@deepseek-ai/dsh-credentials')).href)};
 import {nativeInstaller} from ${JSON.stringify(pathToFileURL(join(root,'dist/src/updates/native.js')).href)};
+import {UpdatesManager} from ${JSON.stringify(pathToFileURL(join(root,'dist/src/updates/manager.js')).href)};
+import {DshRecords} from ${JSON.stringify(pathToFileURL(join(root,'dist/src/dsh/records.js')).href)};
 export const name='update-driver';export const inject=['pluginManager','credentials'];
 export function apply(ctx){const timer=setTimeout(()=>{void run().catch(async error=>{await writeFile(${JSON.stringify(report)},JSON.stringify({passed:false,error:String(error.stack)}));});},300);ctx.effect(()=>()=>clearTimeout(timer));
 async function run(){const service=ctx.pluginManager;const installer=nativeInstaller(service);const checks=[];
 const profile=${JSON.stringify(profile)};const packages=${JSON.stringify(packages)};
-const packageOf=async version=>{const path=packages[version],bytes=await readFile(path);return {version,path,sha256:createHash('sha256').update(bytes).digest('hex')};};
+const packageOf=async version=>{const path=packages[version],bytes=await readFile(path);return {version,path,sha256:createHash('sha256').update(bytes).digest('hex'),commit:(version==='1.0.0'?'a':'b').repeat(40),compatible:true,dshVersion:${JSON.stringify(host.version)},releaseUrl:'https://github.com/yuqiguang/dsh-nexus/releases'};};
+const currentVersion=process.env.UPDATE_FIXTURE_PHASE==='1'?'1.0.0':'1.0.1';
+const manager=new UpdatesManager({records:new DshRecords(ctx.credentials,'update-fixture-settings'),currentVersion,currentCommit:(currentVersion==='1.0.0'?'a':'b').repeat(40),dshVersion:${JSON.stringify(host.version)},
+packages:{latest:async()=>'1.0.1',get:packageOf,verify:async pkg=>assert.equal(createHash('sha256').update(await readFile(pkg.path)).digest('hex'),pkg.sha256)},installer:()=>installer,isIdle:async()=>true});
+await manager.load();
 if(process.env.UPDATE_FIXTURE_PHASE==='1'){
  assert.equal(await installer.installed(),'1.0.0');assert.equal(ctx.get('updateFixture').version,'1.0.0');
  const row=(await service.listPlugins()).find(row=>row.moduleName==='dsh-nexus/off');
  await service.setPluginEnabled(row.entryId,true);
  await ctx.credentials.modifyRecord(credentialKey('update-fixture','preserve'),async()=>({kind:'grant',payload:{value:'synthetic'}}));
  const patch=await readFile(profile+'/cordis.patch.yml','utf8');const before=JSON.parse(await readFile(profile+'/package.json','utf8')).dsh;
- await installer.install(await packageOf('1.0.1'),new AbortController().signal);
+ await manager.handle('check');await manager.settle();
+ const available=await manager.view();assert.equal(available.phase,'available');assert.ok(available.lastCheckAt);assert.equal(available.autoInstall,false);checks.push('check_state_saved_by_native_credentials');
+ await manager.handle('save',{revision:available.revision,autoCheck:true,autoInstall:true});
+ await manager.tick();await manager.settle();assert.equal((await manager.view()).phase,'restart-required');checks.push('opt_in_and_install_transaction_saved_by_native_credentials');
  assert.equal(await installer.installed(),'1.0.1');assert.equal(ctx.get('updateFixture').version,'1.0.0');checks.push('install_requires_restart_and_keeps_running_generation');
  assert.equal(await readFile(profile+'/cordis.patch.yml','utf8'),patch);assert.deepEqual(JSON.parse(await readFile(profile+'/package.json','utf8')).dsh,before);checks.push('profile_and_component_choices_preserved');
  await assert.rejects(installer.install(await packageOf('1.0.2'),new AbortController().signal));checks.push('bad_bundle_refused_after_native_package_operation');
  await installer.install(await packageOf('1.0.1'),new AbortController().signal);assert.equal(await installer.installed(),'1.0.1');checks.push('rollback_reinstalls_original_files_even_after_manifest_restore');
  assert.equal(await readFile(profile+'/cordis.patch.yml','utf8'),patch);checks.push('rollback_preserves_profile');
 }else{
+ const state=await manager.view();assert.equal(state.outcome,'updated');assert.equal(state.autoInstall,true);assert.equal(state.error,undefined);
+ await manager.handle('save',{revision:state.revision,autoCheck:true,autoInstall:false});assert.equal((await manager.view()).autoInstall,false);checks.push('restart_clears_transaction_and_preserves_native_update_settings');
  assert.equal(await installer.installed(),'1.0.1');assert.equal(ctx.get('updateFixture').version,'1.0.1');checks.push('new_generation_activates_after_restart');
  const record=await ctx.credentials.readRecord(credentialKey('update-fixture','preserve'));assert.equal(record.payload.value,'synthetic');checks.push('native_credentials_preserved');
  const row=(await service.listPlugins()).find(row=>row.moduleName==='dsh-nexus/off');assert.equal(row.enabled,true);checks.push('component_choice_survives_restart');
