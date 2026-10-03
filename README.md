@@ -38,12 +38,18 @@ Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话
 ## 安装到桌面端
 
 1. 从 [DSH 官网](https://deepseek.com/harness/) 安装桌面端，确认版本为 `0.2.0-rc.2`，并先完成模型配置。
-2. 在 [Releases](https://github.com/yuqiguang/dsh-nexus/releases) 查找 `dsh-nexus-0.2.38.tgz` 和对应的 `SHA256SUMS`；若该版本尚未发布附件，可按下文从源码打包。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
-3. 在 **插件 → 添加插件** 中填写安装包的本机绝对路径，安装完成后点击 **立即启用**。如果提示重启，从托盘完全退出后重新打开。
-4. 先打开 **设置 → 编码工具** 完成上面的首次任务，再按需配置 **渠道连接** 和其他扩展。
-5. 需要提醒功能时，在 **插件 → 官方** 启用 **自动化任务**（`@deepseek-ai/dsh-experimental-schedule-bundle`）。
+2. 在 **插件 → 添加插件** 中粘贴下面的固定地址，安装完成后点击 **立即启用**。如果提示重启，从托盘完全退出后重新打开。
 
-Windows 安装应使用 Windows 本地路径，例如 `C:\Users\<user>\Downloads\dsh-nexus-0.2.38.tgz`。桌面端自带插件安装所需的 CLI 和 pnpm。
+   ```text
+   https://github.com/yuqiguang/dsh-nexus/releases/download/install/dsh-nexus.tgz
+   ```
+
+3. 先打开 **设置 → 编码工具** 完成上面的首次任务，再按需配置 **渠道连接** 和其他扩展。
+4. 需要提醒功能时，在 **插件 → 官方** 启用 **自动化任务**（`@deepseek-ai/dsh-experimental-schedule-bundle`）。
+
+固定地址随新版本发布自动更新，不需要改版本号；**已经安装的插件不会因此自动升级**。当前指向的版本及兼容性说明见 [固定安装入口](https://github.com/yuqiguang/dsh-nexus/releases/tag/install)。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
+
+也可以从 [版本 Releases](https://github.com/yuqiguang/dsh-nexus/releases) 下载指定版本的 `.tgz` 和 `SHA256SUMS`，核对后填写本机绝对路径。Windows 示例：`C:\Users\<user>\Downloads\dsh-nexus-0.2.38.tgz`；不要填写 WSL 路径。桌面端自带安装所需的 CLI 和 pnpm。需要固定历史版本时，使用对应版本的下载链接。
 
 编码工具现在支持「推荐版本」或「指定版本」。默认推荐 Codex 0.155.1、Claude Agent SDK 0.3.273；指定时填写完整版本号，可带预发布后缀，不支持 latest、版本范围或下载地址。先保存设置，再点击安装；保存、切回推荐或更新插件均不会自动替换现有工具。页面分别显示已安装版本、待安装版本与本次安装版本。Claude 的选择指 Agent SDK 及配套程序，与 Claude Code 命令显示的版本号不同。自定义版本尚未通过本插件兼容性验证，遇到问题可切回推荐版本重新安装。编码任务或沙箱配置进行中不能替换托管程序。
 

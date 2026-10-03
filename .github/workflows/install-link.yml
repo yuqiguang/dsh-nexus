@@ -1,0 +1,32 @@
+name: Update fixed installation link
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published version tag to install (for example v0.2.38)
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: nexus-install-link
+  cancel-in-progress: false
+jobs:
+  update:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check publication behavior
+        run: node --test --test-concurrency=1 test/install-link.test.mjs
+      - name: Update and verify fixed download
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.version || github.event.release.tag_name }}
+        run: node scripts/install-link.mjs
