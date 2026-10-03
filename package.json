@@ -1,6 +1,6 @@
 {
   "name": "dsh-nexus",
-  "version": "0.2.42",
+  "version": "0.2.43",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/",

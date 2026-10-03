@@ -191,17 +191,27 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
       && !agents.some(agent => agent.status === 'running' || agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0)
       && ![undefined, ...agents.map(agent => agent.id)].some(id => ctx.jobs.list(id).some(job => job.status === 'running' || job.status === 'stopping'));
   };
+  const updateWaitReason = async (quiet: boolean): Promise<string | undefined> => {
+    if (!dataIdle()) return '仍有会话、编码任务或后台任务未结束（可能正在等待审批），等待结束后更新。';
+    if (manager.busyWithInstallation()) return '编码工具正在安装，等待安装结束后更新。';
+    if (assistant?.heldPushes()) return `还有 ${assistant.heldPushes()} 条通知暂缓发送，请在助理设置中处理后更新。`;
+    for (const file of ['import-pending.json', 'update.lock']) {
+      try { await access(join(dshHomePath(), file)); return file === 'import-pending.json' ? '有数据恢复等待完成，完成后再更新。' : '另一个更新操作尚未结束，等待其完成。'; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return '暂时无法确认数据恢复或更新状态，请稍后重试。'; }
+    }
+    const recovery = await desktopRecovery?.status();
+    if (recovery && !['completed', 'rolled-back', 'cancelled'].includes(recovery.phase)) return '数据恢复尚未结束，请先在数据设置中完成或取消恢复。';
+    for (const item of (await channels.view()).connections) {
+      const channel = { wechat: '微信', feishu: '飞书', wecom: '企业微信' }[item.channel];
+      if (item.pendingDeliveries) return `${channel}还有 ${item.pendingDeliveries} 条消息等待投递。${item.channel === 'wechat' && (item.waitingForReply || item.deliveryError === 'wechat_context_stale')
+        ? '请先用绑定微信账号发送一条新消息，恢复发送后再更新。' : '请在渠道连接中查看并处理发送状态。'}`;
+      if (item.phase === 'connecting') return `${channel}正在连接，等待连接结束后更新。`;
+    }
+    if (quiet && Date.now() - lastActivityAt < UPDATE_IDLE_MS) return '自动更新需连续两分钟无会话活动；也可点击“立即更新”手动安装。';
+    return undefined;
+  };
   const updates = await installUpdates(ctx, { home: dshHomePath(), currentVersion: runtimeVersion, currentCommit: build?.dirty === false ? build.commit : undefined, dshVersion: dshVersion ?? '',
-    async isIdle(quiet) {
-      if (!dataIdle() || manager.busyWithInstallation() || assistant?.heldPushes() || (quiet && Date.now() - lastActivityAt < UPDATE_IDLE_MS)) return false;
-      for (const file of ['import-pending.json', 'update.lock']) {
-        try { await access(join(dshHomePath(), file)); return false; }
-        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false; }
-      }
-      const recovery = await desktopRecovery?.status();
-      if (recovery && !['completed', 'rolled-back', 'cancelled'].includes(recovery.phase)) return false;
-      return (await channels.view()).connections.every(item => !item.pendingDeliveries && item.phase !== 'connecting');
-    } });
+    isIdle: async quiet => (await updateWaitReason(quiet)) === undefined, waitReason: updateWaitReason });
   installDataRoutes({ ctx, home: dshHomePath(), importEnabled: process.env.NEXUS_IMPORT_HOME === dshHomePath(), ...(dshVersion ? { dshVersion } : {}), ...(build?.commit ? { commit: build.commit } : {}), report,
     desktopRestore: desktopRecovery,
     isIdle: () => dataIdle() && !updates.busy,

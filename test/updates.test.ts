@@ -73,6 +73,48 @@ test('automatic installation waits for idle and reports installed separately fro
   const restarted=new UpdatesManager({...f.deps,currentVersion:f.target.version,currentCommit:f.target.commit});await restarted.load();
   assert.equal((await restarted.view()).outcome,'updated');assert.equal((await restarted.view()).phase,'idle');
 });
+test('manual installation overrides automatic quiet time without enabling automatic installation', async () => {
+  const f = await fixture();
+  f.deps.isIdle = async quiet => !quiet;
+  f.deps.waitReason = async quiet => quiet ? '等待两分钟无会话活动' : undefined;
+  await f.auto(); await f.check(); await f.manager.tick();
+  assert.equal((await f.manager.view()).installMode, 'automatic');
+  assert.equal((await f.manager.view()).waitReason, '等待两分钟无会话活动');
+  await f.install();
+  assert.deepEqual(f.installs, [f.target.version]);
+  assert.equal((await f.manager.view()).phase, 'restart-required');
+  assert.equal((await f.manager.view()).waitReason, undefined);
+  assert.equal((await f.manager.view()).installMode, undefined);
+  const manualOnly = await fixture(); await manualOnly.check(); await manualOnly.install();
+  assert.equal((await manualOnly.manager.view()).autoInstall, false);
+  assert.deepEqual(manualOnly.installs, [manualOnly.target.version]);
+});
+test('manual installation keeps task and delivery guards and reports changing reasons only while queued', async () => {
+  const f = await fixture({ busy: true });
+  let reason: string | undefined = '编码任务尚未结束';
+  f.deps.waitReason = async quiet => { assert.equal(quiet, false); return reason; };
+  await f.check(); await f.install();
+  assert.deepEqual(f.installs, []);
+  assert.equal((await f.manager.view()).installMode, 'manual');
+  assert.equal((await f.manager.view()).waitReason, reason);
+  reason = '微信还有待投递消息';
+  await f.manager.tick();
+  assert.equal((await f.manager.view()).waitReason, reason);
+  assert.deepEqual(f.installs, []);
+  assert.ok(!('waitReason' in (await f.records.read('settings') as object)));
+  reason = undefined; f.setIdle(true); await f.manager.tick(); await f.manager.settle();
+  assert.deepEqual(f.installs, [f.target.version]);
+  assert.equal((await f.manager.view()).waitReason, undefined);
+});
+test('failed readiness diagnostics do not expose raw errors or grant installation permission', async () => {
+  const f = await fixture({ busy: true });
+  f.deps.waitReason = async () => { throw new Error('private path and token'); };
+  await f.check(); await f.install();
+  const view = await f.manager.view();
+  assert.match(view.waitReason!, /暂时无法读取等待原因/);
+  assert.doesNotMatch(JSON.stringify(view), /private path|token/);
+  assert.deepEqual(f.installs, []);
+});
 test('turning automatic installation off cancels an idle wait; settings survive restart',async()=>{
   const f=await fixture({busy:true});await f.auto();await f.check();await f.manager.tick();const before=await f.manager.view();
   await f.manager.handle('save',{revision:before.revision,autoCheck:false,autoInstall:false});f.setIdle(true);await f.manager.tick();assert.deepEqual(f.installs,[]);

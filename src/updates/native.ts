@@ -44,7 +44,8 @@ export function nativeInstaller(service: InstallerService, prepare = installatio
     },
   };
 }
-export async function installUpdates(ctx: Context, options: { home: string; currentVersion: string; currentCommit?: string; dshVersion: string; isIdle(quiet: boolean): Promise<boolean> }): Promise<UpdatesManager> {
+export async function installUpdates(ctx: Context, options: { home: string; currentVersion: string; currentCommit?: string; dshVersion: string;
+  isIdle(quiet: boolean): Promise<boolean>; waitReason?(quiet: boolean): Promise<string | undefined> }): Promise<UpdatesManager> {
   let installer: UpdateInstaller | undefined;
   const manager = new UpdatesManager({ ...options, records: new DshRecords(ctx.credentials, 'nexus-update'),
     packages: new ReleasePackages(options.home, options.dshVersion), installer: () => installer });

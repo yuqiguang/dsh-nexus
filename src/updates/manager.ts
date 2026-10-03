@@ -16,6 +16,8 @@ export interface UpdatesView {
   revision: number; autoCheck: boolean; autoInstall: boolean; lastCheckAt?: number;
   phase: 'idle' | 'checking' | 'available' | 'waiting' | 'preparing' | 'installing' | 'rolling-back' | 'restart-required' | 'failed';
   latest?: { version: string; compatible: boolean; dshVersion: string; releaseUrl: string };
+  /** Live installation readiness, not persisted task or update state. */
+  installMode?: 'manual' | 'automatic'; waitReason?: string;
   error?: string; outcome?: SavedUpdates['outcome']; rollbackVersion?: string;
 }
 export interface UpdatesDeps {
@@ -23,6 +25,7 @@ export interface UpdatesDeps {
   packages: { latest(signal: AbortSignal): Promise<string>; get(version: string, signal: AbortSignal): Promise<UpdatePackage>; verify(pkg: UpdatePackage): Promise<void> };
   installer(): UpdateInstaller | undefined;
   isIdle(quiet: boolean): Promise<boolean>;
+  waitReason?(quiet: boolean): Promise<string | undefined>;
   now?: () => number;
 }
 function saved(value: unknown): SavedUpdates {
@@ -81,10 +84,15 @@ export class UpdatesManager {
   async view(): Promise<UpdatesView> {
     const installer = this.deps.installer();
     if (installer && !this.work) this.installedVersion = await installer.installed().catch(() => this.installedVersion);
+    const installMode = this.requested ? 'manual' : 'automatic';
+    const waitReason = this.phase === 'waiting'
+      ? await this.deps.waitReason?.(installMode === 'automatic').catch(() => '暂时无法读取等待原因，请稍后刷新。') : undefined;
     return { supported: !!installer, currentVersion: this.deps.currentVersion, installedVersion: this.installedVersion,
       dshVersion: this.deps.dshVersion, revision: this.record.revision, autoCheck: this.record.autoCheck, autoInstall: this.record.autoInstall,
       phase: this.phase, lastCheckAt: this.record.lastCheckAt, error: this.record.lastError, outcome: this.record.outcome,
       ...(this.target ? { latest: { version: this.target.version, compatible: this.target.compatible, dshVersion: this.target.dshVersion, releaseUrl: this.target.releaseUrl } } : {}),
+      ...(this.phase === 'waiting' ? { installMode: this.requested ? 'manual' as const : 'automatic' as const,
+        ...(waitReason && installMode === (this.requested ? 'manual' : 'automatic') ? { waitReason } : {}) } : {}),
       ...(validVersion(this.record.rollbackVersion) && (this.record.rollbackVersion !== this.deps.currentVersion || this.record.transaction || this.record.lastError === 'update_rollback_failed') ? { rollbackVersion: this.record.rollbackVersion } : {}) };
   }
   private launch(action: (signal: AbortSignal) => Promise<void>) {

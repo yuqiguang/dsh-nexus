@@ -39,9 +39,48 @@ test('installed updates still display the running old version and a restart inst
   const ui=await page(t,async()=>({...initial,installedVersion:'0.2.40',phase:'restart-required'}));
   assert.match(ui.text(),/正在运行：0.2.39/);assert.match(ui.text(),/已安装：0.2.40/);
   assert.match(ui.text(),/当前仍运行旧版/);assert.match(ui.text(),/从托盘菜单完全退出/);
-  assert.ok(!ui.buttons().includes('空闲时安装'));
+  assert.ok(!ui.buttons().includes('立即更新'));
 });
 test('source-managed profiles do not offer automatic installation controls',async t=>{
   const ui=await page(t,async()=>({...initial,supported:false}));
   assert.match(ui.text(),/源码 Web 由源码服务/);assert.equal(ui.buttons().length,0);
+});
+
+const latest = { version: '0.2.42', compatible: true, dshVersion: '0.2.0-rc.2', releaseUrl: 'https://github.com/yuqiguang/dsh-nexus/releases/tag/v0.2.42' };
+test('manual update queues once and explains the current blocker instead of an automatic quiet period', async t => {
+  let view: UpdatesView = { ...initial, phase: 'available', latest };
+  const installs: unknown[] = [];
+  const ui = await page(t, async (method, payload) => {
+    if (method === 'install') {
+      installs.push(payload);
+      view = { ...view, phase: 'waiting', installMode: 'manual', waitReason: '微信还有 3 条消息等待投递。请先用绑定微信账号发送一条新消息。' };
+    }
+    if (method === 'cancel') view = { ...initial, phase: 'available', latest };
+    return view;
+  });
+  assert.ok(ui.buttons().includes('立即更新'));
+  assert.ok(!ui.buttons().includes('空闲时安装'));
+  await ui.click('立即更新');
+  assert.deepEqual(installs, [{ version: latest.version }]);
+  assert.match(ui.text(), /等待原因：微信还有 3 条消息等待投递/);
+  assert.doesNotMatch(ui.text(), /两分钟/);
+  await ui.click('等待更新');
+  assert.equal(installs.length, 1, 'a queued manual request cannot be submitted twice');
+  await ui.click('取消本次更新');
+  assert.ok(ui.buttons().includes('立即更新'));
+  assert.doesNotMatch(ui.text(), /等待原因：/);
+});
+test('automatic waiting still offers immediate manual installation and clears the waiting explanation while preparing', async t => {
+  let view: UpdatesView = { ...initial, autoInstall: true, phase: 'waiting', installMode: 'automatic', latest,
+    waitReason: '自动更新需连续两分钟无会话活动。' };
+  let requested = false;
+  const ui = await page(t, async method => {
+    if (method === 'install') { requested = true; view = { ...view, phase: 'preparing' }; }
+    return view;
+  });
+  assert.match(ui.text(), /等待原因：自动更新需连续两分钟/);
+  await ui.click('立即更新');
+  assert.equal(requested, true);
+  assert.match(ui.text(), /正在校验安装包/);
+  assert.doesNotMatch(ui.text(), /等待原因：/);
 });

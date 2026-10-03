@@ -31,7 +31,7 @@ export const updatesApi: UpdatesApi = async (method, payload = {}) => {
 };
 const phases: Record<UpdatesView['phase'], string> = {
   idle: '当前版本无需更新。', checking: '正在检查发布版本与安装包…', available: '发现新版本。',
-  waiting: '已等待安装；任务与待投递消息处理完毕后继续，自动更新还会等待两分钟无会话活动。',
+  waiting: '更新已排队，等待条件满足后继续。',
   preparing: '正在校验安装包并准备回退包…', installing: '正在通过 DSH 安装新版…', 'rolling-back': '安装未完成，正在恢复旧版…',
   'restart-required': '新版已安装，当前仍运行旧版。请从托盘菜单完全退出并重新打开 DSH 后生效。', failed: '本次更新未完成。',
 };
@@ -69,6 +69,7 @@ export function UpdateSettings({ api = updatesApi }: { api?: UpdatesApi }) {
             onChange={event => void action('save', { revision: view.revision, autoCheck: view.autoCheck, autoInstall: event.target.checked })} /> 空闲时自动安装（重启后生效）</label>
           <p className="nexus-channel-hint">默认关闭。开启后会保留当前版本的回退包，通过 DSH 安装新版本；安装失败时尝试恢复旧版。保留会话、配置与组件开关，不自动批准新的依赖脚本，不强制结束任务或重启桌面端。</p>
           <p role="status">{view.lastCheckAt || working || view.phase !== 'idle' ? phases[view.phase] : '尚未检查更新。'}</p>
+          {view.phase === 'waiting' && view.waitReason && <p role="status">等待原因：{view.waitReason}</p>}
           {view.latest && <p>发布版本：{view.latest.version} · 要求 DSH {view.latest.dshVersion} · <a href={view.latest.releaseUrl} target="_blank" rel="noreferrer">查看版本说明</a></p>}
           {view.lastCheckAt && <p>上次检查：{new Date(view.lastCheckAt).toLocaleString('zh-CN')}</p>}
           {view.error && <p role="alert">{explain(view.error)}</p>}
@@ -76,10 +77,12 @@ export function UpdateSettings({ api = updatesApi }: { api?: UpdatesApi }) {
           {view.outcome === 'rolled-back' && <p>已恢复旧版本的安装文件。</p>}
           <div className="nexus-channel-actions">
             <button disabled={busy || working || view.phase === 'restart-required'} onClick={() => void action('check')}>检查更新</button>
-            {view.latest?.compatible && view.phase !== 'restart-required' && <button disabled={busy || working || view.phase === 'waiting'} onClick={() => void action('install', { version: view.latest!.version })}>空闲时安装</button>}
+            {view.latest?.compatible && view.phase !== 'restart-required' && <button disabled={busy || working || (view.phase === 'waiting' && view.installMode !== 'automatic')}
+              onClick={() => void action('install', { version: view.latest!.version })}>{view.phase === 'waiting' && view.installMode !== 'automatic' ? '等待更新' : '立即更新'}</button>}
             {['waiting', 'preparing', 'installing'].includes(view.phase) && <button disabled={busy} onClick={() => void action('cancel')}>取消本次更新</button>}
             {view.rollbackVersion && <button disabled={busy || working} onClick={() => void action('rollback', { version: view.rollbackVersion })}>回退到 {view.rollbackVersion}</button>}
           </div>
+          {view.latest?.compatible && view.phase !== 'restart-required' && <p className="nexus-channel-hint">手动更新会立即尝试安装；有任务、待投递消息或数据恢复时会排队，并显示等待原因。安装完成后需退出并重启 DSH 生效。</p>}
         </article>
       </>}
     </>}
