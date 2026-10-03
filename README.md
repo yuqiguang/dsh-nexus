@@ -247,6 +247,13 @@ Windows 桌面恢复要求备份标注的 DSH 版本与当前版本一致，且�
 
 请勿将 `.nexus/`、`.dsh/`、真实环境变量文件、认证地址或工作区中的私人文件提交到仓库。
 
+## Community & feedback
+
+- GitHub：[GitHub Repository](https://github.com/yuqiguang/dsh-nexus)
+- Releases：[GitHub Releases](https://github.com/yuqiguang/dsh-nexus/releases)
+- npm：[npm Package](https://www.npmjs.com/package/dsh-nexus)
+- Linux.do：[Linux.do 社区](https://linux.do/)
+
 ## 许可证与参与开发
 
 Nexus 自有代码采用 [MIT License](LICENSE)，允许在保留版权和许可声明的条件下使用、修改和分发，包括商业使用。
