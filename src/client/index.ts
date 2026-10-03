@@ -3,6 +3,7 @@ import { createElement } from 'react';
 import type {} from '@deepseek-ai/dsh-client-ui-slots';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client';
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client';
 import { installTaskPlacement, type TaskSlots } from './CoderTaskPlacement.js';
 import { ChannelSettings } from './ChannelSettings.js';
 import { CoderSettings } from './CoderSettings.js';
@@ -56,9 +57,9 @@ export function apply(ctx: Context): void {
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-data', order: 18, label: '数据',
   }, DataSettings));
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section', id: 'nexus-updates', order: 19, label: 'Nexus 更新',
-  }, UpdateSettings));
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+    name: 'plugins.bundle.config', key: 'dsh-nexus',
+  }, () => createElement(UpdateSettings)));
   // The coding-task card and its right-sidebar panel wait for the sidebar; without it the settings pages above still load.
   ctx.inject(['sidebarRight', 'sidebarRightTabs'], (inner: Context) => {
     const seats = inner as unknown as TaskSeats;
