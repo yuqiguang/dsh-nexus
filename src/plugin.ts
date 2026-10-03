@@ -6,8 +6,8 @@ import { registerRpc } from './dsh/rpc.js';
 import type {} from './dsh/nexus.js';
 export { registerRpc } from './dsh/rpc.js';
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
-import { mkdir, readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { access, mkdir, readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { parseEnv } from 'node:util';
 import { DeliveryLedger } from './channels/ledger.js';
 import { ChannelManager, type ChannelDependencies } from './channels/manager.js';
@@ -32,6 +32,8 @@ import { DshRecords } from './dsh/records.js';
 import { installHealth, readBuildInfo } from './service/health.js';
 import { installDataRoutes } from './data/index.js';
 import { desktopRestore } from './data/desktop.js';
+import { installUpdates } from './updates/native.js';
+import { UPDATE_IDLE_MS } from './updates/package.js';
 import { createRequire } from 'node:module';
 import { startLifecycle } from './service/lifecycle.js';
 import { ChannelError, type ChannelId, type ConnectionRecord } from './channels/types.js';
@@ -44,6 +46,9 @@ import { WechatClient } from './wechat/client.js';
 import { WechatStateStore, formerWechatBases } from './wechat/state.js';
 
 export const name = 'nexus-channels';
+// Capture the loaded generation once. Replacing files on disk is not activation.
+const runtimeVersion = (createRequire(import.meta.url)('../../package.json') as { version: string }).version;
+const runtimeBuild = readBuildInfo(new URL('../build-info.json', import.meta.url));
 export const inject = ['llm', 'sessionController', 'sessions', 'sessionPersistence', 'credentials', 'connection', 'tools', 'sandboxPolicy', 'sandbox', 'web', 'agents',
   'jobs', 'userQuestions', 'storageDomain', 'systemPrompt'];
 
@@ -175,7 +180,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   let lastActivityAt = startedAt;
   ctx.on('session/event', () => { lastActivityAt = Date.now(); });
   const runningTurns = () => ctx.sessions.list().filter(session => session.snapshotEvents().findLast(event => event.type === 'turn/start' || event.type === 'turn/end')?.type === 'turn/start').length;
-  const build = readBuildInfo(new URL('../build-info.json', import.meta.url));
+  const build = runtimeBuild;
   // Export and import of the user's data. Under systemd a SIGTERM stops DSH cleanly and the unit starts it again,
   // and the start script swaps a staged import in before DSH opens anything; run by hand, the user restarts it.
   const dshVersion = hostVersion();
@@ -186,9 +191,20 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
       && !agents.some(agent => agent.status === 'running' || agent.inbox.nextTurn.length > 0 || agent.inbox.nextStep.length > 0)
       && ![undefined, ...agents.map(agent => agent.id)].some(id => ctx.jobs.list(id).some(job => job.status === 'running' || job.status === 'stopping'));
   };
+  const updates = await installUpdates(ctx, { home: dshHomePath(), currentVersion: runtimeVersion, currentCommit: build?.dirty === false ? build.commit : undefined, dshVersion: dshVersion ?? '',
+    async isIdle(quiet) {
+      if (!dataIdle() || manager.busyWithInstallation() || assistant?.heldPushes() || (quiet && Date.now() - lastActivityAt < UPDATE_IDLE_MS)) return false;
+      for (const file of ['import-pending.json', 'update.lock']) {
+        try { await access(join(dshHomePath(), file)); return false; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false; }
+      }
+      const recovery = await desktopRecovery?.status();
+      if (recovery && !['completed', 'rolled-back', 'cancelled'].includes(recovery.phase)) return false;
+      return (await channels.view()).connections.every(item => !item.pendingDeliveries && item.phase !== 'connecting');
+    } });
   installDataRoutes({ ctx, home: dshHomePath(), importEnabled: process.env.NEXUS_IMPORT_HOME === dshHomePath(), ...(dshVersion ? { dshVersion } : {}), ...(build?.commit ? { commit: build.commit } : {}), report,
     desktopRestore: desktopRecovery,
-    isIdle: dataIdle,
+    isIdle: () => dataIdle() && !updates.busy,
     restart: () => {
       if (!process.env.INVOCATION_ID) return false;
       // A task may start after staging. Check again immediately before signaling the host.

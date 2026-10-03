@@ -160,6 +160,8 @@ export class CodersManager {
   /** Last loaded settings, for synchronous readers such as the prompt section. */
   current(): CoderSettingsRecord | undefined { return this.settings; }
 
+  busyWithInstallation(): boolean { return !!this.deps.installer.installing() || this.settingUpSandbox; }
+
   onConcurrencyChange(listener: (limit: number) => void): () => void {
     this.concurrencyListeners.add(listener);
     return () => { this.concurrencyListeners.delete(listener); };

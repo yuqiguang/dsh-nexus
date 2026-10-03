@@ -10,6 +10,7 @@ import { AssistantSettings } from './AssistantSettings.js';
 import { MemorySettings } from './MemorySettings.js';
 import { ConnectorSettings } from './ConnectorSettings.js';
 import { DataSettings } from './DataSettings.js';
+import { UpdateSettings } from './UpdateSettings.js';
 import styles from './styles.css';
 import { applyChatFold, readChatFold } from './chatFold.js';
 import { TASK_RESOURCE, TASK_TAB_ID, TASK_TAB_KIND, coderTaskPanel, coderTaskRow, taskIdOf, taskAddress } from './CoderTasks.js';
@@ -55,6 +56,9 @@ export function apply(ctx: Context): void {
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section', id: 'nexus-data', order: 18, label: '数据',
   }, DataSettings));
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section', id: 'nexus-updates', order: 19, label: 'Nexus 更新',
+  }, UpdateSettings));
   // The coding-task card and its right-sidebar panel wait for the sidebar; without it the settings pages above still load.
   ctx.inject(['sidebarRight', 'sidebarRightTabs'], (inner: Context) => {
     const seats = inner as unknown as TaskSeats;
