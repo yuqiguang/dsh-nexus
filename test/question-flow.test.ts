@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Context } from '@deepseek-ai/cordis';
-import type { AskUserQuestionItem, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions';
+import type { AskUserQuestionItem, AskUserQuestionRequest, AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions';
 import { DshChannelBridge } from '../src/dsh/bridge.js';
 import { parseCommand, sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 import { until } from './helpers.js';
@@ -39,7 +39,7 @@ async function fixture() {
   await bridge.receive(inbound('task', '生成报告'));
   prompts.length = 0;
   activations = 0;
-  function ask(questions = [choice], signal?: AbortSignal, local = async () => { throw new Error('must use channel question'); }) {
+  function ask(questions = [choice], signal?: AbortSignal, local: (signal?: AbortSignal) => Promise<AskUserQuestionAnswer> = async () => { throw new Error('must use channel question'); }) {
     return bridge.ask({ agent, questions, signal } as unknown as AskUserQuestionRequest, local);
   }
   const questions = () => texts.filter(text => text.startsWith('需要你补充信息'));
@@ -176,4 +176,27 @@ test('status reads live or cold native history without activating an agent or cr
   assert.equal(f.activations(), 0);
   assert.equal(f.prompts.length, 0);
   assert.equal(f.readClosed(), true);
+});
+
+test('desktop answers cancel channel questions, and late replies do not queue a new task', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  let localSignal: AbortSignal | undefined;
+  const expected = { answers: [{ id: 'format', selected: ['PDF'] }] };
+  assert.deepEqual(await f.ask([choice], undefined, async signal => { localSignal = signal; return expected; }), expected);
+  assert.equal(localSignal?.aborted, true);
+  await f.bridge.receive(inbound('late-answer', '回答 1'));
+  assert.equal(f.prompts.length, 0);
+  assert.match(f.texts.at(-1)!, /没有|失效/);
+});
+
+test('channel answers cancel the desktop question lifetime', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  let cancelled = false;
+  const result = f.ask([choice], undefined, signal => new Promise((_resolve, reject) => {
+    signal!.addEventListener('abort', () => { cancelled = true; reject(new Error('native presentation cancelled')); }, { once: true });
+  }));
+  await until(() => f.questions().length === 1, 'question missing');
+  await f.bridge.receive(inbound('remote-wins', '回答 2'));
+  assert.deepEqual((await result).answers, [{ id: 'format', selected: ['PDF'] }]);
+  assert.equal(cancelled, true);
 });

@@ -121,9 +121,9 @@ test('the agenda tools add, list, update, complete and remove; clashes are repor
   await connector.apply(settings);
   assert.deepEqual([...tools.keys()], ['calendar', 'todo']);
   assert.match(sections[0]!.text(), /^现在是 2026-09-21（周一）10:00（Asia\/Shanghai）。\n日历与待办：/);
-  assert.equal((await run('calendar', { action: 'list' })).text, '9/21（周一） 到 9/21（周一） 没有日程。');
+  assert.match((await run('calendar', { action: 'list' })).text, /^类型：日历提醒，只发送已保存的文字，不调用助理执行任务[^\n]*\n9\/21（周一） 到 9\/21（周一） 没有日程。$/);
   const added = await run('calendar', { action: 'add', title: '和张老师开会', start: '2026-09-22 15:00', location: '会议室' });
-  assert.match(added.text, /^已安排：\[ev-[0-9a-f]{8}\] 9\/22（周二）15:00–16:00 和张老师开会 @ 会议室，开始前 15 分钟提醒。$/);
+  assert.match(added.text, /^类型：日历提醒[^\n]*\n已安排：\[ev-[0-9a-f]{8}\] 9\/22（周二）15:00–16:00 和张老师开会 @ 会议室，开始前 15 分钟提醒。$/);
   const id = /ev-[0-9a-f]{8}/.exec(added.text)![0];
   await assert.rejects(run('calendar', { action: 'add', title: 'x', start: '明天三点' }), /YYYY-MM-DD HH:mm/);
   await assert.rejects(run('calendar', { action: 'add', title: 'x', start: '2026-09-22 15:00', end: '2026-09-22 14:00' }), /晚于开始时间/);
@@ -132,16 +132,16 @@ test('the agenda tools add, list, update, complete and remove; clashes are repor
   assert.match(clash.text, /^这个时间和已有日程冲突：\n\[ev-.*和张老师开会 @ 会议室\n先告诉用户/);
   assert.equal(connector.listEvents().length, 1);
   const forced = await run('calendar', { action: 'add', title: '看牙', start: '2026-09-22 15:30', duration_minutes: 30, force: true, remind_minutes: -1 });
-  assert.match(forced.text, /^已安排：.*看牙（与已有日程冲突，按用户要求照排）。$/);
+  assert.match(forced.text, /^类型：日历提醒[^\n]*\n已安排：.*看牙（与已有日程冲突，按用户要求照排）。$/);
   assert.equal(connector.listEvents().length, 2);
   const weekly = await run('calendar', { action: 'add', title: '周会', start: '2026-09-21 09:30', duration_minutes: 30, repeat: 'weekly' });
   assert.match(weekly.text, /周会（每周），开始前 15 分钟提醒/);
   const week = (await run('calendar', { action: 'list', from: '2026-09-21', days: 7 })).text;
-  assert.match(week, /^9\/21（周一）：\n\[ev-.*周会（每周）\n9\/22（周二）：\n\[ev-.*15:00–16:00 和张老师开会 @ 会议室\n\[ev-.*15:30–16:00 看牙$/);
+  assert.match(week, /^类型：日历提醒[^\n]*\n9\/21（周一）：\n\[ev-.*周会（每周）\n9\/22（周二）：\n\[ev-.*15:00–16:00 和张老师开会 @ 会议室\n\[ev-.*15:30–16:00 看牙$/);
   assert.match((await run('calendar', { action: 'list', from: '2026-10-05' })).text, /10\/5（周一）09:30–10:00 周会（每周）/, 'weekly events show in later weeks');
   // Update moves the event, keeps the duration, and clears the reminder mark.
   const moved = await run('calendar', { action: 'update', id, start: '2026-09-23 10:00', note: '带合同' });
-  assert.match(moved.text, /^已更新：\[ev-.*9\/23（周三）10:00–11:00 和张老师开会 @ 会议室｜带合同$/);
+  assert.match(moved.text, /^类型：日历提醒[^\n]*\n已更新：\[ev-.*9\/23（周三）10:00–11:00 和张老师开会 @ 会议室｜带合同$/);
   await assert.rejects(run('calendar', { action: 'update', id: 'ev-none', title: 'x' }), /没有日程 ev-none/);
   assert.equal((await run('calendar', { action: 'remove', id })).text, `已删除日程 ${id}。`);
   assert.equal((await run('calendar', { action: 'remove', id })).text, `没有日程 ${id}。`);
@@ -250,10 +250,10 @@ test('daily and monthly repeats keep the wall clock, a point in time clashes wit
     sessions: () => ['s1'], timeZone: () => zone, now: () => now, report: () => {},
     sleep: (_ms, signal) => new Promise((_resolve, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }); }) });
   await connector.start({ enabled: true, remindMinutes: 15, todoReminderTime: '09:00' });
-  assert.match(sections[0]!.text(), /每天七点半叫我起床.*repeat 选 daily、weekly 或 monthly，duration_minutes 给 0.*remind_minutes 给 0（到点提醒）/);
+  assert.match(sections[0]!.text(), /repeat daily、weekly 或 monthly.*日历到点只发送已保存的提醒文字.*原生自动化工具不可用时如实说明，不能用日历通知代替/);
   await run('calendar', { action: 'add', title: '晨会', start: '2026-09-28 07:00', duration_minutes: 60, remind_minutes: -1 });
   const added = await run('calendar', { action: 'add', title: '七点半了，该起床了', start: '2026-09-27 07:30', duration_minutes: 0, remind_minutes: 0, repeat: 'daily' });
-  assert.match(added.text, /^已安排：\[ev-[0-9a-f]{8}\] 9\/27（周日）07:30 七点半了，该起床了（每天），到点提醒。$/, 'no clash with the meeting, one moment, reminded at it');
+  assert.match(added.text, /^类型：日历提醒[^\n]*\n已安排：\[ev-[0-9a-f]{8}\] 9\/27（周日）07:30 七点半了，该起床了（每天），到点提醒。$/, 'no clash with the meeting, one moment, reminded at it');
   await assert.rejects(run('calendar', { action: 'add', title: 'x', start: '2026-09-27 08:00', end: '2026-09-27 08:00' }), /晚于开始时间/, 'an equal end is only a point when asked for with duration 0');
   await assert.rejects(run('calendar', { action: 'add', title: 'x', start: '2026-09-27 08:00', remind_minutes: -2 }), /-1 表示不提醒/);
   assert.equal(connector.view().nextReminderAt, at('2026-09-27T07:30:00+08:00'));

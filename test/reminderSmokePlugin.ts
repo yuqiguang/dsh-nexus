@@ -9,6 +9,7 @@ import { installBridge } from '../src/dsh/bridge.js';
 import { BridgeRegistry } from '../src/channels/notify.js';
 import { installAssistant } from '../src/plugin.js';
 import { localMinutes } from '../src/assistant/clock.js';
+import { installAutomation } from '../src/dsh/automation.js';
 import { installAssistantPrompt } from '../src/assistant/prompt.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 import { ROTATION_NOTICES, SessionRoster } from '../src/sessions/index.js';
@@ -60,7 +61,7 @@ class FixtureModel extends LlmAdapter {
       this.reminders.push(reminderText);
       assert.match(reminderText, /^\[SCHEDULE REMINDER/);
       const quiet = reminderText.includes('monitor-quiet');
-      yield* this.text(quiet ? '静默' : `提醒：${/reminder_prompt_json: "([^"]+)"/.exec(reminderText)?.[1] ?? '到点了'}`);
+      yield* this.text(reminderText.includes('执行本地检查后输出检查结果。') ? '本地检查完成：已生成检查结果。' : quiet ? '静默' : `提醒：${/reminder_prompt_json: "([^"]+)"/.exec(reminderText)?.[1] ?? '到点了'}`);
       return;
     }
     const asked = options.messages.findLast(message => message.source?.kind === 'user');
@@ -101,6 +102,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     { sessions: roster, memory: { async remember(text, sessionId) { digests.push({ text, sessionId }); } } });
   const registry = new BridgeRegistry();
   registry.add(bridge);
+  installAutomation(ctx, registry);
   await installAssistant(ctx, registry, { report: message => failures.push(`assistant: ${message}`) });
   // The plugin entry does this on mount; phase 14 depends on it so the reminder created in phase 13's session fires with no user message.
   void bridge.resumeBound().catch(() => failures.push('resume_failed'));
@@ -265,6 +267,31 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(model.reminders.filter(text => text.includes('交报告')).length, 1, 'fired once, not from both sessions');
     await bridge.receive(inbound('s5', '状态'));
     assert.match(texts.at(-1)!, /待触发的提醒（1）：\n- schedule-\S+ 每 5 分钟/);
+    // Use the real tool pipeline and native Schedule storage from a newer chat generation.
+    const automation = async (args: object) => {
+      const result = await ctx.tools.execute({ name: 'nexus_automation', callId: ToolCallId(`automation-${crypto.randomUUID()}`),
+        arguments: args, agent: next, signal: new AbortController().signal });
+      assert.equal(result.isError, false, JSON.stringify(result));
+      return JSON.parse((result.value as { text: string }).text);
+    };
+    const listed = await automation({ action: 'list' });
+    assert.ok(Array.isArray(listed.tasks), JSON.stringify(listed));
+    assert.ok(listed.tasks.some((task: any) => task.prompt === '交报告' && task.status === 'inactive'));
+    const daily = await ctx.schedule.create(sessionId, { title: '自动执行本地检查', prompt: '执行本地检查后输出检查结果。', daily: { time: '23:59:59', time_zone: 'Asia/Shanghai' } });
+    const observed = (await automation({ action: 'list' })).tasks.find((task: any) => task.id === daily.id);
+    const time = new Date(Date.now() + 3500).toISOString().slice(11, 23);
+    const changed = await automation({ action: 'update', id: daily.id, revision: observed.revision, change: { kind: 'daily', daily: { time, time_zone: 'UTC' } } });
+    assert.equal(changed.updated, true);
+    assert.equal(changed.sessionId, sessionId);
+    assert.equal(changed.prompt, daily.prompt);
+    assert.equal(changed.timeZone, 'UTC');
+    assert.equal((await automation({ action: 'update', id: daily.id, revision: observed.revision, title: 'stale' })).code, 'schedule_conflict');
+    await until(() => texts.includes('本地检查完成：已生成检查结果。'), 'daily automation did not execute in original session and deliver its result', 20_000);
+    const fresh = (await automation({ action: 'list' })).tasks.find((task: any) => task.id === daily.id);
+    assert.equal(fresh.status, 'active');
+    assert.ok(fresh.lastDelivery);
+    assert.equal((await automation({ action: 'delete', id: daily.id, revision: fresh.revision })).deleted, true);
+    assert.ok(!(await ctx.schedule.catalog()).some(task => task.id === daily.id));
     // The user archived the active session in the Web UI. DSH's archive gate rejects every step it proposes, so the
     // next message must open a new generation instead of being answered by a session that can no longer run.
     // The monitor still owns the session, so this is the archive the Web UI asks the user to confirm: stop the work, then archive.
@@ -286,7 +313,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(await ctx.sessions.flush(next.session), true);
     assert.deepEqual(failures, []);
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls,
-      checks: ['bound_session_resumed_at_startup', 'assistant_settings_restored', 'reminder_after_restart_held_in_quiet_hours', 'ending_quiet_hours_releases_held_push',
+      checks: ['cross_session_automation_list_update_delete', 'daily_automation_executes_original_prompt', 'stale_update_rejected', 'bound_session_resumed_at_startup', 'assistant_settings_restored', 'reminder_after_restart_held_in_quiet_hours', 'ending_quiet_hours_releases_held_push',
         'new_command_opens_next_generation', 'reminders_carried_to_new_generation', 'carried_reminder_fires_once_from_new_session', 'old_session_digested_to_memory', 'status_reads_new_generation',
         'archived_session_is_left_behind'] }, null, 2));
   }

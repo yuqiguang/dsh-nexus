@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import type { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
+import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import { access, writeFile } from 'node:fs/promises';
+import { isNativeMirror } from '../src/dsh/interaction.js';
 import { installBridge } from '../src/dsh/bridge.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
+import type { AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions';
 import { until } from './helpers.js';
 
 export const name = 'nexus-question-smoke';
@@ -25,8 +28,8 @@ class FixtureModel extends LlmAdapter {
     options.signal?.throwIfAborted();
     assert.ok(options.tools?.some(tool => tool.name === 'ask_user_question'));
     const step = this.calls++;
-    if (step === 0) {
-      const block = { type: 'tool-call' as const, id: ToolCallId('native-question'), name: 'ask_user_question', arguments: JSON.stringify({
+    if (step % 2 === 0) {
+      const block = { type: 'tool-call' as const, id: ToolCallId(`native-question-${Math.floor(step / 2)}`), name: 'ask_user_question', arguments: JSON.stringify({
         questions: [{ id: 'format', question: '采用哪种格式？', options: [{ label: 'Markdown' }, { label: 'PDF' }] },
           { id: 'title', question: '报告标题是什么？' }],
       }) };
@@ -35,8 +38,8 @@ class FixtureModel extends LlmAdapter {
       yield { type: 'block-end', index: 0, block };
       yield { type: 'finish', reason: { kind: 'tool-calls' } };
     } else {
-      assert.equal(step, 1);
-      const result = options.messages.find(message => message.role === 'tool' && message.toolCallId === 'native-question');
+      assert.equal(step % 2, 1);
+      const result = options.messages.findLast(message => message.role === 'tool' && message.toolCallId === `native-question-${Math.floor(step / 2)}`);
       assert.ok(result);
       const text = result.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('');
       assert.deepEqual(JSON.parse(text), { answers: [{ id: 'format', selected: ['PDF'] },
@@ -57,6 +60,11 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
   const transport: ChannelTransport = { async start() {}, stop() {}, async sendFile() {},
     async sendText(_chatId, text) { texts.push(text); } };
   const bridge = installBridge(ctx, transport, owner, config.workspace, code => failures.push(code));
+  const native: { signal?: AbortSignal; answer(value: AskUserQuestionAnswer): void }[] = [];
+  ctx.on('user-questions/request', (request, next) => !isNativeMirror(request) && request.agent?.id === sessionId ? next() : new Promise((resolve, reject) => {
+    native.push({ signal: request.signal, answer: resolve });
+    request.signal?.addEventListener('abort', () => reject(new Error('native fixture dismissed')), { once: true });
+  }), { prepend: true });
   let running = false;
   const timer = setInterval(() => {
     void access(config.triggerFile).then(() => {
@@ -96,10 +104,33 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.match(texts.at(-1)!, /已完成/);
     assert.equal(model.calls, 2);
     assert.equal(await ctx.sessions.flush(agent.session), true);
+    assert.equal(native.length, 1, 'native desktop received the same question batch');
+    assert.equal(native[0]!.signal?.aborted, true, 'channel answer removes the native presentation');
+    const beforeDesktop = texts.filter(text => text === '按回答完成原任务。').length;
+    await ctx.sessionController.prompt({ sessionId, requestId: 'desktop-followup' as SessionRequestId, mode: 'queue', content: [{ type: 'text', text: '电脑继续生成报告' }] }, new AbortController().signal);
+    await until(() => native.length === 2, 'desktop question not presented', 10_000);
+    native[1]!.answer({ answers: [{ id: 'format', selected: ['PDF'] }, { id: 'title', selected: [], custom: '本地验收报告' }] });
+    await agent.whenIdle();
+    await bridge.drain();
+    assert.equal(native[1]!.signal?.aborted, true);
+    assert.equal(texts.filter(text => text === '按回答完成原任务。').length, beforeDesktop + 1, 'desktop-initiated final reply is forwarded');
+    assert.ok(!texts.includes('电脑继续生成报告'), 'desktop user text is not mirrored');
+    await bridge.receive(inbound('late-answer', '回答 2'));
+    assert.equal(model.calls, 4);
+    assert.match(texts.at(-1)!, /没有|失效/);
+    const unboundId = SessionId('desktop-unbound-fixture');
+    await ctx.sessionController.create({ sessionId: unboundId, cwd: config.workspace });
+    const beforeUnbound = texts.length;
+    await ctx.sessionController.prompt({ sessionId: unboundId, requestId: 'unbound-task' as SessionRequestId, mode: 'queue', content: [{ type: 'text', text: '普通桌面会话' }] }, new AbortController().signal);
+    await until(() => native.length === 3, 'unbound desktop question not presented', 10_000);
+    native[2]!.answer({ answers: [{ id: 'format', selected: ['PDF'] }, { id: 'title', selected: [], custom: '本地验收报告' }] });
+    await ctx.agents.get(unboundId)!.whenIdle();
+    await bridge.drain();
+    assert.equal(texts.length, beforeUnbound, 'unbound desktop session is never forwarded');
     assert.deepEqual(failures, []);
     await bridge.close();
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls,
-      checks: ['native_ask_user_question_tool', 'question_batch_answers_in_native_history', 'question_answer_resumes_same_turn',
+      checks: ['dual_question_presentation', 'channel_answer_dismisses_desktop', 'desktop_answer_invalidates_channel', 'desktop_reply_forwarded_only_in_bound_session', 'native_ask_user_question_tool', 'question_batch_answers_in_native_history', 'question_answer_resumes_same_turn',
         'question_duplicate_and_invalid_replies_isolated', 'native_waiting_and_completed_status'],
     }, null, 2));
   }

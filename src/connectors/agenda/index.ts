@@ -254,6 +254,7 @@ export class AgendaConnector {
     }));
     const text = { schema: { type: 'object' as const, additionalProperties: false as const, properties: { text: { type: 'string' as const, required: true as const } } },
       render: (_args: unknown, value: { text: string }) => [{ type: 'text' as const, text: value.text }] };
+    const calendarKind = '类型：日历提醒，只发送已保存的文字，不调用助理执行任务，不代表已创建或修改官方自动化。';
     const clashText = (clashes: Occurrence[]) => ['这个时间和已有日程冲突：', ...clashes.map(item => renderOccurrence(item, connector.zone())), '先告诉用户，用户仍要安排时再带 force: true 调用。'].join('\n');
     this.disposers.push(register(defineTool({
       name: 'calendar',
@@ -281,7 +282,7 @@ export class AgendaConnector {
           if (from === undefined) throw new Error('from 要写成 YYYY-MM-DD。');
           const days = typeof args.days === 'number' && args.days > 0 ? Math.floor(args.days) : 1;
           const begin = startOfDay(from, zone);
-          return { text: renderAgenda(connector.agenda(from, days), begin, addDays(begin, Math.min(MAX_LIST_DAYS, days), zone), zone) };
+          return { text: calendarKind + '\n' + renderAgenda(connector.agenda(from, days), begin, addDays(begin, Math.min(MAX_LIST_DAYS, days), zone), zone) };
         }
         if (args.action === 'remove') {
           if (!args.id) throw new Error('remove 需要日程 id。');
@@ -291,12 +292,12 @@ export class AgendaConnector {
           if (!args.id) throw new Error('update 需要日程 id。');
           const { event, clashes } = await connector.updateEvent(args.id, args as Record<string, unknown>);
           if (!event) return { text: clashText(clashes) };
-          return { text: `已更新：${renderOccurrence({ event, start: event.start, end: event.end }, zone)}` };
+          return { text: `${calendarKind}\n已更新：${renderOccurrence({ event, start: event.start, end: event.end }, zone)}` };
         }
         const { event, clashes } = await connector.addEvent(args as Parameters<AgendaConnector['addEvent']>[0]);
         if (!event) return { text: clashText(clashes) };
         const lead = connector.leadOf(event);
-        return { text: `已安排：${renderOccurrence({ event, start: event.start, end: event.end }, zone)}${clashes.length ? '（与已有日程冲突，按用户要求照排）' : ''}${lead === undefined ? '' : lead === 0 ? '，到点提醒' : `，开始前 ${lead} 分钟提醒`}。` };
+        return { text: `${calendarKind}\n已安排：${renderOccurrence({ event, start: event.start, end: event.end }, zone)}${clashes.length ? '（与已有日程冲突，按用户要求照排）' : ''}${lead === undefined ? '' : lead === 0 ? '，到点提醒' : `，开始前 ${lead} 分钟提醒`}。` };
       },
     })));
     this.disposers.push(register(defineTool({

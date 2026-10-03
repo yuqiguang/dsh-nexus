@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Context } from '@deepseek-ai/cordis';
-import type { ApprovalRequest } from '@deepseek-ai/dsh-user-approval';
+import type { ApprovalRequest, ApprovalOutcome } from '@deepseek-ai/dsh-user-approval';
 import { DshChannelBridge } from '../src/dsh/bridge.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage } from '../src/channels/protocol.js';
 import { until } from './helpers.js';
@@ -28,11 +28,11 @@ async function fixture() {
   const bridge = new DshChannelBridge(ctx, transport, owner, '/local-approval-fixture', code => errors.push(code));
   await bridge.receive(inbound('initial-task', '创建本地测试文件'));
   prompts.length = 0;
-  function ask(callId: string, args = { command: 'printf hello > result.txt', description: '写入测试文件', sandbox_permissions: 'require_escalated' }) {
+  function ask(callId: string, args = { command: 'printf hello > result.txt', description: '写入测试文件', sandbox_permissions: 'require_escalated' }, local: (signal?: AbortSignal) => Promise<ApprovalOutcome> = async () => { throw new Error('no desktop'); }) {
     const serialized = JSON.stringify(args);
     calls.push({ type: 'tool/call', data: { callId, arguments: serialized } });
     return bridge.approve({ agent, callId, toolName: 'bash', reason: '需要在沙盒外执行这一次操作。' } as unknown as ApprovalRequest,
-      async () => { throw new Error('local approval must not replace the channel question'); });
+      local);
   }
   return { bridge, prompts, texts, errors, ask, setSend: (handler: typeof send) => { send = handler; },
     setPrompt: (handler: () => void) => { onPrompt = handler; } };
@@ -144,4 +144,45 @@ test('a new task reaching approval is not mislabeled as waiting behind another t
   assert.equal(f.prompts.length, 1);
   assert.ok(f.texts.some(text => text.startsWith('需要你确认后继续')));
   assert.equal(f.texts.filter(text => text.includes('排队')).length, 0);
+});
+
+test('desktop approval wins even during a slow send and invalidates the channel token', async t => {
+  const f = await fixture();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.setSend(() => gate);
+  t.after(() => { release(); return f.bridge.close(); });
+  let signal: AbortSignal | undefined;
+  const result = await f.ask('desktop-wins', undefined, async s => { signal = s; return 'rejected'; });
+  assert.equal(result, 'rejected');
+  assert.equal(signal?.aborted, true);
+  release();
+  f.setSend(async () => {});
+  const token = /允许 ([a-f0-9]{32})/.exec(f.texts[0]!)![1];
+  await f.bridge.receive(inbound('late-desktop-decision', `允许 ${token}`));
+  assert.equal(f.prompts.length, 0);
+  assert.match(f.texts.at(-1)!, /失效|没有/);
+});
+
+test('channel decision cancels native pending presentation; unavailable desktop cannot settle it early', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  let cancelled = false;
+  const result = f.ask('channel-wins', undefined, signal => new Promise(resolve => {
+    signal!.addEventListener('abort', () => { cancelled = true; resolve('cancelled'); }, { once: true });
+  }));
+  await until(() => f.texts.length === 1, 'channel prompt missing');
+  await f.bridge.receive(inbound('remote-decision', '允许'));
+  assert.equal(await result, 'allowed-once');
+  assert.equal(cancelled, true);
+  const second = f.ask('desktop-unavailable', undefined, async () => 'unavailable');
+  await until(() => f.texts.some(text => text.includes('desktop-unavailable')) || f.texts.length === 3, 'second prompt missing');
+  await f.bridge.receive(inbound('second-remote-decision', '拒绝'));
+  assert.equal(await second, 'rejected');
+});
+
+test('failed channel delivery falls back to the desktop approval', async t => {
+  const f = await fixture(); t.after(() => f.bridge.close());
+  f.setSend(async () => { throw new Error('offline fixture'); });
+  const result = await f.ask('desktop-fallback', undefined, async () => { await new Promise(resolve => setImmediate(resolve)); return 'allowed-once'; });
+  assert.equal(result, 'allowed-once');
 });

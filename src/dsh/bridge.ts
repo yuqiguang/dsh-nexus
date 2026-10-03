@@ -1,3 +1,4 @@
+import { firstAvailable, isNativeMirror, nativeApproval, nativeQuestion } from './interaction.js';
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
 import type { ScheduleCatalogEntry } from '@deepseek-ai/dsh-schedule';
 import type { Context } from '@deepseek-ai/cordis';
@@ -625,28 +626,31 @@ export class DshChannelBridge {
     return { sessionId: active, reason: why };
   }
 
-  async ask(request: AskUserQuestionRequest, next: () => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> {
+  async ask(request: AskUserQuestionRequest, next: (signal?: AbortSignal) => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> {
     const chatId = request.agent && this.chatOf(request.agent.id);
     if (!chatId || this.stopped) return next();
     const prompts = request.questions.map((question, index) => questionPrompt(question, index, request.questions.length));
     if (prompts.some(prompt => prompt.length > 2500)) {
-      await this.transport.sendText(chatId, '这个问题需要在本机 DSH 查看完整内容并回答。',
+      void this.transport.sendText(chatId, '这个问题需要在本机 DSH 查看完整内容并回答。',
         identity('local-question', request.agent!.id, ...request.questions.map(question => question.id))).catch(() => {});
       return next();
     }
-    const signal = request.signal ? AbortSignal.any([request.signal, this.lifetime.signal]) : this.lifetime.signal;
-    const answers = [];
-    for (const [index, question] of request.questions.entries()) {
-      signal.throwIfAborted();
-      const pending = this.questions.open(chatId, question, index === request.questions.length - 1, signal);
-      try {
-        await this.transport.sendText(chatId, `${prompts[index]}\n多项问题同时等待时：回答 ${pending.token} 内容`,
-          identity('question', pending.token));
-        pending.presented();
-      } catch { pending.unavailable(); }
-      answers.push(await pending.outcome);
-    }
-    return { answers };
+    const lifetime = new AbortController();
+    const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
+    const remote = async () => {
+      const answers = [];
+      for (const [index, question] of request.questions.entries()) {
+        signal.throwIfAborted();
+        const pending = this.questions.open(chatId, question, index === request.questions.length - 1, signal);
+        // Do not delay native presentation or settlement on a slow channel send.
+        void this.transport.sendText(chatId, `${prompts[index]}\n也可在本机 DSH 回答；任一端完成整组回答后另一端失效。\n多项问题同时等待时：回答 ${pending.token} 内容`,
+          identity('question', pending.token)).then(pending.presented, pending.unavailable);
+        answers.push(await pending.outcome);
+      }
+      return { answers };
+    };
+    try { return await firstAvailable([remote(), Promise.resolve().then(() => next(signal))], () => true); }
+    finally { lifetime.abort(); }
   }
 
   private async status(base: SessionId, sessionId: SessionId, chatId: string): Promise<string> {
@@ -667,7 +671,7 @@ export class DshChannelBridge {
     return '当前没有任务记录，发送文字即可开始。' + tail;
   }
 
-  async approve(request: ApprovalRequest, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
+  async approve(request: ApprovalRequest, next: (signal?: AbortSignal) => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
     const chatId = this.chatOf(request.agent.id);
     if (!chatId || this.stopped) return next();
     const call = request.agent.session.snapshotEvents().findLast(event =>
@@ -685,22 +689,20 @@ export class DshChannelBridge {
     const prompt = `需要你确认后继续\n操作：${title}\n${request.reason ? `原因：${request.reason}\n` : ''}完整参数：\n${parameters}`;
     // Exact arguments must fit in the remote prompt. Larger or unbound requests remain in the native UI.
     if (!args || prompt.length > 2500) {
-      await this.transport.sendText(chatId, '此操作需要在本机 DSH 查看完整参数并审批。',
+      void this.transport.sendText(chatId, '此操作需要在本机 DSH 查看完整参数并审批。',
         identity('local-approval', request.agent.id, String(request.callId))).catch(() => {});
       return next();
     }
-    const pending = this.replies.open(chatId, request.signal);
-    try {
-      await this.transport.sendText(chatId,
-        `${prompt}\n\n只有一项待审批时，直接回复“允许”或“拒绝”。\n` +
-        `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
-        '有效期 10 分钟，仅本次操作。停止当前执行：/cancel',
-        identity('approval', pending.token));
-      pending.presented();
-    } catch {
-      this.replies.answer(chatId, pending.token, 'unavailable');
-    }
-    return pending.outcome;
+    const lifetime = new AbortController();
+    const signal = AbortSignal.any([lifetime.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
+    const pending = this.replies.open(chatId, signal);
+    void this.transport.sendText(chatId,
+      `${prompt}\n\n也可在本机 DSH 审批；任一端处理后另一端失效。\n只有一项待审批时，直接回复“允许”或“拒绝”。\n` +
+      `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
+      '有效期 10 分钟，仅本次操作。停止当前执行：/cancel',
+      identity('approval', pending.token)).then(pending.presented, () => { this.replies.answer(chatId, pending.token, 'unavailable'); });
+    try { return await firstAvailable([pending.outcome, Promise.resolve().then(() => next(signal))], value => value !== 'unavailable'); }
+    finally { lifetime.abort(); }
   }
 
   onEvent(session: Session, event: SessionEvent): void {
@@ -853,8 +855,8 @@ export function voiceNotice(code: string): string {
 export function installBridge(ctx: Context, transport: ChannelTransport,
   identity: ChannelIdentity, workspace: string, report: (code: string) => void, heartbeat?: HeartbeatOptions, extras?: BridgeExtras): DshChannelBridge {
   const bridge = new DshChannelBridge(ctx, transport, identity, workspace, report, heartbeat, undefined, extras);
-  ctx.on('approval/request', (request, next) => bridge.approve(request, next), { prepend: true });
-  ctx.on('user-questions/request', (request, next) => bridge.ask(request, next), { prepend: true });
+  ctx.on('approval/request', (request, next) => isNativeMirror(request) ? next() : bridge.approve(request, signal => signal ? nativeApproval(ctx, request, signal) : next()), { prepend: true });
+  ctx.on('user-questions/request', (request, next) => isNativeMirror(request) ? next() : bridge.ask(request, signal => signal ? nativeQuestion(ctx, request, signal) : next()), { prepend: true });
   ctx.on('session/event', (session, event) => bridge.onEvent(session, event));
   ctx.effect(() => () => bridge.close());
   return bridge;

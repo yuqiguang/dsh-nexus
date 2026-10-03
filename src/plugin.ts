@@ -27,6 +27,7 @@ import { installUntrustedResults } from './assistant/untrusted.js';
 import { MemoryService, installMemory } from './memory/index.js';
 import { projectScope, sessionMemoryScope } from './memory/scope.js';
 import { installBridge, type BridgeExtras } from './dsh/bridge.js';
+import { installAutomation } from './dsh/automation.js';
 import { DshRecords } from './dsh/records.js';
 import { installHealth, readBuildInfo } from './service/health.js';
 import { installDataRoutes } from './data/index.js';
@@ -167,6 +168,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   assistant.attachAgenda((now, days) => connectors.agendaFor(now, days));
   ctx.provide('nexusWorkspace', { root: workspace });
   installAssistantPrompt(ctx);
+  installAutomation(ctx, registry);
   installFileFind({ ctx, workspace, ledger: files, timeZone });
   // The updater restarts only a quiet service: no open turn, and nothing happened in any session for a while.
   let lastActivityAt = startedAt;

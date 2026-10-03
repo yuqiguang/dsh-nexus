@@ -9,6 +9,7 @@ import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-tools';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isNativeMirror } from '../src/dsh/interaction.js';
 import { installBridge, type DshChannelBridge } from '../src/dsh/bridge.js';
 import { sessionIdFor, type ChannelTransport, type InboundMessage, type OutboundFile } from '../src/channels/protocol.js';
 import { until } from './helpers.js';
@@ -103,6 +104,11 @@ export async function apply(ctx: Context, config: {
     async sendFile(target, file) { assert.equal(target, chatId); files.push(file); },
   };
   bridge = installBridge(ctx, transport, owner, config.workspace, code => failures.push(code));
+  const nativeApprovals: AbortSignal[] = [];
+  ctx.on('approval/request', (request, next) => !isNativeMirror(request) ? next() : new Promise(resolve => {
+    nativeApprovals.push(request.signal!);
+    request.signal!.addEventListener('abort', () => resolve('cancelled'), { once: true });
+  }), { prepend: true });
   // Force a real native approval for the fixture's write. No tool or loop is replaced.
   ctx.on('tools/pre-execute', async (execution, next) => {
     if (execution.callId === 'fixture-1-3') {
@@ -172,6 +178,9 @@ export async function apply(ctx: Context, config: {
       assert.ok(texts.includes('测试文件已生成并交付。'));
       const events = agent.session.snapshotEvents();
       assert.equal(events.filter(event => event.type === 'turn/start').length, 1, 'the Chinese approval reply must not start another turn');
+      assert.equal(nativeApprovals.length, 1);
+      assert.equal(nativeApprovals[0]!.aborted, true, 'channel decision dismisses native desktop approval');
+      assert.equal(events.filter(event => event.type === 'approval/asked' && event.data.callId === 'fixture-1-1').length, 1);
       const ask = events.find(event => event.type === 'approval/asked');
       const grant = events.find(event => event.type === 'approval/decided' && event.data.outcome === 'allowed-once');
       const write = events.find(event => event.type === 'tool/result' && event.data.message.source.callId === 'fixture-1-1');
@@ -220,7 +229,7 @@ export async function apply(ctx: Context, config: {
       completedTurns: events.filter(event => event.type === 'turn/end' && event.data.reason.kind === 'completed').length,
       fileDeliveries: files.length, restoredToolHistory: model.restoredToolHistory,
       checks: config.phase === 1
-        ? ['owner_filter', 'group_filter', 'native_read_error_recovery', 'native_approval_order', 'chinese_approval_stays_in_current_turn', 'write_then_continue',
+        ? ['dual_approval_single_native_audit', 'owner_filter', 'group_filter', 'native_read_error_recovery', 'native_approval_order', 'chinese_approval_stays_in_current_turn', 'write_then_continue',
           'explicit_file_delivery', 'native_message_deduplication', 'remote_session_keeps_its_permission',
           'native_never_policy_rejects', 'remote_full_access_runs', 'invalid_approval_replies_do_not_grant', 'closed_bridge_rejects_admission']
         : ['same_native_session', 'restart_message_deduplication', 'no_old_reply_replay', 'native_tool_history_restored', 'continued_file_read'],
