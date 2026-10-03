@@ -161,7 +161,8 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
       name: pathToFileURL(installedPlugin ? join(packageFixture, 'pluginSmokePlugin.js') : join(projectRoot,
         phase >= 25 ? 'dist/test/dataSmokePlugin.js' : phase >= 23 ? 'dist/test/rebindSmokePlugin.js' : phase === 21 ? 'dist/test/mailSmokePlugin.js' : phase >= 19 ? 'dist/test/serviceSmokePlugin.js' : phase >= 17 ? 'dist/test/memorySmokePlugin.js' : phase >= 15 ? 'dist/test/mediaSmokePlugin.js' : phase >= 13 ? 'dist/test/reminderSmokePlugin.js' : phase === 12 ? 'dist/test/coderSmokePlugin.js' : phase === 11 ? 'dist/test/questionSmokePlugin.js' : phase < 3 ? 'dist/test/nativeSmokePlugin.js'
           : phase < 5 ? 'dist/test/settingsSmokePlugin.js' : 'dist/test/wechatSmokePlugin.js')).href,
-      config: { phase, workspace, triggerFile, reportFile, packageName, renamed: renameOnly && phase === 8, packageDir: join(activeProfile, 'node_modules', packageName) } }] },
+      config: { phase, workspace, triggerFile, reportFile, packageName, initialComponentsEnabled: !renameOnly && !sourcePackageOnly,
+        renamed: renameOnly && phase === 8, packageDir: join(activeProfile, 'node_modules', packageName) } }] },
     // Supplemental shared-Fetch-only host. Current Desktop uses an HTTP Host; this is not an Electron test.
     ...(phase === 9 ? ['web-startup', 'webserver', 'web-runtime', 'client-hmr', 'open-in-app', 'ui-open-in-app', 'directory-picker', 'hmr']
       .map(id => ({ id, disabled: true })).concat([{ id: 'connection', inject: ['credentials'], config: {} }]) : []),

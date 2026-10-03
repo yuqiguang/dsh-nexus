@@ -76,15 +76,15 @@ test('retired document insertions and enabled or disabled overrides are removed 
   assert.deepEqual(foreign.at(-1), { id: 'nexus-documents', disabled: false });
 });
 
-test('remaining components are default-off and native overrides survive setup', () => {
+test('remaining components are default-on and explicit disable overrides survive setup', () => {
   const patch = backfillProfilePatch(original(), ['/nexus']);
   const memory = patch[0]!.insert!.find(row => row.id === 'nexus-memory');
-  assert.deepEqual(memory, { id: 'nexus-memory', name: 'file:///nexus/dist/src/memory/plugin.js', disabled: true });
-  patch.push({ id: 'nexus-memory', disabled: false });
-  assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-mail'), { id: 'nexus-mail', name: 'file:///nexus/dist/src/connectors/mail/plugin.js', disabled: true });
-  patch.push({ id: 'nexus-mail', disabled: false });
-  assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-agenda'), { id: 'nexus-agenda', name: 'file:///nexus/dist/src/connectors/agenda/plugin.js', disabled: true });
-  patch.push({ id: 'nexus-agenda', disabled: false });
+  assert.deepEqual(memory, { id: 'nexus-memory', name: 'file:///nexus/dist/src/memory/plugin.js' });
+  patch.push({ id: 'nexus-memory', disabled: true });
+  assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-mail'), { id: 'nexus-mail', name: 'file:///nexus/dist/src/connectors/mail/plugin.js' });
+  patch.push({ id: 'nexus-mail', disabled: true });
+  assert.deepEqual(patch[0]!.insert!.find(row => row.id === 'nexus-agenda'), { id: 'nexus-agenda', name: 'file:///nexus/dist/src/connectors/agenda/plugin.js' });
+  patch.push({ id: 'nexus-agenda', disabled: true });
   const before = JSON.stringify(patch);
   assert.equal(JSON.stringify(backfillProfilePatch(patch, ['/nexus'])), before);
 });

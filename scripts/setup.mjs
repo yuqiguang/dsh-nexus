@@ -44,7 +44,7 @@ export function backfillProfilePatch(patch, coderRoots) {
       if (inserts.some(item => item.id === id)) continue;
       const name = entry.name?.startsWith('file:')
         ? new URL(`./${['mail', 'agenda'].includes(component) ? `connectors/${component}` : component}/plugin.js`, entry.name).href : `dsh-nexus/${component}`;
-      patch.find(layer => Array.isArray(layer.insert)).insert.push({ id, name, disabled: true });
+      patch.find(layer => Array.isArray(layer.insert)).insert.push({ id, name });
     }
     // The official bundle now owns these rows. Keep explicit configuration/disable overrides.
     const overrides = [];

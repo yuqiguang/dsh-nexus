@@ -3,10 +3,7 @@
       name: dsh-nexus
     - id: nexus-memory
       name: dsh-nexus/memory
-      disabled: true
     - id: nexus-mail
       name: dsh-nexus/mail
-      disabled: true
     - id: nexus-agenda
       name: dsh-nexus/agenda
-      disabled: true

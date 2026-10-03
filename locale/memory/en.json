@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Long-term memory",
-    "description": "Project- and identity-scoped recall, injection and channel summaries under your saved policy. Disabled by default; data management remains available."
+    "description": "Project- and identity-scoped recall, injection and channel summaries under your saved policy. Enabled by default; new memories require confirmation by default. Data remains manageable when disabled."
   }
 }

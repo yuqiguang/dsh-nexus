@@ -16,7 +16,7 @@ import { until } from './helpers.js';
 export const name = 'nexus-plugin-package-smoke';
 export const inject = ['connection', 'clientModules', 'credentials', 'tools', 'pluginManager'];
 
-export function apply(ctx: Context, config: { phase: number; triggerFile: string; reportFile: string; packageDir: string; packageName?: string; renamed?: boolean }): void {
+export function apply(ctx: Context, config: { phase: number; triggerFile: string; reportFile: string; packageDir: string; packageName?: string; renamed?: boolean; initialComponentsEnabled?: boolean }): void {
   const packageName = config.packageName ?? 'dsh-nexus';
   let running = false;
   const timer = setInterval(() => {
@@ -125,7 +125,13 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.ok(ctx.get('schedule'), 'native reminder service stays available');
       if (config.phase === 7) {
         await ctx.credentials.modifyRecord(credentialKey('nexus-modules', 'settings'), async () => ({ kind: 'grant', payload: legacyModules }));
-        assert.equal(agendaRow.enabled, false);
+        const initiallyEnabled = config.initialComponentsEnabled ?? true;
+        assert.equal(agendaRow.enabled, initiallyEnabled);
+        if (initiallyEnabled) {
+          assert.ok(agendaTools.every(name => ctx.tools.get(name)));
+          assert.equal((await rpc('connectors', 'list')).value.modules.agenda, true);
+          assert.equal((await ctx.pluginManager.setPluginEnabled(agendaRow.entryId, false)).application, 'applied');
+        }
         assert.ok(agendaTools.every(name => !ctx.tools.get(name)));
         assert.equal((await rpc('connectors', 'list')).value.modules.agenda, false);
         assert.equal((await ctx.pluginManager.setPluginEnabled(agendaRow.entryId, true)).application, 'applied');
@@ -141,8 +147,15 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.ok(completed.value.agenda.todos[0].doneAt);
         assert.equal((await ctx.pluginManager.setPluginEnabled(agendaRow.entryId, true)).application, 'applied');
         assert.ok((await rpc('connectors', 'list')).value.agenda.todos[0].doneAt);
-        checks.push('agenda_default_off', 'agenda_native_live_toggle', 'agenda_data_management_survives_disable');
-        assert.equal(mailRow.enabled, false);
+        checks.push(initiallyEnabled ? 'agenda_default_on' : 'agenda_saved_disable_preserved', 'agenda_native_live_toggle', 'agenda_data_management_survives_disable');
+        assert.equal(mailRow.enabled, initiallyEnabled);
+        if (initiallyEnabled) {
+          const state = (await rpc('connectors', 'list')).value;
+          assert.equal(state.modules.mail, true);
+          assert.equal(state.mail.phase, 'disabled');
+          assert.ok(!ctx.tools.get('mail_send'));
+          assert.equal((await ctx.pluginManager.setPluginEnabled(mailRow.entryId, false)).application, 'applied');
+        }
         assert.equal((await rpc('connectors', 'list')).value.modules.mail, false);
         assert.equal((await rpc('connectors', 'mail/test')).error.code, 'module_disabled');
         assert.equal((await ctx.pluginManager.setPluginEnabled(mailRow.entryId, true)).application, 'applied');
@@ -152,9 +165,14 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.equal((await ctx.pluginManager.setPluginEnabled(mailRow.entryId, false)).application, 'applied');
         assert.equal((await rpc('connectors', 'list')).value.modules.mail, false);
         assert.equal((await ctx.pluginManager.setPluginEnabled(mailRow.entryId, true)).application, 'applied');
-        checks.push('mail_default_off', 'mail_native_live_toggle', 'mail_component_requires_configured_account');
+        checks.push(initiallyEnabled ? 'mail_default_on' : 'mail_saved_disable_preserved', 'mail_native_live_toggle', 'mail_component_requires_configured_account');
         assert.ok(agendaTools.every(name => ctx.tools.get(name)), 'native agenda remains independent');
-        assert.equal(memoryRow.enabled, false);
+        assert.equal(memoryRow.enabled, initiallyEnabled);
+        if (initiallyEnabled) {
+          await until(() => memoryTools.every(name => !!ctx.tools.get(name)), 'default memory did not activate');
+          assert.equal((await rpc('memory', 'list')).value.policy.remember, 'ask');
+          assert.equal((await ctx.pluginManager.setPluginEnabled(memoryRow.entryId, false)).application, 'applied');
+        }
         assert.ok(memoryTools.every(name => !ctx.tools.get(name)));
         const memory = await rpc('memory', 'event/add', { text: 'module restart fixture' });
         assert.equal(memory.ok, true);
@@ -173,7 +191,7 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
         assert.equal(restoredMemory.value.policy.remember, 'off');
         assert.equal(restoredMemory.value.policy.inject, false);
         assert.match(restoredMemory.value.exportJson, /module restart fixture/);
-        checks.push('memory_default_off_with_data_management', 'memory_live_toggle_preserves_store_and_policy');
+        checks.push(initiallyEnabled ? 'memory_default_on_with_ask_policy' : 'memory_saved_disable_preserved', 'memory_live_toggle_preserves_store_and_policy');
       } else if (config.phase === 8) {
         assert.equal(mailRow.enabled, true);
         assert.equal((await rpc('connectors', 'list')).value.modules.mail, true);
