@@ -36,7 +36,7 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
   }
   if (dependencyPassed(task)) return { ...view, title: '指定检查已通过',
     nextStep: '保留本步骤结果，查看目标与验收中尚未完成的项目；需要确认的业务效果仍由你验收。' };
-  view.title = task.status === 'interrupted' ? '任务已中断' : task.status === 'cancelled' ? '任务已取消'
+  view.title = task.stopCause === 'user-wait-timeout' ? '等待用户超时，已暂停' : task.status === 'interrupted' ? '任务已中断' : task.status === 'cancelled' ? '任务已取消'
     : task.result?.execution === 'failed' ? '编码执行失败'
     : task.permissions?.securityMode !== 'full' && task.result?.outsideRoots.length ? '检测到工作区外改动'
     : task.result?.verification === 'failed' ? '独立验证未通过'

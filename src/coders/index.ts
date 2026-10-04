@@ -1,3 +1,4 @@
+import { readonlyReview } from './readonly-review.js';
 import { UserWaits } from './user-waits.js';
 import { dispatchPrompt } from './prompt.js';
 import { timingSummary } from './timing.js';
@@ -173,7 +174,7 @@ export function interruptedNotice(task: TaskRecord): string {
 }
 
 function describeDecision(decision: DecisionRecord): string {
-  const outcome = { allow: '允许', deny: '拒绝', answer: '回答', ask: '转交用户' }[decision.outcome];
+  const outcome = { allow: '允许', deny: '拒绝', answer: '回答', ask: '转交用户', timeout: '等待超时' }[decision.outcome];
   const notes = [decision.reason, ...(decision.remembered?.length ? [`已记住：${decision.remembered.join('、')}`] : [])].filter(Boolean);
   return `[${LAYER_LABEL[decision.layer]}·${outcome}] ${decision.summary}${notes.length ? ` — ${notes.join('；')}` : ''}`;
 }
@@ -219,7 +220,7 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
   const count = (layer: DecisionRecord['layer']) => task.decisions.filter(decision => decision.layer === layer).length;
   const changes = changeSummary(verify.changedFiles);
   const lines = [
-    `编码任务 ${task.id} ${outcome.status === 'completed' ? (verify.verifyExecuted === false ? '执行结束，独立验证未执行' : verify.verifyOk === false ? '执行结束，但验证失败' : task.permissions?.securityMode !== 'full' && verify.outsideRoots.length ? '已完成，但有改动越出根目录' : verify.verifyOk === undefined ? '执行结束，尚未独立验证' : '执行结束，验证通过') : outcome.status === 'killed' ? '已取消' : '失败'}${outcome.detail ? `（${outcome.detail}）` : ''}`,
+    `编码任务 ${task.id} ${outcome.status === 'completed' ? (verify.verifyExecuted === false ? '执行结束，独立验证未执行' : verify.verifyOk === false ? '执行结束，但验证失败' : task.permissions?.securityMode !== 'full' && verify.outsideRoots.length ? '已完成，但有改动越出根目录' : verify.verifyOk === undefined ? '执行结束，尚未独立验证' : '执行结束，验证通过') : outcome.status === 'killed' ? task.stopCause === 'user-wait-timeout' ? '等待用户超时，已暂停' : task.stopReason ? '已暂停' : '已取消' : '失败'}${outcome.detail ? `（${outcome.detail}）` : ''}`,
     `任务：${task.description}`,
     ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []),
     `目录：${task.cwd}`,
@@ -423,10 +424,12 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           if (!envelope) { escalationReason = preparation.reason; break; }
           const cached = reviewCache.get(task, envelope);
           step(`${cached ? 'DSH 正在核验已有安全结论' : 'DSH 正在审核'}：${oneLine(request.summary, 100)}`);
-          const result = cached ?? await reviewUntilAborted(safetyReviewer(task, envelope, reviewSignal), reviewSignal);
+          const deterministic = await readonlyReview(task, request, reviewEnvs.get(taskId));
+          const result = deterministic ?? cached ?? await reviewUntilAborted(safetyReviewer(task, envelope, reviewSignal), reviewSignal);
           reviewSignal.throwIfAborted();
           const rechecked = await prepareReview(task, request, reviewEnvs.get(taskId));
           const after = rechecked.input;
+          const readonlyUnchanged = !deterministic || !!await readonlyReview(task, request, reviewEnvs.get(taskId));
           const current = store.get(taskId);
           const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard');
           // A newly added deny must still win, even if the reviewer was already in flight.
@@ -435,7 +438,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
             step('审核证据发生变化，正在根据最新内容重新审核一次。');
             continue;
           }
-          const allowed = result.safe && !!after && reviewFingerprint(after) === reviewFingerprint(envelope)
+          const allowed = readonlyUnchanged && result.safe && !!after && reviewFingerprint(after) === reviewFingerprint(envelope)
             && !!current && isActive(current) && !current.stopReason && config.manager?.current()?.autoApproveSafe !== false;
           const reason = result.safe && !allowed ? rechecked.reason ?? '审核期间操作内容、目标路径或任务状态已变化' : cached ? `复用本任务 60 秒内的安全审核（命令、权限和文件证据未变）：${result.reason}` : result.reason;
           await store.update(taskId, current => ({ decisions: [...current.decisions, { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'supervisor', outcome: allowed ? 'allow' : 'ask', reason }] }));
@@ -491,7 +494,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       try { await store.update(taskId, current => userWaits.remove(current, waitId)); }
       finally { releaseQuestion?.(); resumeBudget?.(); }
     }
-    if (waitSignal.aborted && !signal.aborted) {
+    if (waitSignal.aborted && !signal.aborted && !shutdown.signal.aborted && waitSignal.reason?.name === 'TimeoutError') {
+      outcome = { decision: { behavior: 'deny', message: '等待用户超时，任务已暂停；未取得本次操作授权。', interrupt: true },
+        record: { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user', outcome: 'timeout', reason: '等待用户超时，未收到决定；不是用户拒绝' } };
       await store.update(taskId, () => ({ stopCause: 'user-wait-timeout' }));
       stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
     }
@@ -503,7 +508,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           record: { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user', outcome: 'deny', reason: '确认期间配置文件路径或规则已变化' } };
       }
     }
-    step(`${{ allow: '用户允许', deny: '拒绝', answer: '用户回答', ask: '转交用户' }[outcome.record.outcome]}：${oneLine(request.summary, 100)}`);
+    step(`${{ allow: '用户允许', deny: '拒绝', answer: '用户回答', ask: '转交用户', timeout: '等待超时' }[outcome.record.outcome]}：${oneLine(request.summary, 100)}`);
     await store.update(taskId, current => ({
       // An aborted question leaves a final status alone: a cancelled task gets it from runJob, an interrupted turn goes on running.
       ...(outcome.unreachable ? { status: 'interrupted' as const } : {}),

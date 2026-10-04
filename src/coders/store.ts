@@ -1,5 +1,5 @@
 import { advanceTiming, initialTiming, TIMING_PHASES } from './timing.js';
-import { REVIEW_FAILURES } from './review.js';
+import { REVIEW_FAILURES, REVIEW_ERROR_CODES } from './review.js';
 import { briefSnapshotSchema } from './brief.js';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
 import { randomBytes } from 'node:crypto';
@@ -11,7 +11,7 @@ const decisionSchema = z.object({
   kind: z.enum(['command', 'file-write', 'file-read', 'network', 'question', 'other']),
   summary: z.string(),
   layer: z.enum(['hard', 'habit', 'user', 'supervisor']),
-  outcome: z.enum(['allow', 'deny', 'answer', 'ask']),
+  outcome: z.enum(['allow', 'deny', 'answer', 'ask', 'timeout']),
   reason: z.string().optional(),
   blockKey: z.string().optional(),
   remembered: z.array(z.string()).optional(),
@@ -70,7 +70,7 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   escalations: z.number(),
   decisions: z.array(decisionSchema),
   safetyReviews: z.array(z.object({ at: z.number(), id: z.string(), taskId: z.string(), phase: z.enum(['request', 'result']), provider: z.string().optional(), model: z.string().optional(), system: z.string().optional(), input: z.string().optional(), output: z.string().optional(), reason: z.string().optional(),
-    attempt: z.number().int().positive().optional(), maxTokens: z.number().int().positive().optional(), finishReason: z.string().optional(), failure: z.enum(REVIEW_FAILURES).optional(),
+    attempt: z.number().int().positive().optional(), maxTokens: z.number().int().positive().optional(), finishReason: z.string().optional(), failure: z.enum(REVIEW_FAILURES).optional(), errorCode: z.enum(REVIEW_ERROR_CODES).optional(),
     usage: z.object({ inputTokens: z.number(), outputTokens: z.number(), reasoningTokens: z.number().optional(), totalTokens: z.number().optional() }).optional() })).optional(),
   autoAllowed: z.number().optional(),
   pending: z.object({ at: z.number(), kind: decisionSchema.shape.kind, summary: z.string(), detail: z.string().optional(), reason: z.string().optional() }).optional(),

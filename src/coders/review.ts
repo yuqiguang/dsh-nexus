@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { TokenUsage } from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import { randomBytes, createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { lstat } from 'node:fs/promises';
 import { isAbsolute, resolve } from 'node:path';
 import { isIP } from 'node:net';
@@ -188,19 +189,28 @@ export type ReviewFailure = typeof REVIEW_FAILURES[number];
 const REVIEW_FAILURE_TEXT: Record<ReviewFailure, string> = {
   empty: '审核模型返回空响应，未提供结论', truncated: '审核模型输出达到上限，未得到完整结论',
   invalid: '审核模型返回的结论格式无效', incomplete: '审核响应没有正常结束',
-  error: '审核模型调用失败', timeout: '自动审核超过等待时限', cancelled: '自动审核已取消',
+  error: '审核服务异常，尚未得到安全结论', timeout: '自动审核超过等待时限', cancelled: '自动审核已取消',
   'too-long': '审核模型返回内容超过可接受长度',
 };
+// Only provider-neutral codes are persisted; raw provider messages may contain credentials or URLs.
+export const REVIEW_ERROR_CODES = ['TIMEOUT', 'TRANSPORT', 'SERVER', 'RATE_LIMIT', 'EMPTY_RESPONSE', 'AUTH', 'QUOTA', 'ACCOUNT_QUOTA', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'NO_ADAPTER', 'INVALID_ARGS', 'CONTEXT_WINDOW_EXCEEDED', 'UNKNOWN'] as const;
+type ReviewErrorCode = typeof REVIEW_ERROR_CODES[number];
+function reviewErrorCode(value: unknown): ReviewErrorCode {
+  const code = value && typeof value === 'object' ? (value as { code?: unknown }).code : undefined;
+  return REVIEW_ERROR_CODES.find(item => item === code) ?? 'UNKNOWN';
+}
+const TRANSIENT_REVIEW_ERRORS = new Set<ReviewErrorCode>(['TIMEOUT', 'TRANSPORT', 'SERVER', 'RATE_LIMIT', 'EMPTY_RESPONSE']);
+
 export interface ReviewAudit {
   id: string; taskId: string; phase: 'request' | 'result'; provider?: string; model?: string;
   system?: string; input?: string; output?: string; reason?: string;
-  attempt?: number; maxTokens?: number; finishReason?: string; failure?: ReviewFailure;
+  attempt?: number; maxTokens?: number; finishReason?: string; failure?: ReviewFailure; errorCode?: ReviewErrorCode;
   usage?: Pick<TokenUsage, 'inputTokens' | 'outputTokens' | 'reasoningTokens' | 'totalTokens'>;
 }
 export type ReviewAuditSink = (record: ReviewAudit) => Promise<void>;
 
-/** At most two calls for missing/truncated output, sharing one deadline and identical evidence.
- * An explicit verdict (including safe=false) is final. DSH owns provider/network retries.
+/** At most two calls for missing/truncated output or classified transient failures, sharing one deadline and identical evidence.
+ * An explicit verdict (including safe=false) is final. Use DSH failure codes; never retry authentication, quota or unknown failures.
  * Each attempt is audited in native task storage, never replayed into the conversation. */
 export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): SafetyReviewer {
   return async (task, input, signal) => {
@@ -218,12 +228,12 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
       const id = `review-${randomBytes(8).toString('hex')}`;
       // Reasoning models need room to produce the final JSON after their analysis. A project-wide command review spent a
       // whole 2048-token first attempt on analysis and only reached a verdict on the retry, so the first attempt is no longer
-      // the smaller one (ct-4c671559); the retry still gets more. DSH owns provider retries; this is only the output budget.
+      // the smaller one (ct-4c671559); the retry still gets more. The single retry also covers classified transient failures; both attempts share the deadline.
       const maxTokens = attempt === 1 ? 4096 : 6144;
       const base = { id, taskId: task.id, attempt, maxTokens };
       await audit({ ...base, phase: 'request', provider: config.provider, model: config.model, system, input: text });
       let output = '', finishReason: string | undefined, usage: ReviewAudit['usage'];
-      let failure: ReviewFailure | undefined, result: ReviewResult | undefined;
+      let failure: ReviewFailure | undefined, result: ReviewResult | undefined, errorCode: ReviewErrorCode | undefined;
       const call = new AbortController();
       try {
         const stream = ctx.llm.stream({ provider: config.provider, model: config.model, system,
@@ -241,7 +251,10 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
               // Keep counts, never reasoning text, provider errors or authenticated URLs.
               usage = { inputTokens, outputTokens, ...(reasoningTokens !== undefined ? { reasoningTokens } : {}), ...(totalTokens !== undefined ? { totalTokens } : {}) };
             }
-            if (chunk.type === 'finish') finishReason = ['stop', 'max-tokens', 'error', 'aborted', 'tool-calls'].includes(chunk.reason.kind) ? chunk.reason.kind : 'other';
+            if (chunk.type === 'finish') {
+              finishReason = ['stop', 'max-tokens', 'error', 'aborted', 'tool-calls'].includes(chunk.reason.kind) ? chunk.reason.kind : 'other';
+              if (chunk.reason.kind === 'error') errorCode = reviewErrorCode(chunk.reason.failure);
+            }
           }
         } finally { call.abort(); void stream.return?.().catch(() => {}); }
         active.throwIfAborted();
@@ -260,23 +273,25 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
             } catch { failure = 'invalid'; }
           }
         }
-      } catch {
+      } catch (error) {
+        if (!active.aborted) errorCode = reviewErrorCode(error);
         failure = active.aborted ? active.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled' : 'error';
       } finally { call.abort(); }
-      // A negative verdict is conservative even when the provider reports truncation.
+      // A negative verdict is conservative even when the provider reports truncation or an error.
       // Never ask again in the hope of turning an explicit refusal into an approval.
-      if (failure === 'truncated') {
+      if (failure === 'truncated' || failure === 'error') {
         try {
           const parsed = JSON.parse(output);
           if (parsed?.safe === false && typeof parsed.reason === 'string' && parsed.reason.trim() && parsed.reason.length <= 500) result = { safe: false, reason: redact(parsed.reason) };
         } catch { /* Still missing a usable verdict. */ }
       }
-      const retry = !result && attempt === 1 && !active.aborted && (failure === 'empty' || failure === 'truncated');
-      const reason = result?.reason ?? `${REVIEW_FAILURE_TEXT[failure ?? 'invalid']}${retry ? '，将自动重试一次' : attempt === 2 ? '；已重试一次，交给你确认' : '，交给你确认'}`;
+      const retry = !result && attempt === 1 && !active.aborted && (failure === 'empty' || failure === 'truncated' || failure === 'error' && !!errorCode && TRANSIENT_REVIEW_ERRORS.has(errorCode));
+      const reason = result?.reason ?? `${REVIEW_FAILURE_TEXT[failure ?? 'invalid']}${errorCode ? `（${errorCode}）` : ''}${retry ? '，将自动重试一次' : attempt === 2 ? '；已重试一次，交给你确认' : '，交给你确认'}`;
       await audit({ ...base, phase: 'result', output: redact(output).slice(0, 8000), reason,
-        ...(finishReason ? { finishReason } : {}), ...(usage ? { usage } : {}), ...(failure ? { failure } : {}) });
+        ...(finishReason ? { finishReason } : {}), ...(usage ? { usage } : {}), ...(failure ? { failure } : {}), ...(errorCode ? { errorCode } : {}) });
       if (result) return result;
       if (!retry) return { safe: false, reason };
+      if (failure === 'error') await delay(500, undefined, { signal: active });
     }
     return { safe: false, reason: '自动审核未得到有效结论，交给你确认' };
   };

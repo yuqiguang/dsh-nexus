@@ -2179,6 +2179,13 @@ test('user wait timeout interrupts the coder and releases its workspace for the 
     assert.equal(harness.tasks.get(first.task_id!)!.status, 'interrupted');
     assert.match(harness.tasks.get(first.task_id!)!.stopReason!, /等待用户超过时限/);
     assert.equal(harness.tasks.get(first.task_id!)!.stopCause, 'user-wait-timeout');
+    const timedOut = harness.tasks.get(first.task_id!)!;
+    assert.equal(timedOut.decisions.at(-1)?.outcome, 'timeout');
+    assert.match((await harness.jobs[0]!.done).result ?? '', /等待用户超时，已暂停/);
+    assert.doesNotMatch((await harness.jobs[0]!.done).result ?? '', /编码任务.*已取消/);
+    assert.match((await harness.run('coder_status', { task_id: first.task_id })).text ?? '', /等待用户超时，已暂停/);
+    assert.match(timedOut.decisions.at(-1)?.reason ?? '', /不是用户拒绝/);
+    assert.doesNotMatch(timedOut.trace?.at(-1)?.text ?? '', /^拒绝/);
     assert.equal(harness.tasks.get(next.task_id!)!.status, 'completed');
     assert.equal(starts, 2);
   } finally { clearInterval(keepAlive); for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(workdir, { recursive: true, force: true }); }

@@ -73,7 +73,7 @@ export interface DecisionRecord {
   kind: CoderRequestKind;
   summary: string;
   layer: DecisionLayer;
-  outcome: 'allow' | 'deny' | 'answer' | 'ask';
+  outcome: 'allow' | 'deny' | 'answer' | 'ask' | 'timeout';
   reason?: string;
   /** What hard rule settled this, so repeated attempts at one block are recognisable as the same block. */
   blockKey?: string;

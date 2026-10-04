@@ -341,3 +341,34 @@ test('review cancellation between attempts prevents a new call, and an unrespons
   assert.equal(result.safe,false);assert.match(result.reason,/等待时限/);assert.equal(calls,1);assert.equal(audits.at(-1)!.failure,'timeout');
  }finally{clearTimeout(keepAlive);}
 });
+
+test('transient review failures retry once, persist safe codes and never retain raw provider errors', async () => {
+ for (const code of ['TIMEOUT','TRANSPORT','SERVER','RATE_LIMIT','AUTH','QUOTA','ACCOUNT_QUOTA','INVALID_CREDENTIAL','secret-code']) {
+  let calls=0;const audits:ReviewAudit[]=[];
+  const ctx={sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'model'}})}}};}},llm:{async *stream(){
+   if(++calls===1)yield {type:'finish',reason:{kind:'error',failure:{code,message:'https://user:secret@example.test/?token=secret'}}};
+   else {yield {type:'text-delta',text:'{"safe":true,"reason":"read only"}'};yield {type:'finish',reason:{kind:'stop'}};}
+  }}} as unknown as Context;
+  const result=await nativeSafetyReviewer(ctx,async e=>{audits.push(e);})(task('/tmp'),{task:'x',scope:'s',operation:'c',evidence:[]},new AbortController().signal);
+  const retry=['TIMEOUT','TRANSPORT','SERVER','RATE_LIMIT'].includes(code);
+  assert.equal(calls,retry?2:1);assert.equal(result.safe,retry);
+  assert.equal(audits[1]?.errorCode,code==='secret-code'?'UNKNOWN':code);
+  assert.doesNotMatch(JSON.stringify(audits),/secret|example\.test/);
+  assert.equal(taskSchema.parse({...task('/tmp'),safetyReviews:audits.map(e=>({...e,at:1}))}).safetyReviews?.[1]?.errorCode,audits[1]?.errorCode);
+ }
+});
+
+test('transient exceptions are bounded and an explicit negative verdict is never retried after an error', async () => {
+ for(const deny of [false,true]) {
+  let calls=0;const audits:ReviewAudit[]=[];
+  const ctx={sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'model'}})}}};}},llm:{async *stream(){
+   calls++;
+   if(deny)yield {type:'text-delta',text:'{"safe":false,"reason":"requires owner"}'};
+   throw Object.assign(new Error('private provider detail'),{code:'TIMEOUT'});
+  }}} as unknown as Context;
+  const result=await nativeSafetyReviewer(ctx,async e=>{audits.push(e);})(task('/tmp'),{task:'x',scope:'s',operation:'c',evidence:[]},new AbortController().signal);
+  assert.equal(calls,deny?1:2);assert.equal(result.safe,false);
+  assert.match(result.reason,deny?/requires owner/:/TIMEOUT.*已重试一次/);
+  assert.doesNotMatch(JSON.stringify(audits),/private provider/);
+ }
+});

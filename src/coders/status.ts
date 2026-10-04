@@ -1,6 +1,7 @@
 import type { TaskRecord } from './types.js';
 
-export function taskStatusLabel(task: Pick<TaskRecord, 'status' | 'result' | 'retry'>): string {
+export function taskStatusLabel(task: Pick<TaskRecord, 'status' | 'result' | 'retry' | 'stopCause'>): string {
+  if (task.status === 'interrupted' && task.stopCause === 'user-wait-timeout') return '等待用户超时，已暂停';
   if (task.status === 'running' && task.retry?.phase === 'waiting') return task.retry.source === 'tool' ? '编码工具重试中' : '等待自动续接';
   if (task.status === 'running' && task.retry?.phase === 'resuming') return '正在恢复原会话';
   if (task.result?.verification === 'failed' && (task.status === 'completed' || task.status === 'failed')) return '执行结束，验证失败';

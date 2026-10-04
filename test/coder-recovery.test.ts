@@ -74,6 +74,8 @@ test('waiting approvals and in-flight verification direct the user to existing w
 
 test('timeout and preflight failure explain the stopped boundary without automatic redispatch', () => {
   const timeout = task({ stopCause: 'user-wait-timeout', result: { ...passed, verification: 'not-run', verifyOk: false } });
+  assert.equal(taskRecovery(timeout, []).title, '等待用户超时，已暂停');
+  assert.match(taskStatusLabel({ ...timeout, status: 'interrupted' }), /超时，已暂停/);
   assert.match(taskRecovery(timeout, []).nextStep, /等待用户明确.*不自动重复派发/);
   const preflight = task({ status: 'failed', result: { ...passed, execution: 'failed', verification: 'not-run', verifyOk: undefined,
     preflightCheck: { command: 'node check.cjs', ok: false, executed: true, output: 'environment failure' } } });
