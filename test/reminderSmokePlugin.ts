@@ -259,7 +259,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     await next.whenIdle();
     await bridge.drain();
     assert.equal(texts.at(-1), '收到。');
-    await until(() => texts.includes('提醒：交报告'), 'reminder carried into the new generation did not fire', 20_000);
+    await until(() => texts.some(text => text.startsWith(`[历史微信会话 ${sessionId}]\n提醒：交报告\n`)), 'reminder carried into the new generation did not fire', 20_000);
     const delivered = (await ctx.schedule.catalog()).find(record => record.prompt === '交报告');
     assert.equal(delivered?.sessionId, sessionId);
     assert.equal(delivered?.status, 'inactive');
@@ -286,7 +286,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(changed.prompt, daily.prompt);
     assert.equal(changed.timeZone, 'UTC');
     assert.equal((await automation({ action: 'update', id: daily.id, revision: observed.revision, title: 'stale' })).code, 'schedule_conflict');
-    await until(() => texts.includes('本地检查完成：已生成检查结果。'), 'daily automation did not execute in original session and deliver its result', 20_000);
+    await until(() => texts.some(text => text.startsWith(`[历史微信会话 ${sessionId}]\n本地检查完成：已生成检查结果。\n`)), 'daily automation did not execute in original session and deliver its result', 20_000);
     const fresh = (await automation({ action: 'list' })).tasks.find((task: any) => task.id === daily.id);
     assert.equal(fresh.status, 'active');
     assert.ok(fresh.lastDelivery);

@@ -128,10 +128,10 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.deepEqual(await formerWechatBases(records, after), [earlier]);
     const beforeTask = (await ctx.schedule.catalog()).find(record => record.sessionId === earlier)!;
     assert.ok(beforeTask);
-    await until(() => texts.includes('提醒：喝水'), 'native reminder was not routed after restart/rebind', 35_000);
+    await until(() => texts.some(text => text.startsWith(`[历史微信会话 ${earlier}]\n提醒：喝水\n`)), 'native reminder was not routed after restart/rebind', 35_000);
     const agent = ctx.agents.get(current)!;
     await bridge.drain();
-    assert.equal(texts.filter(text => text === '提醒：喝水').length, 1);
+    assert.equal(texts.filter(text => text.startsWith(`[历史微信会话 ${earlier}]\n提醒：喝水\n`)).length, 1);
     const delivered = (await ctx.schedule.catalog()).find(record => record.id === beforeTask.id)!;
     assert.equal(delivered.sessionId, earlier);
     assert.equal(delivered.status, 'inactive');
