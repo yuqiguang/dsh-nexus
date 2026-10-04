@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { downloadPackages, downloadTargets, npmDownloadOptions, type DownloadProgress } from '../src/coders/install-download.js';
 import { createNpmRunner, onPath } from '../src/coders/install.js';
 
-import { registry } from './coder-download-fixture.js';
+import { hermeticNpmConfig, registry } from './coder-download-fixture.js';
 
 const require = createRequire(import.meta.url);
 const dependencies = { '@openai/codex': '0.155.1' };
@@ -64,7 +64,7 @@ test('an interrupted body retries with reset counters and marks only the fully v
 });
 
 test('the npm worker reports progress and stock npm installs from its verified cache', async t => {
-  const r = await registry(t);
+  const r = await registry(t); await hermeticNpmConfig(t, r.root);
   const project = join(r.root, 'project'); await mkdir(project);
   await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'fixture-install', private: true, dependencies }));
   await writeFile(join(project, '.npmrc'), `registry=${r.url}\ncache=${dirname(r.cache)}\naudit=false\nfund=false\n`);
@@ -79,7 +79,7 @@ test('the npm worker reports progress and stock npm installs from its verified c
 });
 
 test('aborting the npm worker stops a stalled download before npm can install it', async t => {
-  const r = await registry(t, 'hanging');
+  const r = await registry(t, 'hanging'); await hermeticNpmConfig(t, r.root);
   const project = join(r.root, 'project'); await mkdir(project);
   await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'fixture-abort', private: true, dependencies }));
   await writeFile(join(project, '.npmrc'), `registry=${r.url}\ncache=${dirname(r.cache)}\n`);
@@ -93,6 +93,7 @@ test('aborting the npm worker stops a stalled download before npm can install it
 
 test('download config retains project registry, authenticated proxy, CA and scoped token settings without reporting them', async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-npm-config-')); t.after(() => rm(root, { recursive: true, force: true }));
+  await hermeticNpmConfig(t, root);
   await writeFile(join(root, 'package.json'), '{"name":"fixture"}');
   await writeFile(join(root, '.npmrc'), `registry=https://registry.example/\nhttps-proxy=http://fixture:secret@127.0.0.1:1234\n//registry.example/:_authToken=fixture-secret\nstrict-ssl=true\ncache=${join(root, 'cache')}\n`);
   const npmPath = dirname(dirname(await realpath((await onPath('npm', process.env))!)));

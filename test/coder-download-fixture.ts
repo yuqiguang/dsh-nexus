@@ -9,6 +9,35 @@ import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
 
+/**
+ * npm gives environment variables higher precedence than any `.npmrc`, and `npm run <script>`
+ * exports its whole resolved config to the script as `npm_config_*`. So `npm test` on a machine
+ * whose `~/.npmrc` points `registry` at a mirror (`https://registry.npmmirror.com` is the common
+ * one) hands every fixture an environment that outranks the project `.npmrc` the test just wrote:
+ * npm then installs from the public mirror, the fixture server sees no request, and the test fails
+ * for a reason its own output never mentions. It passes under a bare `node --test` and fails under
+ * `npm test`, which is exactly how this stayed hidden.
+ *
+ * Drop the inherited `npm_config_*` and point both config files at empty fixtures for the duration
+ * of the test, so the project `.npmrc` under test is the only thing that can decide.
+ */
+export async function hermeticNpmConfig(t: TestContext, root: string): Promise<void> {
+  const saved = new Map<string, string>();
+  for (const name of Object.keys(process.env)) {
+    if (!/^npm_config_/i.test(name)) continue;
+    saved.set(name, process.env[name]!);
+    delete process.env[name];
+  }
+  await writeFile(join(root, 'npmrc-user'), 'audit=false\nfund=false\n');
+  await writeFile(join(root, 'npmrc-global'), 'audit=false\nfund=false\n');
+  process.env.NPM_CONFIG_USERCONFIG = join(root, 'npmrc-user');
+  process.env.NPM_CONFIG_GLOBALCONFIG = join(root, 'npmrc-global');
+  t.after(() => {
+    for (const name of Object.keys(process.env)) if (/^npm_config_/i.test(name)) delete process.env[name];
+    for (const [name, value] of saved) process.env[name] = value;
+  });
+}
+
 export async function registry(t: TestContext, mode: 'normal' | 'unknown-size' | 'corrupt' | 'reset-once' | 'hanging' = 'normal', version = '0.155.1') {
   const root = await mkdtemp(join(tmpdir(), 'nexus-download-'));
   t.after(() => rm(root, { recursive: true, force: true }));

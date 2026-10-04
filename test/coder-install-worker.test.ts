@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import type { DownloadProgress } from '../src/coders/install-download.js';
-import { registry } from './coder-download-fixture.js';
+import { hermeticNpmConfig, registry } from './coder-download-fixture.js';
 
 const require = createRequire(import.meta.url);
 
@@ -55,6 +55,7 @@ async function runWorker(path: string, cli: string, cwd: string, command = proce
 
 for (const version of ['0.155.1', '1.2.3-rc.1']) test(`standalone worker installs ${version} via stock npm without DSH host modules and reuses verified downloads`, async t => {
   const r = await registry(t, 'normal', version);
+  await hermeticNpmConfig(t, r.root);
   const worker = await isolatedWorker(t);
   const project = join(r.root, 'project'); await mkdir(project);
   await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'fixture-install', private: true, dependencies: { '@openai/codex': version } }));
