@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import type { RetryNotice } from '../src/coders/retry.js';
 import { test } from 'node:test';
+import { hasUserNamespaces } from './helpers.js';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
 import { runClaudeTask, type ClaudeQuery, type ClaudeStreamMessage } from '../src/coders/claude.js';
@@ -19,7 +20,12 @@ import { join } from 'node:path';
 import { DEFAULT_REVIEW_POLICY, type CoderReviewPolicy } from '../src/coders/review-policy.js';
 import { dependencyPassed } from '../src/coders/dependencies.js';
 
-test('full access uses native Claude bypass, allows protected requests, but retains questions, cancellation and owner scope', async t => {
+// The confined pipeline these tests drive shells out to `unshare --user`; a kernel that refuses
+// unprivileged user namespaces fails them with a raw `unshare: Operation not permitted` instead
+// of saying why. Skip with a reason, like the local-check tests do. See test/helpers.ts.
+const noNamespaces = hasUserNamespaces() ? undefined : 'unprivileged user namespaces are disabled';
+
+test('full access uses native Claude bypass, allows protected requests, but retains questions, cancellation and owner scope', { skip: noNamespaces }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-full-flow-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const harness = coderHarness(qs => qs.map(q => ({ id: q.id, selected: ['A'] })), root);
@@ -67,7 +73,7 @@ test('full access uses native Claude bypass, allows protected requests, but reta
   await assert.rejects(harness.run('coder_task', { description: 'read-only' }), /只读/);
 });
 
-test('full access verification respects an explicit offline contract and allows observed outside writes without failing dependencies', async t => {
+test('full access verification respects an explicit offline contract and allows observed outside writes without failing dependencies', { skip: noNamespaces }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-full-verify-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(join(root, 'check.cjs'), 'require("fs").writeFileSync("executed", "yes")');
@@ -418,7 +424,7 @@ test('the Claude adapter reports SDK errors and cancellation without rejecting',
   assert.deepEqual([outcome.status, outcome.detail], ['killed', 'user asked']);
 });
 
-test('the verify command runs without a shell and reports exit status', async () => {
+test('the verify command runs without a shell and reports exit status', { skip: noNamespaces }, async () => {
   const ok = await runVerifyCommand('true', process.cwd());
   assert.deepEqual(ok, { ok: true, output: '' });
   const failed = await runVerifyCommand('sh -c exit_3_missing', process.cwd());
@@ -885,7 +891,7 @@ const until = async (check: () => boolean, what: string) => {
   }
 };
 
-test('owner files-only choice stops independent verification, persists evidence, and does not change a resumed contract', async () => {
+test('owner files-only choice stops independent verification, persists evidence, and does not change a resumed contract', { skip: noNamespaces }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'nexus-verify-choice-'));
   const harness = coderHarness(questions => questions.map(q => ({ id: q.id, selected: [q.id === 'nexus-verification' ? '本次仅交付文件' : q.id === 'approve' ? '允许' : '交付'] })));
   let runs = 0, reviews = 0;
@@ -1385,6 +1391,7 @@ test('the task panel route returns the record and, unless brief, the coder\'s pr
 
 import { taskPermissions } from '../src/coders/permissions.js';
 
+
 test('Claude unattended tasks configure a required sandbox and gate file tools before execution', async () => {
   const permissions = await taskPermissions(process.cwd(), [process.cwd()], 'claude');
   const query = scriptedQuery(async function* (options) {
@@ -1567,7 +1574,7 @@ test('successful tool work breaks failure streaks, but three consecutive identic
   } finally { await rm(workdir, { recursive: true, force: true }); }
 });
 
-test('online verification needs its own approval and denial prevents command execution', async () => {
+test('online verification needs its own approval and denial prevents command execution', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-verify-approval-'));
   try {
     for (const allowed of [false, true]) {
@@ -1800,7 +1807,7 @@ test('simultaneous resumptions admit only one job for the same native coder sess
   }
 });
 
-test('dependencies wait without holding execution slots and start only after independent verification', async () => {
+test('dependencies wait without holding execution slots and start only after independent verification', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-dependencies-'));
   const other = await mkdtemp(join(tmpdir(), 'nexus-independent-'));
   const harness = coderHarness();
@@ -1876,7 +1883,7 @@ test('failed prerequisite blocks the whole dependent chain without launching its
   }
 });
 
-test('briefs keep shared constraints, distinguish uncovered acceptance, and reject stale dispatch revisions', async () => {
+test('briefs keep shared constraints, distinguish uncovered acceptance, and reject stale dispatch revisions', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-brief-'));
   const harness = coderHarness();
   let seen = '';
@@ -1972,7 +1979,7 @@ test('saved step plans enforce coverage, derive verification and dependencies, a
   } finally { for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(workdir, { recursive: true, force: true }); }
 });
 
-test('business acceptance is recorded only through the owner native question and stays distinct from verification', async () => {
+test('business acceptance is recorded only through the owner native question and stays distinct from verification', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-acceptance-'));
   const harness = coderHarness(questions => questions.map(question => ({ id: question.id!, selected: ['已满足'] })));
   try {
@@ -1989,7 +1996,7 @@ test('business acceptance is recorded only through the owner native question and
   } finally { await rm(workdir, { recursive: true, force: true }); }
 });
 
-test('recovery retries only failed steps and redirects descendants to the new attempt without rerunning success', async () => {
+test('recovery retries only failed steps and redirects descendants to the new attempt without rerunning success', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-recover-'));
   const harness = coderHarness();
   const runs = new Map<string, number>();
@@ -2111,7 +2118,7 @@ test('provider rate limits preserve the session as interrupted and expose the re
   } finally {for(const job of harness.jobs)job.cancel('cleanup');await Promise.all(harness.jobs.map(job=>job.done));await rm(workdir,{recursive:true,force:true});}
 });
 
-test('standard dispatch reviews commands and verification, falls back on review failure, and keeps high-impact actions manual', async () => {
+test('standard dispatch reviews commands and verification, falls back on review failure, and keeps high-impact actions manual', { skip: noNamespaces }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'nexus-standard-flow-'));
   try {
     await writeFile(join(cwd, 'check.cjs'), 'console.log("verified")');
@@ -2206,7 +2213,7 @@ test('standard Claude reuses only repeatable safety reviews and rechecks changed
 });
 
 
-test('verification suite executes and reviews commands serially, records failures and leaves later checks unexecuted', async () => {
+test('verification suite executes and reviews commands serially, records failures and leaves later checks unexecuted', { skip: noNamespaces }, async () => {
  const cwd=await mkdtemp(join(tmpdir(),'nexus-verify-suite-'));
  try {
   await writeFile(join(cwd,'first.cjs'), 'require("fs").writeFileSync("first-done", "yes");');
@@ -2221,7 +2228,7 @@ test('verification suite executes and reviews commands serially, records failure
  } finally {await rm(cwd,{recursive:true,force:true});}
 });
 
-test('dispatched verification suite persists, reaches coder prompt, and remains intact on resume', async () => {
+test('dispatched verification suite persists, reaches coder prompt, and remains intact on resume', { skip: noNamespaces }, async () => {
  const cwd=await mkdtemp(join(tmpdir(),'nexus-suite-dispatch-')), harness=coderHarness();
  try {
   await writeFile(join(cwd,'one.cjs'),'console.log("one");'); await writeFile(join(cwd,'two.cjs'),'console.log("two");');
@@ -2482,7 +2489,7 @@ test('missing verification cwd is not executed and does not reach approval or pr
   assert.match(result.verifyOutput!, /验证目录不存在/);
 });
 
-test('retry rejects a removed verification directory before dispatch and accepts an explicit corrected root', async t => {
+test('retry rejects a removed verification directory before dispatch and accepts an explicit corrected root', { skip: noNamespaces }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-retry-directory-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const harness = coderHarness(undefined, root);
@@ -2506,7 +2513,7 @@ test('retry rejects a removed verification directory before dispatch and accepts
   assert.equal(harness.tasks.get(corrected.task_id!)!.result?.verification, 'passed');
 });
 
-test('planned dispatch binds the first project directory and verification-only recovery preserves the plan', async t => {
+test('planned dispatch binds the first project directory and verification-only recovery preserves the plan', { skip: noNamespaces }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-plan-recovery-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = join(root, 'kb-service'); await mkdir(project);
@@ -2584,7 +2591,7 @@ test('planned continuation keeps original requirements and explicit brief direct
   assert.equal(record.brief?.revision, 2);
 });
 
-test('environment preflight failure prevents coding and remains distinct from final verification', async t => {
+test('environment preflight failure prevents coding and remains distinct from final verification', { skip: noNamespaces }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-preflight-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const harness = coderHarness(undefined, root);

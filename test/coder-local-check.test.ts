@@ -70,7 +70,7 @@ test('walk excludes npm and Chromium profiles while retaining check evidence', a
   } finally {await rm(root,{recursive:true,force:true});}
 });
 
-test('independent verification binds an explicit project directory and explains parent-directory mistakes', async () => {
+test('independent verification binds an explicit project directory and explains parent-directory mistakes', { skip: noNamespaces }, async () => {
   const root=await mkdtemp(join(tmpdir(),'nexus-verify-cwd-'));
   try {
     await mkdir(join(root,'app'));await writeFile(join(root,'app','package.json'),JSON.stringify({scripts:{build:'node -e "process.exit(0)"'}}));

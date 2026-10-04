@@ -6,6 +6,11 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { CoderQueue } from '../src/coders/queue.js';
 import { changedFiles, snapshotWorkTree, verifyTask, workspaceScope } from '../src/coders/verify.js';
+import { hasUserNamespaces } from './helpers.js';
+
+// The verification tests below run the real confined command pipeline, which needs
+// `unshare --user`; skip with a reason where the kernel refuses it. See test/helpers.ts.
+const noNamespaces = hasUserNamespaces() ? undefined : 'unprivileged user namespaces are disabled';
 
 test('overlapping workspace leases serialize while independent work advances', async () => {
   const queue = new CoderQueue(3), signal = new AbortController().signal;
@@ -58,7 +63,7 @@ test('repository subdirectories share a scope and restoring preexisting dirty fi
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('verification artifacts are included in the final change report', async () => {
+test('verification artifacts are included in the final change report', { skip: noNamespaces }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-verify-output-'));
   try {
     await writeFile(join(root, 'verify.cjs'), "require('fs').writeFileSync('artifact.txt','checked')");
