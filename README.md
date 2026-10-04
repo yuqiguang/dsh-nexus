@@ -4,7 +4,7 @@
 
 基于 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness)，在桌面端、微信和飞书中安排、跟进与验收本机编码任务。你可以交代目标，让本机 Codex 或 Claude Code 执行，查看进度、回答关键问题，再根据验证结果继续修改。
 
-Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话、后台任务、审批和恢复服务。目前源码插件版本为 **0.2.44**，精确匹配 **DSH 0.2.0-rc.2**，处于实验阶段。本机 DSH 和编码工具需要保持运行；手机渠道用于远程交互。
+Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话、后台任务、审批和恢复服务。目前源码插件版本为 **0.2.45**，精确匹配 **DSH 0.2.0-rc.2**，处于实验阶段。本机 DSH 和编码工具需要保持运行；手机渠道用于远程交互。
 
 插件列表的名称与简介随 DSH 界面语言显示中文或英文：中文名为“Nexus 个人编码助理”，英文名为“Nexus for DSH”。安装预览提供中英双语简介。DSH 同时展示技术标识 `dsh-nexus`，以及 `dsh-nexus/memory` 等组件入口；从 0.2.32 起，安装包名和 GitHub 仓库名统一为 `dsh-nexus`；已有 `nexus-next` 安装需按[迁移说明](RENAME.md)替换旧包。组件 ID 与数据存储标识保持不变。
 
@@ -47,11 +47,11 @@ Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话
 3. 先打开 **设置 → 编码工具** 完成上面的首次任务，再按需配置 **渠道连接** 和其他扩展。
 4. 需要提醒功能时，在 **插件 → 官方** 启用 **自动化任务**（`@deepseek-ai/dsh-experimental-schedule-bundle`）。
 
-npm 从 0.2.41 起提供安装包，实验版入口为 [`dsh-nexus@next`](https://www.npmjs.com/package/dsh-nexus)，也可填写 `dsh-nexus@0.2.44` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
+npm 从 0.2.41 起提供安装包，实验版入口为 [`dsh-nexus@next`](https://www.npmjs.com/package/dsh-nexus)，也可填写 `dsh-nexus@0.2.45` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
 
 固定地址及 npm 的 `next` 标签随实验版发布更新，不需要改版本号；已安装插件从 0.2.39 起可选择空闲自动安装，见下方“插件更新”。当前固定地址指向的版本及兼容性说明见 [固定安装入口](https://github.com/yuqiguang/dsh-nexus/releases/tag/install)。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
 
-也可以从 [版本 Releases](https://github.com/yuqiguang/dsh-nexus/releases) 下载指定版本的 `.tgz` 和 `SHA256SUMS`，核对后填写本机绝对路径。Windows 示例：`C:\Users\<user>\Downloads\dsh-nexus-0.2.44.tgz`；不要填写 WSL 路径。桌面端自带安装所需的 CLI 和 pnpm。需要固定历史版本时，使用对应版本的下载链接。
+也可以从 [版本 Releases](https://github.com/yuqiguang/dsh-nexus/releases) 下载指定版本的 `.tgz` 和 `SHA256SUMS`，核对后填写本机绝对路径。Windows 示例：`C:\Users\<user>\Downloads\dsh-nexus-0.2.45.tgz`；不要填写 WSL 路径。桌面端自带安装所需的 CLI 和 pnpm。需要固定历史版本时，使用对应版本的下载链接。
 
 编码工具现在支持「推荐版本」或「指定版本」。默认推荐 Codex 0.155.1、Claude Agent SDK 0.3.273；指定时填写完整版本号，可带预发布后缀，不支持 latest、版本范围或下载地址。先保存设置，再点击安装；保存、切回推荐或更新插件均不会自动替换现有工具。页面分别显示已安装版本、待安装版本与本次安装版本。Claude 的选择指 Agent SDK 及配套程序，与 Claude Code 命令显示的版本号不同。自定义版本尚未通过本插件兼容性验证，遇到问题可切回推荐版本重新安装。编码任务或沙箱配置进行中不能替换托管程序。
 
