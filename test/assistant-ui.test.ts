@@ -48,7 +48,10 @@ test('the assistant page saves quiet hours and briefing, shows held pushes, and 
       quietStart: payload.config.quietStart || undefined, quietEnd: payload.config.quietEnd || undefined, briefingTime: payload.config.briefingTime || undefined, persona: payload.config.persona,
       speech: { baseUrl: payload.config.speech.baseUrl, model: payload.config.speech.model, apiKeyConfigured: payload.config.speech.apiKey.length > 0 },
       rotation: { daily: payload.config.rotation.daily, contextTokens: Number(payload.config.rotation.contextTokens) } },
-      quietNow: true, heldPushes: 2, nextBriefingAt: Date.parse('2026-09-20T08:00:00+08:00') };
+      // Built from local wall-clock parts on purpose. `Date.parse('…+08:00')` is an absolute
+      // instant, so the page renders it as a different clock time on any machine that is not
+      // Asia/Shanghai and the assertion below fails there — which is what a UTC CI runner is.
+      quietNow: true, heldPushes: 2, nextBriefingAt: new Date(2026, 8, 20, 8, 0, 0).getTime() };
     if (method === 'hook/rotate') return { ...view, settings: { ...view.settings, revision: view.settings.revision + 1, hookEnabled: payload.enabled },
       hookUrl: payload.enabled ? 'http://127.0.0.1:3080/nexus-hooks/inbound' : undefined, hookToken: payload.enabled ? 'minted-token-fixture' : undefined };
     if (method === 'flush') view = { ...view, heldPushes: 0 };

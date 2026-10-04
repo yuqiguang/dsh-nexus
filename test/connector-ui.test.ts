@@ -99,9 +99,12 @@ test('a failed test explains the error and keeps the draft', async t => {
 
 test('the agenda section saves its settings with the mail ones and lists, completes and removes what the assistant keeps', async t => {
   let view = initial();
-  view = { ...view, agenda: { ...view.agenda, events: 2, openTodos: 1, nextReminderAt: Date.parse('2026-09-22T14:45:00+08:00'),
-    upcoming: [{ id: 'ev-1', title: '和张老师开会', start: Date.parse('2026-09-22T15:00:00+08:00'), end: Date.parse('2026-09-22T16:00:00+08:00'), location: '会议室' }],
-    todos: [{ id: 'td-1', title: '交报告', due: Date.parse('2026-09-25T00:00:00+08:00'), dueAllDay: true, createdAt: 1 }] } };
+  // Local wall-clock parts, not `Date.parse('…+08:00')`: an absolute +08:00 instant renders as a
+  // different clock time (and can cross a date boundary) on any machine that is not Asia/Shanghai,
+  // so the rendered-string assertions below would fail on a UTC CI runner.
+  view = { ...view, agenda: { ...view.agenda, events: 2, openTodos: 1, nextReminderAt: new Date(2026, 8, 22, 14, 45, 0).getTime(),
+    upcoming: [{ id: 'ev-1', title: '和张老师开会', start: new Date(2026, 8, 22, 15, 0, 0).getTime(), end: new Date(2026, 8, 22, 16, 0, 0).getTime(), location: '会议室' }],
+    todos: [{ id: 'td-1', title: '交报告', due: new Date(2026, 8, 25).getTime(), dueAllDay: true, createdAt: 1 }] } };
   const calls: { method: string; payload: any }[] = [];
   const api: ConnectorApi = async (method, payload: any) => {
     calls.push({ method, payload });
