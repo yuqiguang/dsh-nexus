@@ -169,12 +169,38 @@ export function codexPermissionRequest(params: Record<string, unknown>, cwd: str
 
 const STEP_LIMIT = 120;
 
-/** Secrets that tend to ride along in a command line: `API_KEY=…`, `Authorization: Bearer …`, `--token …`. */
+/**
+ * Secrets that tend to ride along in a command line or in the output it prints: `API_KEY=…`,
+ * `Authorization: Bearer …`, `--token …`, `"apiKey": "…"`, and a bare credential carrying a
+ * vendor prefix.
+ *
+ * The first four only recognise the shapes a *shell* produces. A command that dumps a JSON
+ * configuration — `kubectl get -o json`, `docker inspect`, a settings file, an env dump — prints
+ * `"apiKey": "sk-…"`, which is a colon and not an `=`, so every one of them walks past it and the
+ * key reaches the activity log in full. The fifth rule is what covers that shape.
+ *
+ * Nothing here tries to detect high entropy: output is full of hashes, ids and checksums that
+ * would be masked for no reason, and a rule that guesses would still miss a credential that
+ * looks ordinary. Each pattern is a shape a secret is actually written in.
+ */
 const SECRETS: readonly [RegExp, string][] = [
   [/(https?:\/\/)[^\s/]+@/gi, '$1***@'],
   [/\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*=)(?:'[^']*'|"[^"]*"|\S+)/gi, '$1***'],
   [/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/g, '$1 ***'],
   [/(--?(?:token|password|passwd|api-key|secret)(?:=|\s+))(?:'[^']*'|"[^"]*"|\S+)/gi, '$1***'],
+  // JSON and object literals. The keyword ends the key and the value is quoted, which is how a
+  // credential is written and how a *setting* is not: `"apiKeyConfigured": true`, `token: none`
+  // and prose keep reading normally. A key that merely contains the keyword (`tokenType`,
+  // `secretName`) is left alone; one that ends with it (`monkey`, `hockey`) is masked, which is
+  // the direction to be wrong in.
+  [/(["']?[A-Za-z0-9_.-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)["']?\s*:\s*)("[^"\n]*"|'[^'\n]*')/gi, '$1***'],
+  // A credential passed with no label at all. Only prefixes that belong to one vendor, so an
+  // ordinary token-shaped string is not swallowed with it.
+  [/\bsk-(?:ant|proj)-[A-Za-z0-9_-]{10,}/g, '***'],
+  [/\b(?:ghp|gho|ghs|ghu)_[A-Za-z0-9_]{20,}/g, '***'],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, '***'],
+  [/\bxox[bpas]-[A-Za-z0-9-]{10,}/g, '***'],
+  [/\bAKIA[0-9A-Z]{16}\b/g, '***'],
 ];
 
 /** Mask secrets that tend to ride along in commands and their output. */
