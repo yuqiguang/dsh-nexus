@@ -47,11 +47,17 @@ sha256sum -c SHA256SUMS
 npm login --registry=https://registry.npmjs.org/ --browser=false
 npm whoami --registry=https://registry.npmjs.org/
 npm publish ./release/0.2.45/dsh-nexus-0.2.45.tgz --access public --tag next --registry=https://registry.npmjs.org/ --ignore-scripts
+npm dist-tag add dsh-nexus@0.2.45 latest --registry=https://registry.npmjs.org/
+npm dist-tag ls dsh-nexus --registry=https://registry.npmjs.org/
 ```
 
-若 npm 要求二次验证，在本机终端按提示完成。不要提交凭据或授权链接。实验版使用 `next`，不主动设置 `latest`；用户在 DSH“添加插件”中填写 `dsh-nexus@next` 或指定版本。
+若 npm 要求二次验证，在本机终端按提示完成；本账号的写操作（含 `npm dist-tag`）需要一次性密码，命令行补 `--otp=<六位验证码>`。不要提交凭据或授权链接。
 
-npm 发布成功后核对版本、`next` 标签、registry 的 integrity，并下载 npm tarball 比对本地 SHA256。再发布包含同一安装包的 GitHub Release，等待固定入口工作流完成并验证下载。npm 已发布版本不可覆盖；若 GitHub 后续步骤失败，保留 npm 版本并补完 GitHub 发布，不重复改包。插件内更新仍依赖 GitHub 版本附件与固定入口，发布 npm 本身不会更新插件的更新源。
+发行标签：`next` 与 `latest` 都指向最新实验版，这样在 DSH“添加插件”里直接填写 `dsh-nexus` 就能装到当前版本，而不是落到 0.0.0-stage 那个占位空包；也可以填写 `dsh-nexus@next` 或指定版本。`npm publish --tag next` **不会**移动 `latest`，所以发布后必须单独执行 `npm dist-tag add`，否则 `latest` 会一直停在旧版本。
+
+需要留意的后果：`latest` 跟随实验版，意味着只写包名的用户会直接拿到实验版，而不再有“裸包名落到稳定版”的保护；当前没有稳定的非实验版可指，如将来需要，再单独为 `latest` 指定该版本。
+
+npm 发布成功后核对版本、`next` 与 `latest` 标签、registry 的 integrity，并下载 npm tarball 比对本地 SHA256。再发布包含同一安装包的 GitHub Release，等待固定入口工作流完成并验证下载。npm 已发布版本不可覆盖；若 GitHub 后续步骤失败，保留 npm 版本并补完 GitHub 发布，不重复改包。插件内更新仍依赖 GitHub 版本附件与固定入口，发布 npm 本身不会更新插件的更新源。
 
 ## GitHub Release
 
@@ -67,7 +73,7 @@ npm 发布成功后核对版本、`next` 标签、registry 的 integrity，并�
 https://github.com/yuqiguang/dsh-nexus/releases/download/install/dsh-nexus.tgz
 ```
 
-对应校验文件为同一路径下的 `SHA256SUMS`。GitHub 的 `/releases/latest/` 不包含预发布版本，因此这里使用专门的 `install` 入口。
+对应校验文件为同一路径下的 `SHA256SUMS`。GitHub 的 `/releases/latest/` 不包含预发布版本，因此这里使用专门的 `install` 入口。所有版本都勾选预发布后，`/releases/latest/` 会返回 404，这是预期结果而非故障；插件更新只读 `install` 入口，不读这个地址。
 
 `install` 是明确可变的分发标签：工作流只更新它及其两个固定附件，页面标明实际来源版本，并指向原版本的源码和说明。更新前验证源包 SHA256，先上传候选文件再切换名称；名称切换失败时恢复旧文件。较旧版本晚发布时不会覆盖较新入口。操作由工作流串行执行；不要同时手动运行同步脚本。
 
