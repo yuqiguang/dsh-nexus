@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sameChat } from '../channels/protocol.js';
 import type { CoderBrief } from './brief.js';
 import { dependencyPassed } from './dependencies.js';
 import { isActive, type TaskRecord } from './types.js';
@@ -7,7 +8,7 @@ import { changeSummary } from './change-summary.js';
 export interface AcceptanceReview { criterion: string; evidence: string; accepted: boolean; note: string; at: number }
 
 export function briefTasks(brief: CoderBrief, records: TaskRecord[]): TaskRecord[] {
-  const tasks = records.filter(task => task.ownerSession === brief.ownerSession && task.brief?.id === brief.id && task.brief.revision === brief.revision);
+  const tasks = records.filter(task => sameChat(task.ownerSession, brief.ownerSession) && task.brief?.id === brief.id && task.brief.revision === brief.revision);
   const replaced = new Set(tasks.map(task => task.replaces ?? task.resumedFrom).filter(Boolean));
   return tasks.filter(task => !replaced.has(task.id));
 }

@@ -46,6 +46,13 @@ export interface BridgeExtras {
   /** Which generation of each chat's session is active; without it a chat keeps one session forever. */
   sessions?: SessionRosterView;
   rotation?: () => RotationSettings;
+  /**
+   * Whether the chat still has work that reports into it — today a coder task that has not settled. Such a task's result is
+   * delivered to the generation that dispatched it, so opening the next generation first leaves the user asking about work
+   * this chat's active session can no longer see (ct-4c671559). A `context` rotation waits for it; the next message after it
+   * settles still rotates, because the growth that asked for it does not go away.
+   */
+  busy?: (baseSessionId: string) => Promise<boolean>;
   /** Where the digest of a session that was just replaced goes (long-term memory). */
   memory?: { remember(text: string, sessionId: string): Promise<unknown> };
   /** The chat's base sessions under earlier bindings of the same person (WeChat: earlier bot accounts); their reminders are carried over once. */
@@ -590,8 +597,22 @@ export class DshChannelBridge {
   }
 
   /**
+   * Why this message should open the chat's next generation, if it should. Only the prompt-size reason waits: while the chat
+   * still owns work that reports into it, the generation that dispatched it is the one that can answer a question about it,
+   * and rotating first sent `有结果了吗` to a session with no task record at all (ct-4c671559). A new conversation day, an
+   * archived session or a moved workspace still rotate, whatever is running — those generations cannot answer at all — and
+   * `/new` is the user asking for it.
+   */
+  private async rotationReason(base: SessionId, events: readonly SessionEvent[], timeZone: string): Promise<RotationReason | undefined> {
+    const due = rotationDue(events, this.now(), timeZone, this.extras.rotation?.() ?? DEFAULT_ROTATION);
+    if (due !== 'context' || !this.extras.busy) return due;
+    // A collaborator that cannot answer must not hold the chat open: trouble reading the task store is not work.
+    return await this.extras.busy(base).catch(() => false) ? undefined : due;
+  }
+
+  /**
    * Open the chat's next generation when one is due (a new conversation day,
-   * a prompt over the limit, the user's `/new`, the current session having
+   * a prompt over the limit while nothing of the chat's is still running, the user's `/new`, the current session having
    * been archived, or the channel's directory having changed) and return it; `undefined` when the current one stays. Native reminders keep their original session binding, and a
    * digest of what it was about goes to memory. Must run on the chat's chain.
    */
@@ -600,7 +621,7 @@ export class DshChannelBridge {
     const current = SessionId(roster.activeFor(base));
     const events = await this.eventsOf(current);
     const timeZone = this.extras.timeZone?.() ?? DEFAULT_TIME_ZONE;
-    const reason = force ?? rotationDue(events, this.now(), timeZone, this.extras.rotation?.() ?? DEFAULT_ROTATION);
+    const reason = force ?? await this.rotationReason(base, events, timeZone);
     // A session the user archived in the Web UI answers nothing: DSH's archive gate rejects every one of
     // its steps, so the turn ends `blocked` and no model call is made. The chat has to move on, whatever
     // the calendar or the prompt size say — and it does, even when the session never had a user turn,

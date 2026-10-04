@@ -132,6 +132,7 @@ test('assistant settings keep rotation with validation and expose it in the view
 
 /** A bridge over fake sessions whose logs the test controls, with a roster and a memory sink. */
 function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: number }; roster?: boolean; failCreate?: (sessionId: string) => boolean; failFlush?: (sessionId: string) => boolean; failAttach?: (sessionId: string) => boolean; failList?: boolean; sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  busy?: (base: string) => Promise<boolean>;
   formerBases?: () => Promise<string[]>; onResolve?: (id: string, session: { append(type: string, data: unknown): unknown }) => void } = {}) {
   let clock = T0;
   const owner = { channel: 'wechat' as const, accountId: 'rot-bot', ownerId: 'rot-owner' };
@@ -222,6 +223,7 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
     const roster = await rosterPromise;
     const bridge = new DshChannelBridge(ctx, transport, owner, dir, code => codes.push(code), { firstMs: 60_000, everyMs: 300_000 }, () => clock, {
       ledger, timeZone: () => ZONE, ...(options.roster === false ? {} : { sessions: roster }), rotation: () => options.rotation ?? DEFAULT_ROTATION,
+      ...(options.busy ? { busy: options.busy } : {}),
       memory: { async remember(text, sessionId) { remembered.push({ text, sessionId }); } }, ...(options.formerBases ? { formerBases: options.formerBases } : {}) });
     return bridge;
   };
@@ -299,6 +301,33 @@ test('an oversized context rotates; /new rotates on demand and refuses an empty 
   assert.equal(plain.prompts.at(-1)!.sessionId, plain.base);
   await fixed.receive(plain.inbound('n1', '/new'));
   assert.equal(plain.texts.at(-1), '这个渠道没有开启会话换新。');
+});
+
+test('a conversation that grew past the limit keeps its generation while the chat still has work running', async t => {
+  // The message that trips the limit is usually the one asking about that work, and the task's result is delivered to the
+  // generation that dispatched it: rotating first sent 有结果了吗 to a session with no task record at all while the task was
+  // still running (ct-4c671559). The next message after it settles rotates as it always would.
+  let busy = true;
+  const f = bridgeFixture({ rotation: { daily: true, contextTokens: 50_000 }, busy: async () => busy });
+  const bridge = await f.make();
+  t.after(() => bridge.close());
+  const old = f.sessionOf(f.base);
+  for (const event of userTurn(1, '读这本书', '读完了', T0, { inputTokens: 1_000, cacheReadTokens: 16_000 })) old.snapshotEvents().push(event);
+  for (const event of userTurn(2, '继续', '好', T0 + 60_000, { inputTokens: 1_000, cacheReadTokens: 70_000 })) old.snapshotEvents().push(event);
+  await bridge.receive(f.inbound('m1', '有结果了吗'));
+  assert.equal(f.prompts.at(-1)!.sessionId, f.base, 'the answer stays in the conversation that can read the task');
+  assert.ok(!f.created.includes(`${f.base}-1`));
+  busy = false;
+  await bridge.receive(f.inbound('m2', '那现在呢'));
+  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`, 'the growth that asked for a rotation is still there once the work settles');
+  assert.equal(f.texts.at(-1), ROTATION_NOTICES.context);
+  for (const event of userTurn(3, '那现在呢', '好', T0 + 120_000)) f.sessionOf(`${f.base}-1`).snapshotEvents().push(event);
+  // A new conversation day is not held back by running work: that generation cannot answer the message at all.
+  busy = true;
+  f.advance(30 * HOUR);
+  await bridge.receive(f.inbound('m3', '早上好'));
+  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-2`);
+  assert.equal(f.texts.at(-1), ROTATION_NOTICES.day);
 });
 
 test('after a restart the previous generation is still routed: its late turn is delivered once and the status reply reads the active one', async t => {

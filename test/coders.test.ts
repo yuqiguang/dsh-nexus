@@ -8,7 +8,7 @@ import { runClaudeTask, type ClaudeQuery, type ClaudeStreamMessage } from '../sr
 import { escalateToUser, type EscalationHost } from '../src/coders/escalate.js';
 import { normalizeClaudeRequest } from '../src/coders/normalize.js';
 import { coderPrompt } from '../src/coders/brief.js';
-import { hardRule, isInside, isProtectedPath } from '../src/coders/rules.js';
+import { commandPathTokens, hardRule, isInside, isProtectedPath } from '../src/coders/rules.js';
 import { CoderStore, taskSchema, type CoderDomain, type DomainOpener } from '../src/coders/store.js';
 import type { CoderRequest, TaskRecord } from '../src/coders/types.js';
 import { changedFiles, runVerifyCommand, snapshotWorkTree, verifyTask } from '../src/coders/verify.js';
@@ -216,6 +216,12 @@ test('a bare relative package config in a command stays protected: its working d
   assert.equal(hardRule(command('cd /home/dev && cat .npmrc'), ['/home/dev/project'])?.verdict, 'deny');
   assert.equal(hardRule(command('cat ./sub/.npmrc'), ['/home/dev/project'])?.verdict, 'deny', 'a relative prefix names no fixed directory either');
   assert.equal(hardRule(command('cat /home/dev/project/.npmrc'), ['/home/dev/project']), undefined, 'the absolute form still works');
+});
+
+test('command path tokens keep quoting out and split a quoted inner command line', () => {
+  assert.deepEqual(commandPathTokens('git check-ignore -v .env.example'), ['git', 'check-ignore', '-v', '.env.example']);
+  assert.deepEqual(commandPathTokens('bash -c "cat .env"'), ['bash', '-c', 'cat', '.env']);
+  assert.deepEqual(commandPathTokens("grep -n 'app/main.ts' src"), ['grep', '-n', 'app/main.ts', 'src']);
 });
 
 test('a system npm config is protected even though its name has no leading dot', () => {
@@ -850,6 +856,62 @@ test('dispatch defaults to its native session, reports the directory, and resume
   harness.session.header!.cwd = channel;
   await assert.rejects(harness.run('coder_package', { task_id: first.task_id, files: ['hello.txt'] }), /工作区/);
   await assert.rejects(harness.run('coder_task', { description: 'continue elsewhere', resume_task_id: resumed.task_id }), /当前会话工作区/);
+});
+
+test('a chat\'s tasks stay readable and continuable after the chat rotates to a later generation', async t => {
+  // A rotation opens the next generation of the same chat. The task keeps the session that dispatched it — its timing, its
+  // delivery history and its permissions stay there — but the chat owns it, so the new generation is not left saying there is
+  // no task while the old conversation's result is being pushed to the user (ct-4c671559).
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-rotation-visibility-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  const query = scriptedQuery(async function* () {
+    yield { type: 'system', subtype: 'init', session_id: 'chat-session' };
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [workspace], query, defaultCoder: 'claude' });
+  const chat = `nexus-wechat-${'a'.repeat(32)}`;
+  const other = `nexus-wechat-${'b'.repeat(32)}`;
+  const first = await harness.run('coder_task', { description: 'add the env loader' }, `${chat}-6`);
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(first.task_id!)!.ownerSession, `${chat}-6`, 'the task stays with the session that ran it');
+  assert.match((await harness.run('coder_status', { task_id: first.task_id }, `${chat}-7`)).text!, new RegExp(first.task_id!));
+  assert.match((await harness.run('coder_status', {}, `${chat}-7`)).text!, new RegExp(first.task_id!));
+  // "换成 claude 接着做" said in the newer generation continues the older generation's task instead of dispatching a duplicate.
+  const resumed = await harness.run('coder_task', { description: 'add the env loader', resume_task_id: first.task_id }, `${chat}-7`);
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(resumed.task_id!)!.resumedFrom, first.task_id);
+  const wanted = harness.tasks.get(first.task_id!);
+  assert.equal(wanted!.id, first.task_id, 'the original record is untouched');
+  // Another chat stays another chat, and a local session is not a chat at all.
+  await assert.rejects(harness.run('coder_status', { task_id: first.task_id }, `${other}-6`), /没有编码任务/);
+  await assert.rejects(harness.run('coder_status', { task_id: first.task_id }, 'session-4d8bb0c5'), /没有编码任务/);
+  await assert.rejects(harness.run('coder_task', { description: 'x', resume_task_id: first.task_id }, `${other}-6`), /没有编码任务/);
+  assert.equal((await harness.run('coder_status', {}, 'session-4d8bb0c5')).text, '还没有编码任务。');
+  assert.equal((await harness.run('coder_status', {}, `${other}-6`)).text, '还没有编码任务。');
+});
+
+test('the task panel lists the chat\'s running work across generations, but places a finished result only in its own conversation', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-rotation-panel-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  let finish!: () => void;
+  const query = scriptedQuery(async function* () {
+    await new Promise<void>(resolve => { finish = resolve; });
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  const rpc = new Map<string, (payload: unknown) => Promise<unknown>>();
+  await installCoders(harness.ctx, { roots: [workspace], query, defaultCoder: 'claude',
+    registerRpc: (family, methods, handle) => { for (const method of methods) rpc.set(`${family}:${method}`, payload => handle(method, payload)); } });
+  const chat = `nexus-wechat-${'c'.repeat(32)}`;
+  const ids = async (owner: string) => (await rpc.get('nexus-coder-tasks:list')!({ ownerSession: owner }) as { id: string }[]).map(task => task.id);
+  const started = await harness.run('coder_task', { description: 'long job' }, `${chat}-6`);
+  await until(() => !!finish, 'coder starts');
+  assert.ok((await ids(`${chat}-7`)).includes(started.task_id!), 'a rotation must not empty the panel of running work');
+  finish();
+  await Promise.all(harness.jobs.map(job => job.done));
+  assert.ok(!(await ids(`${chat}-7`)).includes(started.task_id!), 'a finished result belongs to the conversation that reported it');
+  assert.ok((await ids(`${chat}-6`)).includes(started.task_id!), 'and that conversation still shows it');
 });
 
 test('queued task rechecks its session workspace before starting the coder', async t => {

@@ -37,6 +37,16 @@ export function baseSessionOf(sessionId: string): string {
   return sessionId.replace(/^(nexus-(?:wechat|feishu|wecom)-[a-f0-9]{32})-\d+$/, '$1');
 }
 
+/**
+ * Whether two session ids are the same conversation. A chat rotates by opening the next generation of itself, and its work
+ * belongs to the chat rather than to the generation that happened to start it: a task dispatched before a rotation still
+ * reports into the chat, so every generation of that chat may read and continue it (ct-4c671559). `baseSessionOf` leaves ids
+ * that are not channel sessions untouched, so two unrelated desktop sessions never match each other.
+ */
+export function sameChat(a: string | undefined, b: string | undefined): boolean {
+  return !!a && !!b && baseSessionOf(a) === baseSessionOf(b);
+}
+
 export type Command = { kind: 'cancel' | 'status' | 'new' } | { kind: 'approve' | 'deny'; token?: string }
   | { kind: 'answer'; token?: string; value: string };
 export function parseCommand(text: string): Command | undefined {

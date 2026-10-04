@@ -1,3 +1,4 @@
+import { sameChat } from '../channels/protocol.js';
 import { analyzeChange, type BriefChange } from './change.js';
 import { recoveryReport } from './recovery.js';
 import { briefTasks, criterionEvidence, deliveryReport, type AcceptanceReview } from './delivery.js';
@@ -27,7 +28,11 @@ const inputSchema = z.object({ objective: z.string().trim().min(1).max(4000), co
 export const briefDomain = defineDomain({ name: 'nexus_coder_briefs', version: 1, layout: 'per-record',
   tables: { briefs: domainTable<string, CoderBrief>(briefSchema) } });
 
-/** Planning evidence only. No execution lifecycle or autonomous recovery is stored here. */
+/**
+ * Planning evidence only. No execution lifecycle or autonomous recovery is stored here. A brief belongs to the chat, not to
+ * one generation of it: a rotating chat keeps asking about a goal it set earlier, so every generation of the same chat may
+ * read and revise it (ct-4c671559).
+ */
 export class BriefStore {
   constructor(private readonly domain: Domain<typeof briefDomain>) {}
   private readonly changing = new Set<string>();
@@ -35,10 +40,10 @@ export class BriefStore {
   private get table() { return this.domain.table('briefs'); }
   get(id: string, owner: string): CoderBrief {
     const brief = this.table.get(id);
-    if (!brief || brief.ownerSession !== owner) throw new Error('任务说明单不存在或不属于当前会话。');
+    if (!brief || !sameChat(brief.ownerSession, owner)) throw new Error('任务说明单不存在或不属于当前会话。');
     return brief;
   }
-  list(owner: string): CoderBrief[] { return [...this.table.entries()].map(([, brief]) => brief).filter(brief => brief.ownerSession === owner).sort((a, b) => b.updatedAt - a.updatedAt); }
+  list(owner: string): CoderBrief[] { return [...this.table.entries()].map(([, brief]) => brief).filter(brief => sameChat(brief.ownerSession, owner)).sort((a, b) => b.updatedAt - a.updatedAt); }
   async save(owner: string, input: unknown, id?: string, revision?: number): Promise<CoderBrief> {
     if (id && this.changing.has(id)) throw new Error('说明单正在应用变更，请稍后重试。');
     const existing = id ? this.get(id, owner) : undefined;
@@ -49,7 +54,7 @@ export class BriefStore {
     if (id) {
       this.get(id, owner);
       return this.table.update(id, current => {
-        if (current.ownerSession !== owner || current.revision !== revision) throw new Error('任务说明单版本已变化，请重新读取后再修改。');
+        if (!sameChat(current.ownerSession, owner) || current.revision !== revision) throw new Error('任务说明单版本已变化，请重新读取后再修改。');
         return { ...current, ...fields, plan: undefined, answers: undefined, reviews: undefined, revision: current.revision + 1, updatedAt: Date.now() };
       });
     }
@@ -62,7 +67,7 @@ export class BriefStore {
     const brief = this.get(id, owner);
     const plan = validatePlan(input, brief.acceptance);
     return this.table.update(id, current => {
-      if (current.ownerSession !== owner || current.revision !== revision) throw new Error('任务说明单版本已变化，请重新读取后再保存计划。');
+      if (!sameChat(current.ownerSession, owner) || current.revision !== revision) throw new Error('任务说明单版本已变化，请重新读取后再保存计划。');
       return { ...current, plan, answers: undefined, reviews: undefined, revision: current.revision + 1, updatedAt: Date.now() };
     });
   }
@@ -70,7 +75,7 @@ export class BriefStore {
   async bindDirectory(id: string, owner: string, revision: number, cwd: string): Promise<void> {
     this.get(id, owner);
     await this.table.update(id, current => {
-      if (current.ownerSession !== owner || current.revision !== revision || this.changing.has(id)) throw new Error('任务说明单版本已变化，请重新读取后再派发。');
+      if (!sameChat(current.ownerSession, owner) || current.revision !== revision || this.changing.has(id)) throw new Error('任务说明单版本已变化，请重新读取后再派发。');
       if (current.cwd && !isInside(current.cwd, cwd)) throw new Error(`任务目录必须位于说明单绑定的项目目录内：${current.cwd}`);
       return current.cwd ? current : { ...current, cwd };
     });
@@ -87,7 +92,7 @@ export class BriefStore {
   async review(id: string, owner: string, revision: number, review: AcceptanceReview): Promise<void> {
     this.get(id, owner);
     await this.table.update(id, current => {
-      if (current.ownerSession !== owner || current.revision !== revision) throw new Error('验收期间目标已变化，请重新核对。');
+      if (!sameChat(current.ownerSession, owner) || current.revision !== revision) throw new Error('验收期间目标已变化，请重新核对。');
       return { ...current, updatedAt: Date.now(), reviews: [...(current.reviews ?? []).filter(item => item.criterion !== review.criterion), review] };
     });
   }
@@ -128,7 +133,7 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
     lines.push(`- ${criterion.id}：${criterion.text} — ${state}${related.length ? `（${related.map(task => task.id).join('、')}）` : ''}`);
   }
   if (brief.plan) lines.push('步骤计划（依赖顺序；尚未派发不代表已执行）：', ...brief.plan.map(step => `${step.id}：${step.description}；验收项 ${step.acceptance_ids.join('、')}；前置步骤 ${step.depends_on.join('、') || '无'}；验证 ${step.verify}`));
-  const obsolete = records.filter(task => task.ownerSession === brief.ownerSession && task.brief?.id === brief.id && task.brief.revision !== brief.revision && isActive(task));
+  const obsolete = records.filter(task => sameChat(task.ownerSession, brief.ownerSession) && task.brief?.id === brief.id && task.brief.revision !== brief.revision && isActive(task));
   if (obsolete.length) lines.push(`旧版本仍有活动任务：${obsolete.map(task => task.id).join('、')}。运行中的任务仍按原说明执行；修改说明单不会自动调整已运行任务，请明确停止或调整它们。`);
   lines.push('任务结果：', ...(tasks.length ? tasks.slice(0, 50).map(task => {
     const changes = changeSummary(task.result?.changedFiles ?? []);
@@ -176,7 +181,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
       if (args.action === 'impact' || args.action === 'amend') {
         const brief = store.get(args.brief_id!, owner);
         const change = analyzeChange(brief, args);
-        const active = records().filter(task => task.ownerSession === owner && task.brief?.id === brief.id && isActive(task));
+        const active = records().filter(task => sameChat(task.ownerSession, owner) && task.brief?.id === brief.id && isActive(task));
         const impact = `受影响步骤：${change.affected.join('、') || '未发现结构变化'}；应用时会停止旧版本活动任务：${active.map(task => task.id).join('、') || '无'}。新版本需要重新核对验收，旧记录保留。`;
         if (args.action === 'impact') return { text: impact };
         const amended = await store.amend(brief.id, owner, args.revision, change, async () => {

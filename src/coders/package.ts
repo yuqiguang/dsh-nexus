@@ -8,6 +8,7 @@ import type { Session } from '@deepseek-ai/dsh-session';
 import { lstat, mkdir, open } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { readDelivery, MAX_DELIVERY_BYTES } from '../channels/files.js';
+import { sameChat } from '../channels/protocol.js';
 import { canonical } from './permissions.js';
 import { isInside, isProtectedPath, isEnvironmentTemplate, isProjectEnvironment } from './rules.js';
 import { safeEnvironmentTemplate } from './environment-files.js';
@@ -111,7 +112,7 @@ export function installCoderPackaging(ctx: Context, tasks: () => TaskRecord[], r
     output: { schema: { type: 'object', additionalProperties: false, properties: { path: { type: 'string', required: true }, files: { type: 'array', items: { type: 'string' }, required: true } } },
       render: (_args, value) => [{ type: 'text', text: `已生成完整文件归档：${value.path}\n包含：${value.files.join('、')}\n尚未发送；请 present 此 zip，并告知用户解压后打开入口。静态资源已核对，动态加载和外部资源仍需运行验证。` }] },
     async execute(args, exec) {
-      const task = tasks().find(task => task.id === args.task_id && task.ownerSession === exec.agent?.id);
+      const task = tasks().find(task => task.id === args.task_id && sameChat(task.ownerSession, exec.agent?.id));
       if (!task || isActive(task)) throw new Error('只能打包本会话已结束的编码任务。');
       if (!exec.agent) throw new Error('打包需要所属会话。');
       const policy = ctx.sandboxPolicy.resolve({ session: exec.agent.session });
@@ -130,7 +131,7 @@ export function installCoderPackaging(ctx: Context, tasks: () => TaskRecord[], r
     for (const item of files ?? []) {
       if (typeof item.path !== 'string' || !/\.html?$/i.test(item.path)) continue;
       const path = resolve(exec.agent.session.header.cwd ?? ctx.sandboxPolicy.resolve({ session: exec.agent.session }).workspaceRoot, item.path);
-      const task = tasks().find(task => task.ownerSession === exec.agent!.id && isInside(task.cwd, path));
+      const task = tasks().find(task => sameChat(task.ownerSession, exec.agent!.id) && isInside(task.cwd, path));
       if (!task) continue;
       try {
         if (await canonical(task.cwd) !== resolve(task.cwd)) throw new Error('任务目录已改变。');
