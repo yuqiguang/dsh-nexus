@@ -47,7 +47,7 @@ Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话
 3. 先打开 **设置 → 编码工具** 完成上面的首次任务，再按需配置 **渠道连接** 和其他扩展。
 4. 需要提醒功能时，在 **插件 → 官方** 启用 **自动化任务**（`@deepseek-ai/dsh-experimental-schedule-bundle`）。
 
-npm 从 0.2.41 起提供安装包，实验版入口为 [`dsh-nexus@next`](https://www.npmjs.com/package/dsh-nexus)，也可填写 `dsh-nexus@0.2.45` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
+npm 从 0.2.41 起提供安装包，实验版入口为 [`dsh-nexus@next`](https://www.npmjs.com/package/dsh-nexus)，直接填写 `dsh-nexus` 也可（`latest` 与 `next` 均指向最新实验版），或填写 `dsh-nexus@0.2.45` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
 
 固定地址及 npm 的 `next` 标签随实验版发布更新，不需要改版本号；已安装插件从 0.2.39 起可选择空闲自动安装，见下方“插件更新”。当前固定地址指向的版本及兼容性说明见 [固定安装入口](https://github.com/yuqiguang/dsh-nexus/releases/tag/install)。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
 
