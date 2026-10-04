@@ -914,6 +914,27 @@ test('the task panel lists the chat\'s running work across generations, but plac
   assert.ok((await ids(`${chat}-6`)).includes(started.task_id!), 'and that conversation still shows it');
 });
 
+test('a cancelled task does not wait in the dock for a notice that will never come', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-dock-cancelled-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  let rpc!: (method: string, payload: unknown) => Promise<unknown>;
+  await installCoders(harness.ctx, { roots: [workspace], defaultCoder: 'claude', registerRpc: (_family, _methods, handle) => { rpc = handle; } });
+  const owner = task().ownerSession;
+  const ran = { startedAt: 1_700_000_000_000 };
+  // DSH posts no job notice for a job the owner cancelled, so these cards can never be placed into the conversation: they
+  // used to sit above the input box until dismissed by hand, and a reload brought them back. A cancellation is the owner's
+  // own act, so the card goes; the record and its detail view stay, and 设置 › 最近任务 still opens them.
+  harness.tasks.set('ran-cancelled', task({ id: 'ran-cancelled', status: 'cancelled', ...ran }));
+  harness.tasks.set('queued-cancelled', task({ id: 'queued-cancelled', status: 'cancelled' }));
+  harness.tasks.set('ran-failed', task({ id: 'ran-failed', status: 'failed', ...ran }));
+  harness.tasks.set('ran-completed', task({ id: 'ran-completed', status: 'completed', ...ran }));
+  harness.tasks.set('running', task({ id: 'running', status: 'running', ...ran }));
+  const listed = (await rpc('list', { ownerSession: owner }) as { id: string }[]).map(item => item.id).sort();
+  assert.deepEqual(listed, ['ran-completed', 'ran-failed', 'running'], 'a cancelled task leaves no card nothing could ever place');
+  assert.equal((await rpc('get', { id: 'ran-cancelled', brief: true }) as { id: string }).id, 'ran-cancelled', 'the record and its detail view are untouched');
+});
+
 test('queued task rechecks its session workspace before starting the coder', async t => {
   const workspace = await mkdtemp(join(tmpdir(), 'nexus-queued-workspace-'));
   t.after(() => rm(workspace, { recursive: true, force: true }));

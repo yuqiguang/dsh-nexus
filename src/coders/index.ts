@@ -199,6 +199,18 @@ function currentActivity(task: TaskRecord, now = Date.now()): string | undefined
   return task.activity;
 }
 
+/**
+ * Whether a settled task keeps its place in the dock. A result waits there only while the job notice that places it into the
+ * conversation is still to come, and DSH announces no notice for a job the owner cancelled: every cancelled record in the
+ * desktop store carries none, while every settled task that ran and was not cancelled carries one. Such a card could never
+ * be placed, so it sat above the input box until the owner dismissed it by hand, and a reload brought it back — a dismissal
+ * lasts only as long as the panel stays mounted. Cancellation is the owner's own act and there is no result to read, so the
+ * card goes; the record, its partial changes and 查看过程 stay reachable through 设置 › 最近任务.
+ */
+function awaitsNotice(task: Pick<TaskRecord, 'status'>): boolean {
+  return task.status !== 'cancelled';
+}
+
 export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaited<ReturnType<typeof verifyTask>>): string {
   const count = (layer: DecisionRecord['layer']) => task.decisions.filter(decision => decision.layer === layer).length;
   const changes = changeSummary(verify.changedFiles);
@@ -1078,8 +1090,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       // The task panel belongs to the chat, not to one of its generations: live work stays listed across a rotation, because
       // asking about it from the new generation must not find an empty panel (ct-4c671559). A finished result is placed by
       // the conversation that reported it, so only the caller's own generation contributes those; the chat's whole backlog
-      // would otherwise reappear as a wall of dismissible cards.
-      const tasks = store.list().filter(task => isActive(task) ? sameChat(task.ownerSession, ownerSession) : task.ownerSession === ownerSession);
+      // would otherwise reappear as a wall of dismissible cards. A cancelled task never gets such a notice, so it is left
+      // out entirely rather than leaving a card nothing can place.
+      const tasks = store.list().filter(task => isActive(task) ? sameChat(task.ownerSession, ownerSession)
+        : task.ownerSession === ownerSession && awaitsNotice(task));
       const active = tasks.filter(isActive);
       const recent = tasks.filter(task => !isActive(task)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
       return [...active, ...recent].map(task => ({ ...taskSummary(task, currentActivity(task)),
