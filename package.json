@@ -1,6 +1,6 @@
 {
   "name": "dsh-nexus",
-  "version": "0.2.47",
+  "version": "0.2.48",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/",
@@ -71,7 +71,7 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "1.66.1",
+    "@larksuiteoapi/node-sdk": "1.74.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@npmcli/config": "10.4.2",
     "@wecom/aibot-node-sdk": "1.0.7",
