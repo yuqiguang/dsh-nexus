@@ -10,10 +10,19 @@ type RestClient = { im: { v1: {
 } } };
 type Socket = { start(input: unknown): Promise<void>; close(input: { force: boolean }): void };
 type Dispatcher = { register(handlers: Record<string, (raw: unknown) => Promise<void>>): Dispatcher };
-type LarkModule = {
+export type LarkModule = {
   Client: new (config: unknown) => RestClient;
   WSClient: new (config: unknown) => Socket;
   EventDispatcher: new (config: unknown) => Dispatcher;
+};
+
+/**
+ * The SDK is loaded lazily so the disabled Web-only profile never pays for it, and through an indirection so the
+ * type checker does not have to load its generated declaration file (tens of thousands of lines) on every `check`.
+ */
+const loadLarkSdk = async (): Promise<LarkModule> => {
+  const moduleName = '@larksuiteoapi/node-sdk';
+  return await import(moduleName) as LarkModule;
 };
 
 export class LarkTransport implements ChannelTransport {
@@ -22,12 +31,12 @@ export class LarkTransport implements ChannelTransport {
   private readonly lifetime = new AbortController();
 
   constructor(private readonly config: FeishuConfig, private readonly report: (code: string) => void,
-    private readonly state: (state: ConnectionState) => void = () => {}) {}
+    private readonly state: (state: ConnectionState) => void = () => {},
+    private readonly load: () => Promise<LarkModule> = loadLarkSdk) {}
 
   async start(receive: (message: InboundMessage) => Promise<void>): Promise<void> {
     // Do not load the SDK or connect to Feishu in the disabled Web-only profile.
-    const moduleName = '@larksuiteoapi/node-sdk';
-    const sdk = await import(moduleName) as LarkModule;
+    const sdk = await this.load();
     this.lifetime.signal.throwIfAborted();
     // SDK error payloads can contain request credentials. Report stable local codes only.
     const silentLogger = Object.fromEntries(['trace', 'debug', 'info', 'warn', 'error'].map(key => [key, () => {}]));
