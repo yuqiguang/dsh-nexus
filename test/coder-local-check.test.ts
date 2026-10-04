@@ -9,10 +9,14 @@ import type { Context } from '@deepseek-ai/cordis';
 import { spawnTaskProcess, closeTaskProcess } from '../src/coders/process.js';
 import { localCheck } from '../src/coders/local-check.js';
 import { snapshotWorkTree, changedFiles, verifyTask } from '../src/coders/verify.js';
+import { hasUserNamespaces, missingLocalCheckDependency } from './helpers.js';
 
 const ctx = { sandbox: { async confine(argv: string[]) { return { argv, enforcement: 'full' }; } } } as unknown as Context;
 
-test('local check connects only within its namespace and cannot write outside the workspace', { skip: process.platform !== 'linux' }, async () => {
+const noSandbox = missingLocalCheckDependency();
+const noNamespaces = hasUserNamespaces() ? undefined : 'unprivileged user namespaces are disabled';
+
+test('local check connects only within its namespace and cannot write outside the workspace', { skip: noSandbox }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-local-'));
   const outside = join(homedir(), `.nexus-outside-${Date.now()}`);
   const host = createServer((_, res) => res.end('host'));
@@ -37,7 +41,7 @@ test('local check connects only within its namespace and cannot write outside th
   } finally { host.closeAllConnections(); await new Promise<void>(resolve => host.close(() => resolve())); await rm(root,{recursive:true,force:true}); await rm(outside,{force:true}); }
 });
 
-test('ending a coder process kills detached descendants with inherited pipes', { skip: process.platform !== 'linux' }, async () => {
+test('ending a coder process kills detached descendants with inherited pipes', { skip: noNamespaces }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-process-'));
   try {
     await writeFile(join(root, 'parent.cjs'), `const {spawn}=require('child_process'); const c=spawn(process.execPath,['-e',\"setInterval(()=>require('fs').appendFileSync('heartbeat','x'),20)\"],{detached:true,stdio:'ignore'});c.unref();setInterval(()=>{},1000);`);
@@ -78,7 +82,7 @@ test('independent verification binds an explicit project directory and explains 
   } finally {await rm(root,{recursive:true,force:true});}
 });
 
-test('cancelling a local check stops its detached background writers', {skip:process.platform!=='linux'}, async () => {
+test('cancelling a local check stops its detached background writers', {skip:noSandbox}, async () => {
   const root=await mkdtemp(join(tmpdir(),'nexus-check-cancel-'));
   const controller=new AbortController();
   try {
@@ -93,7 +97,7 @@ test('cancelling a local check stops its detached background writers', {skip:pro
   } finally {controller.abort();await rm(root,{recursive:true,force:true});}
 });
 
-test('Claude custom spawn drains large stderr and cleans detached children on natural completion', {skip:process.platform!=='linux',timeout:10000}, async () => {
+test('Claude custom spawn drains large stderr and cleans detached children on natural completion', {skip:noNamespaces,timeout:10000}, async () => {
   const {runClaudeTask}=await import('../src/coders/claude.js');
   const {taskPermissions}=await import('../src/coders/permissions.js');
   const root=await mkdtemp(join(tmpdir(),'nexus-claude-process-'));

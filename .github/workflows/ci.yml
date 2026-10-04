@@ -22,6 +22,10 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
+      # The confined local-check tests need bubblewrap and iproute2; the runner image ships
+      # iproute2 but not bubblewrap, and the tests skip (with a reason) rather than silently
+      # pass when it is missing. Install it so the real isolation keeps being exercised in CI.
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap iproute2
       # Serial on purpose: the suite runs against `dist/`, so `check` must pass and `build` must
       # finish before `test` starts. See CONTRIBUTING.
       - run: npm run check
