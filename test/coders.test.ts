@@ -1,3 +1,4 @@
+import { CODEX_RESULT_SCHEMA, parseTurnResult } from '../src/coders/turn-result.js';
 import assert from 'node:assert/strict';
 import type { RetryNotice } from '../src/coders/retry.js';
 import { test } from 'node:test';
@@ -65,6 +66,9 @@ test('full access uses native Claude bypass, allows protected requests, but reta
   assert.equal(record.permissions?.securityMode, 'full');
   assert.equal(harness.asked.length, 1, 'only goal clarification reaches the owner');
   assert.equal(record.decisions.some(d => d.layer === 'supervisor'), false);
+  assert.equal(record.timing?.phase, undefined);
+  assert.equal(record.timing?.reviews, 0);
+  assert.match((await harness.run('coder_status', { task_id: record.id })).text!, /耗时分项/);
   const stopped = await options.canUseTool('Bash', { command: 'echo after completion' }, { signal: options.abortController.signal });
   assert.equal(stopped.behavior, 'deny');
   await assert.rejects(harness.run('coder_task', { description: 'resume', resume_task_id: dispatched.task_id }, 'another-owner'));
@@ -555,12 +559,12 @@ test('the task store keeps records in native storage and marks live tasks interr
   assert.ok(updated.updatedAt >= 9);
 });
 
-import { APP_SERVER_ARGS, runCodexTask, trailingQuestion, type CodexProcess } from '../src/coders/codex.js';
+import { APP_SERVER_ARGS, runCodexTask, type CodexProcess } from '../src/coders/codex.js';
 import { codexCommandRequest, codexFileChangeRequest, codexQuestionRequest, codexTextQuestion } from '../src/coders/normalize.js';
 
 /** A scripted app-server: replies to client requests and pushes server requests and notifications. */
 function fakeCodex(script: (io: { sent: Record<string, unknown>[]; push(message: Record<string, unknown>): void;
-  reply(id: unknown, result: unknown): void; onWrite(handler: (message: Record<string, unknown>) => void): void }) => void) {
+  reply(id: unknown, result: unknown): void; onWrite(handler: (message: Record<string, unknown>) => void): void }) => void, rawResults = false) {
   const sent: Record<string, unknown>[] = [];
   const queue: string[] = [];
   let wake: (() => void) | undefined;
@@ -568,7 +572,26 @@ function fakeCodex(script: (io: { sent: Record<string, unknown>[]; push(message:
   let exit: (code: number | null) => void = () => {};
   const exited = new Promise<number | null>(resolve => { exit = resolve; });
   const handlers: ((message: Record<string, unknown>) => void)[] = [];
-  const push = (message: Record<string, unknown>) => { queue.push(JSON.stringify(message)); wake?.(); };
+  let finalText = 'done';
+  const push = (message: Record<string, unknown>) => {
+    // The fake provider honors the requested native output schema by default.
+    // Protocol-error tests opt out; question tests explicitly emit needs_input.
+    message = structuredClone(message);
+    const wrap = (item: any) => {
+      if (item?.type === 'agentMessage' && typeof item.text === 'string') {
+        if (!rawResults && !parseTurnResult(item.text)) item.text = JSON.stringify({ status: 'completed', text: item.text });
+        finalText = item.text;
+      }
+      return item;
+    };
+    const params = message.params as any;
+    if (message.method === 'item/completed') wrap(params?.item);
+    if (message.method === 'turn/completed' && params?.turn?.status === 'completed' && !rawResults) {
+      params.turn.items = (params.turn.items ?? []).map(wrap);
+      if (!params.turn.items.some((item: any) => item.type === 'agentMessage')) params.turn.items.push({ type: 'agentMessage', id: 'fixture-final', text: parseTurnResult(finalText) ? finalText : JSON.stringify({ status: 'completed', text: finalText }) });
+    }
+    queue.push(JSON.stringify(message)); wake?.();
+  };
   const io = { sent, push, reply: (id: unknown, result: unknown) => {
     const request = sent.find(message => message.id === id);
     if ((request?.method === 'thread/start' || request?.method === 'thread/resume') && result && typeof result === 'object') {
@@ -579,7 +602,7 @@ function fakeCodex(script: (io: { sent: Record<string, unknown>[]; push(message:
     push({ jsonrpc: '2.0', id, result });
   }, onWrite: (handler: typeof handlers[number]) => { handlers.push(handler); } };
   const process: CodexProcess = {
-    write(line) { const message = JSON.parse(line) as Record<string, unknown>; sent.push(message); for (const handler of handlers) handler(message); },
+    write(line) { const message = JSON.parse(line) as Record<string, unknown>; if (message.method === 'turn/start') assert.deepEqual((message.params as any).outputSchema, CODEX_RESULT_SCHEMA); sent.push(message); for (const handler of handlers) handler(message); },
     lines: (async function* () {
       while (!closed) {
         if (queue.length) { yield queue.shift()!; continue; }
@@ -628,30 +651,8 @@ test('Codex requests normalize into the coder request model', () => {
   assert.equal(textQuestion.kind, 'question');
   assert.equal(textQuestion.summary, 'Which database should I use?');
   assert.equal(textQuestion.questions![0]!.question, 'I need one thing.\nWhich database should I use?');
-  assert.equal(trailingQuestion('Done. Which next?', []), true);
-  assert.equal(trailingQuestion('Done. Which next?', [{ type: 'commandExecution' }]), false);
-  assert.equal(trailingQuestion('All done.', []), false);
 });
 
-test('a turn without work that asks for a reply in prose is a question; courtesy closings and turns with work are not', () => {
-  // The real Codex 0.155.1 message that ended task ct-8d9b0004 as "completed": no question mark anywhere.
-  const real = '在 `nexus-playground` 里新建配置文件前，需要先确认两件事：\n\n1. **文件名**：例如 `config.yaml`、`.env`、`settings.json`。  \n2. **格式**：例如 YAML、JSON、TOML、INI、dotenv。\n\n请直接回复这两项。收到后再写文件。';
-  assert.equal(trailingQuestion(real, []), true);
-  assert.equal(trailingQuestion(real, [{ type: 'reasoning' }, { type: 'agentMessage', text: real }]), true);
-  assert.equal(trailingQuestion(real, [{ type: 'commandExecution' }]), false);
-  assert.equal(trailingQuestion('I need two things:\n1. the file name\n2. the format\nPlease tell me both.', []), true);
-  assert.equal(trailingQuestion('用哪个数据库？\n1. SQLite\n2. Postgres', []), true);
-  assert.equal(trailingQuestion('要我继续吗', []), true);
-  assert.equal(trailingQuestion('需要你先确认目标目录。', []), true);
-  assert.equal(trailingQuestion('已创建 hello.txt。如需调整请告诉我。', []), false);
-  assert.equal(trailingQuestion('Done. Let me know if you need anything else.', []), false);
-  assert.equal(trailingQuestion('目录里有 3 个文件。', []), false);
-  assert.equal(trailingQuestion('', []), false);
-  assert.equal(trailingQuestion('已修复。还需要别的吗？', [{ type: 'fileChange' }]), false, 'a turn that did work is a result, whatever it closes with');
-  assert.equal(trailingQuestion('目录里有 a.yaml 和 b.yaml。\n请告诉我改哪个。', [{ type: 'commandExecution' }]), false);
-  assert.equal(trailingQuestion('两个方案。\n1. A\n2. B\n你选哪个？', [{ type: 'plan' }, { type: 'reasoning' }]), true, 'a plan is not work');
-  assert.deepEqual(APP_SERVER_ARGS, ['app-server', '-c', 'approval_policy="on-request"', '-c', 'features.default_mode_request_user_input=true']);
-});
 
 test('the Codex adapter drives app-server, routes approvals through decide, and reports the final message', async () => {
   const decisions: CoderRequest[] = [];
@@ -711,11 +712,12 @@ test('the Codex adapter turns a trailing plain-text question into an escalation 
         turns.push(text);
         io.reply(message.id, { turn: { id: `turn-${turns.length}`, status: 'inProgress' } });
         const end = (id: string, text: string, work: boolean) => {
+          text = JSON.stringify({ status: turns.length <= 2 ? 'needs_input' : 'completed', text });
           io.push({ jsonrpc: '2.0', method: 'item/completed', params: { item: { type: 'agentMessage', id, text } } });
           io.push({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { id: `turn-${turns.length}`, status: 'completed',
             items: [...(work ? [{ type: 'commandExecution', id: `c${turns.length}` }] : []), { type: 'agentMessage', id, text }] } } });
         };
-        if (turns.length === 1) end('m1', '开始前需要确认：\n1. 数据库\n请直接回复。', false);
+        if (turns.length === 1) end('m1', '检查项目后需要确认：\n1. 数据库\n请直接回复。', true);
         else if (turns.length === 2) end('m2', '要不要顺便加测试？', false);
         else end('m3', '已用 SQLite 接好并加了测试。', true);
       }
@@ -974,38 +976,24 @@ const until = async (check: () => boolean, what: string) => {
   }
 };
 
-test('owner files-only choice stops independent verification, persists evidence, and does not change a resumed contract', { skip: noNamespaces }, async () => {
+test('ordinary clarification retains verification and ignores unsolicited verification answers', { skip: noNamespaces }, async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'nexus-verify-choice-'));
-  const harness = coderHarness(questions => questions.map(q => ({ id: q.id, selected: [q.id === 'nexus-verification' ? '本次仅交付文件' : q.id === 'approve' ? '允许' : '交付'] })));
-  let runs = 0, reviews = 0;
-  try {
-    await writeFile(join(cwd, 'check.cjs'), 'require("node:fs").writeFileSync("verification-ran", "yes")');
-    const query = scriptedQuery(async function* (options) {
-      yield { type: 'system', subtype: 'init', session_id: 'fixture-resume' };
-      if (++runs === 1) {
-        const choice = await options.canUseTool('AskUserQuestion', { questions: [{ question: '如何继续？', options: [{ label: '交付' }] }] }, { signal: options.abortController.signal });
-        assert.equal(choice.behavior, 'allow');
-        assert.match(JSON.stringify(choice.updatedInput), /不再运行验证/);
-      }
-      yield { type: 'result', subtype: 'success', result: 'Files ready, no test claim.' };
-    });
-    await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard',
-      safetyReviewer: async () => { reviews++; return { safe: true, reason: 'fixture local check' }; } });
-    const first = await harness.run('coder_task', { cwd, description: 'create file', verify: 'node check.cjs' });
-    await harness.jobs.at(-1)!.done;
-    const stored = harness.tasks.get(first.task_id!)!;
-    assert.equal(stored.verificationSkipped?.command, 'node check.cjs');
-    assert.equal(taskSchema.parse(stored).verificationSkipped?.command, 'node check.cjs');
-    assert.equal(stored.result?.verification, 'not-run'); assert.equal(stored.result?.verifyOk, false);
-    assert.equal(stored.status, 'failed'); assert.equal(reviews, 0);
-    assert.equal(harness.asked.length, 1);
-    await assert.rejects(readFile(join(cwd, 'verification-ran')));
-    const second = await harness.run('coder_task', { cwd, description: 'now verify', resume_task_id: first.task_id });
-    await harness.jobs.at(-1)!.done;
-    assert.equal(harness.tasks.get(second.task_id!)!.verificationSkipped, undefined);
-    assert.equal(harness.tasks.get(second.task_id!)!.result?.verification, 'passed');
-    assert.equal(await readFile(join(cwd, 'verification-ran'), 'utf8'), 'yes');
-  } finally { for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(cwd, { recursive: true, force: true }); }
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const harness = coderHarness(questions => [...questions.map(q => ({ id: q.id, selected: [q.id === 'approve' ? '允许' : 'A'] })), { id: 'nexus-verification', selected: ['本次仅交付文件'] }]);
+  await writeFile(join(cwd, 'check.cjs'), 'require("node:fs").writeFileSync("verified", "yes")');
+  const query = scriptedQuery(async function* (options) {
+    const choice = await options.canUseTool('AskUserQuestion', { questions: [{ question: 'layout', options: [{ label: 'A' }] }] }, { signal: options.abortController.signal });
+    assert.equal(choice.behavior, 'allow');
+    assert.doesNotMatch(JSON.stringify(choice.updatedInput), /不再运行验证/);
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard', safetyReviewer: async () => ({ safe: true, reason: 'local fixture' }) });
+  const run = await harness.run('coder_task', { cwd, description: 'work', verify: 'node check.cjs' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(run.task_id!)!.verificationSkipped, undefined);
+  assert.equal(harness.tasks.get(run.task_id!)!.result?.verification, 'passed');
+  assert.equal(await readFile(join(cwd, 'verified'), 'utf8'), 'yes');
+  assert.ok(harness.asked.every(qs => qs.every(q => q.id !== 'nexus-verification')));
 });
 
 test('DSH reviews bounded extra file operations, while uncertainty and older permissions retain user approval', async t => {
@@ -2144,7 +2132,7 @@ test('amending a goal stops running and queued old-version jobs before publishin
   } finally { for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(workdir, { recursive: true, force: true }); }
 });
 
-test('identical clarification answers are reused within one goal version, while permissions are asked each time', async () => {
+test('identical clarification answers are reused within one goal version, while permissions are asked each time', { skip: noNamespaces }, async () => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-questions-'));
   const harness = coderHarness(questions => questions.map(question => ({ id: question.id!, selected: [question.id === 'approve' ? '允许' : 'A'] })));
   const query = scriptedQuery(async function* (options) {
@@ -2157,11 +2145,11 @@ test('identical clarification answers are reused within one goal version, while 
     await installCoders(harness.ctx, { securityMode: 'strict', roots: [workdir], query, defaultCoder: 'claude' });
     const saved = await harness.run('coder_brief', { action: 'save', objective: 'goal', acceptance: ['works'] });
     const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
-    for (let i = 0; i < 2; i++) { await harness.run('coder_task', { cwd: workdir, description: 'work', brief_id: id, brief_revision: 1, acceptance_ids: ['a1'] }); await harness.jobs.at(-1)!.done; }
+    for (let i = 0; i < 2; i++) { await harness.run('coder_task', { cwd: workdir, description: 'work', verify: 'true', brief_id: id, brief_revision: 1, acceptance_ids: ['a1'] }); await harness.jobs.at(-1)!.done; }
     assert.equal(harness.asked.filter(items => items[0]!.id === 'approve').length, 2);
     assert.equal(harness.asked.filter(items => items[0]!.id !== 'approve').length, 1);
     await harness.run('coder_brief', { action: 'save', brief_id: id, revision: 1, objective: 'new goal', acceptance: ['works'] });
-    await harness.run('coder_task', { cwd: workdir, description: 'work', brief_id: id, brief_revision: 2, acceptance_ids: ['a1'] }); await harness.jobs.at(-1)!.done;
+    await harness.run('coder_task', { cwd: workdir, description: 'work', verify: 'true', brief_id: id, brief_revision: 2, acceptance_ids: ['a1'] }); await harness.jobs.at(-1)!.done;
     assert.equal(harness.asked.filter(items => items[0]!.id !== 'approve').length, 2);
   } finally { for (const job of harness.jobs) job.cancel('cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(workdir, { recursive: true, force: true }); }
 });
@@ -2817,4 +2805,97 @@ test('verification keeps stdout and stderr byte fragments separate', async t => 
   const result = await runVerifyCommand('node output.cjs', cwd);
   assert.equal(result.ok, true, result.output);
   assert.equal(result.output, 'ERR中');
+});
+
+
+test('unresolved Codex structured questions hit a bounded failure rather than reporting completion', async () => {
+  let answers = 0;
+  const fake = fakeCodex(io => {
+    io.onWrite(message => {
+      if (message.method === 'initialize') io.reply(message.id, {});
+      if (message.method === 'thread/start') io.reply(message.id, { thread: { id: 'bounded' } });
+      if (message.method === 'turn/start') {
+        io.reply(message.id, { turn: { id: 'q', status: 'inProgress' } });
+        const item = { type: 'agentMessage', id: `q-${answers}`, text: JSON.stringify({ status: 'needs_input', text: '请确认目标目录。' }) };
+        io.push({ jsonrpc: '2.0', method: 'item/completed', params: { item } });
+        io.push({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { id: 'q', status: 'completed', items: [item] } } });
+      }
+    });
+  });
+  const result = await runCodexTask(codexTask(), { spawn: () => fake.process, async decide(request) {
+    answers++;
+    return { behavior: 'allow', updatedInput: { answers: { [request.questions![0]!.question]: 'current workspace' } } };
+  } }).done;
+  assert.equal(answers, 5);
+  assert.equal(result.status, 'failed');
+  assert.match(result.detail!, /澄清次数达到上限/);
+});
+
+
+test('restart closes recorded timings at the last observed update, excluding service downtime', async () => {
+  const { opener, records } = fakeDomain();
+  const current = task({ id: 'ct-crash', status: 'running', createdAt: 0, updatedAt: 200 });
+  current.timing = { since: 100, phase: 'execution', ms: { queue: 100, execution: 0, review: 0, user: 0, verification: 0, retry: 0 }, reviews: 0, retries: 0 };
+  records.set(current.id, current);
+  const store = await CoderStore.open(opener);
+  await store.markInterrupted();
+  const after = store.get(current.id)!;
+  assert.equal(after.timing?.phase, undefined);
+  assert.equal(after.timing?.ms.execution, 100);
+  assert.equal(after.status, 'interrupted');
+});
+
+test('native final-result schema handles optional questions, blockers and malformed results without guessing', async () => {
+  for (const [status, text, expected] of [
+    ['completed', '已修复。要不要顺便加深色模式？', 'completed'],
+    ['completed', '新增 FAQ：如何安装？', 'completed'],
+    ['blocked', '环境不可用', 'failed'],
+    ['raw', '如果需要我继续，请确认目标目录。', 'failed'],
+  ] as const) {
+    const fake = fakeCodex(io => io.onWrite(message => {
+      if (message.method === 'initialize') io.reply(message.id, {});
+      if (message.method === 'thread/start') io.reply(message.id, { thread: { id: 'structured' } });
+      if (message.method === 'turn/start') {
+        io.reply(message.id, { turn: { id: 'turn' } });
+        io.push({ method: 'turn/completed', params: { turn: { status: 'completed', items: [{ type: 'agentMessage', id: 'final', text: status === 'raw' ? text : JSON.stringify({ status, text }) }] } } });
+      }
+    }), true);
+    const result = await runCodexTask(codexTask(), { spawn: () => fake.process, decide: async () => { throw new Error('must not ask from prose'); } }).done;
+    assert.equal(result.status, expected);
+    assert.equal(result.result, text);
+    if (status === 'raw') assert.match(result.detail!, /结构化任务结果/);
+  }
+});
+
+test('overlapping native questions keep the next pending request visible and stop waiting only after all answers', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-overlap-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const harness = coderHarness(() => [], cwd);
+  const shown: string[] = [];
+  const replies: (() => void)[] = [];
+  harness.ctx.userQuestions.ask = (async (request: { questions: AskUserQuestionItem[] }) => {
+    shown.push(request.questions[0]!.question);
+    await new Promise<void>(resolve => replies.push(resolve));
+    return { answers: request.questions.map(q => ({ id: q.id, selected: ['A'] })) };
+  }) as typeof harness.ctx.userQuestions.ask;
+  const query = scriptedQuery(async function* (options) {
+    await Promise.all(['first', 'second'].map(question => options.canUseTool('AskUserQuestion', { questions: [{ question, options: [{ label: 'A' }] }] }, { signal: options.abortController.signal })));
+    yield { type: 'result', subtype: 'success', result: 'done' };
+  });
+  await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'full' });
+  const { task_id: id } = await harness.run('coder_task', { description: 'work' });
+  await until(() => replies.length === 1, 'first question');
+  assert.equal(harness.tasks.get(id!)!.pending?.summary, 'first');
+  replies[0]!();
+  await until(() => replies.length === 2, 'second question');
+  assert.deepEqual(shown, ['first', 'second']);
+  assert.equal(harness.tasks.get(id!)!.status, 'waiting-user');
+  assert.equal(harness.tasks.get(id!)!.pending?.summary, 'second');
+  assert.equal(harness.tasks.get(id!)!.timing?.phase, 'user');
+  replies[1]!();
+  const result = await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(id!)!.pending, undefined);
+  assert.equal(harness.tasks.get(id!)!.status, 'completed');
+  assert.match(result.result!, /耗时分项/);
+  assert.equal(harness.tasks.get(id!)!.timing?.phase, undefined);
 });

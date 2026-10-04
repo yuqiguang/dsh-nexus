@@ -76,3 +76,13 @@ html[data-nexus-chat-fold=on] [data-chat-flow-kind=system-prompt] { display: non
 .nexus-coder-card-pending { flex-basis: 100%; font-weight: 600; overflow-wrap: anywhere; }
 .nexus-coder-card[data-state="waiting-user"] { border-color: var(--dsw-alias-text-secondary, #888); }
 .nexus-coder-card-dismiss { margin-left: auto; font-size: 12px; }
+
+/* Plugin details start compact; native details keeps keyboard toggling and open state across status refreshes. */
+.nexus-update-settings { padding-bottom: 0; }
+.nexus-update-details { border: 1px solid var(--dsw-alias-border-l2, #dedede); border-radius: 10px; }
+.nexus-update-details > summary { cursor: pointer; padding: 12px 14px; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.nexus-update-details > summary:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4f6bff); outline-offset: 2px; border-radius: 10px; }
+.nexus-update-title { font-weight: 600; margin-right: 12px; }
+.nexus-update-summary { color: var(--dsw-alias-label-secondary); }
+.nexus-update-body { padding: 0 14px 14px; border-top: 1px solid var(--dsw-alias-border-l2, #dedede); }
+.nexus-update-body > .nexus-channel-card { border: 0; border-radius: 0; margin: 0; padding: 0; }

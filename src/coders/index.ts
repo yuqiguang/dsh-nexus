@@ -1,3 +1,6 @@
+import { UserWaits } from './user-waits.js';
+import { dispatchPrompt } from './prompt.js';
+import { timingSummary } from './timing.js';
 import { taskNotices, taskSummary } from './presentation.js';
 import { nativeSafetyReviewer, prepareReview, reviewFingerprint, reviewUntilAborted, ReviewCache, REVIEW_TIMEOUT_MS, type SafetyReviewer } from './review.js';
 import { installCoderPackaging } from './package.js';
@@ -163,6 +166,7 @@ function oneLine(value: string, max = 120): string {
 export function interruptedNotice(task: TaskRecord): string {
   return [`编码任务 ${task.id} 因服务重启而中断（${CODER_NAMES[task.coder]}）。`, `任务：${clip(task.description, 200)}`,
     `目录：${task.cwd}`,
+    timingSummary(task),
     ...(task.permissions ? [permissionSummary(task.permissions)] : []), ...(task.pending ? [`中断时正在等待你回答：${task.pending.summary}`] : []),
     ...(task.coderSessionId ? [`${CODER_NAMES[task.coder]} 会话 ${task.coderSessionId} 已保留。`] : []),
     task.coderSessionId ? '任务不会自动重跑；需要继续时告诉我，可以接着原来的会话做下去。' : '任务不会自动重跑；需要继续时告诉我重新派发。'].join('\n');
@@ -219,6 +223,7 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     `任务：${task.description}`,
     ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []),
     `目录：${task.cwd}`,
+    timingSummary(task),
     ...(task.permissions ? [permissionSummary(task.permissions)] : []),
     '',
     `DSH 独立验证范围：${task.verify ? [task.verify, ...(task.verifyCommands ?? [])].join('；') : '未指定'}。编码工具自述的其他测试不代表 DSH 已独立运行。`,
@@ -327,6 +332,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   ctx.effect(() => () => reviewCache.clear());
   ctx.effect(() => () => reviewQueue.close());
   const budgets = new Map<string, ActiveBudget>();
+  const userWaits = new UserWaits();
   const questionQueues = new Map<string, CoderQueue>();
   ctx.effect(() => () => { for (const queue of questionQueues.values()) queue.close(); });
   const stopOf = new Map<string, (reason: string) => void>();
@@ -404,6 +410,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     }
     let escalationReason = verdict.reason;
     if (!manualReview && !verdict.manualOnly && task.permissions?.autoApproveSafe && request.kind !== 'question' && config.manager?.current()?.autoApproveSafe !== false) {
+      await store.update(taskId, current => ({ reviewDepth: (current.reviewDepth ?? 0) + 1 }));
       let release: (() => void) | undefined;
       let recorded = false;
       let reviewSignal: AbortSignal | undefined;
@@ -441,7 +448,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         }
       } catch { escalationReason = reviewSignal?.aborted && reviewSignal.reason?.name === 'TimeoutError'
         ? '自动审核超过等待时限，交给你确认' : '自动审核调用或证据核验失败，交给你确认'; }
-      finally { release?.(); }
+      finally { release?.(); await store.update(taskId, current => ({ reviewDepth: Math.max(0, (current.reviewDepth ?? 0) - 1) })); }
       if (signal.aborted || shutdown.signal.aborted) return { behavior: 'deny', message: '任务已取消。', interrupt: true };
       if (!recorded) {
         await store.update(taskId, current => ({ decisions: [...current.decisions, { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'supervisor', outcome: 'ask', reason: escalationReason }] }));
@@ -450,15 +457,16 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     } else if (!verdict.manualOnly && request.kind !== 'question') {
       escalationReason = manualReview ? '本任务的 DSH 审核规则要求此类操作由你确认' : task.permissions?.autoApproveSafe ? '安全操作自动审核已关闭，需要你确认本次操作' : '本次任务未启用安全操作自动审核，需要你确认';
     }
-    const key = task.brief && request.kind === 'question' && !task.verify ? createHash('sha256').update(JSON.stringify(request.questions ?? [])).digest('hex') : undefined;
+    const key = task.brief && request.kind === 'question' && request.questions?.length ? createHash('sha256').update(JSON.stringify([task.cwd, request.questions])).digest('hex') : undefined;
     const cached = key && task.brief ? briefs.answer(task.brief.id, task.ownerSession, task.brief.revision, key) : undefined;
     if (cached) {
       step(`沿用用户已确认回答：${oneLine(request.summary, 100)}`);
       await store.update(taskId, current => ({ decisions: [...current.decisions, { at, kind: request.kind, summary: request.summary, layer: 'user', outcome: 'answer', reason: '同一目标版本下相同澄清问题，沿用已有回答' }] }));
       return { behavior: 'allow', updatedInput: { ...request.raw, answers: cached } };
     }
-    await store.update(taskId, () => ({ status: 'waiting-user', pending: { at, kind: request.kind, summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
-      ...(request.detail ? { detail: clip(request.detail, 500) } : {}) } }));
+    const waitId = Symbol('user-wait');
+    await store.update(taskId, current => userWaits.add(current, waitId, { at, kind: request.kind, summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
+      ...(request.detail ? { detail: clip(request.detail, 500) } : {}) }));
     step(`等待用户：${oneLine(request.summary, 100)}`);
     const resumeBudget = budgets.get(taskId)?.pause();
     const waitSignal = AbortSignal.any([signal, AbortSignal.timeout(config.maxUserWaitMs ?? 10 * 60_000)]);
@@ -479,7 +487,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       }
     } catch {
       outcome = { decision: { behavior: 'deny', message: '等待用户已取消或超时。', interrupt: true }, record: { at, kind: request.kind, summary: request.summary, layer: 'user', outcome: 'deny', reason: '等待用户已取消或超时' } };
-    } finally { releaseQuestion?.(); resumeBudget?.(); }
+    } finally {
+      try { await store.update(taskId, current => userWaits.remove(current, waitId)); }
+      finally { releaseQuestion?.(); resumeBudget?.(); }
+    }
     if (waitSignal.aborted && !signal.aborted) {
       await store.update(taskId, () => ({ stopCause: 'user-wait-timeout' }));
       stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
@@ -495,9 +506,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     step(`${{ allow: '用户允许', deny: '拒绝', answer: '用户回答', ask: '转交用户' }[outcome.record.outcome]}：${oneLine(request.summary, 100)}`);
     await store.update(taskId, current => ({
       // An aborted question leaves a final status alone: a cancelled task gets it from runJob, an interrupted turn goes on running.
-      status: outcome.unreachable ? 'interrupted' : current.status === 'waiting-user' ? 'running' : current.status,
-      escalations: current.escalations + (didAsk ? 1 : 0), decisions: [...current.decisions, outcome.record], pending: undefined,
-      ...(outcome.verificationSkipped ? { verificationSkipped: outcome.verificationSkipped } : {}),
+      ...(outcome.unreachable ? { status: 'interrupted' as const } : {}),
+      escalations: current.escalations + (didAsk ? 1 : 0), decisions: [...current.decisions, outcome.record],
     }));
     if (outcome.decision.behavior === 'deny') {
       const stop = repeated(task, `user:${request.kind}:${request.command ?? (request.paths.join('|') || request.tool)}`, '用户未授权这项操作');
@@ -742,8 +752,6 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       if (settledTask.verificationSkipped) Object.assign(verify, { verifyOk: false, verifyExecuted: false,
         verifyOutput: '用户明确选择本次仅交付文件，独立验证未执行；原验证要求保留，未标记为验收通过。' });
       if (preflightCheck) Object.assign(verify, { preflightCheck });
-      const current = store.get(task.id) ?? task;
-      const report = taskReport(current, outcome, verify);
       const failed = outcome.status === 'failed' || verify.verifyOk === false || task.permissions?.securityMode !== 'full' && verify.outsideRoots.length > 0;
       const status: TaskRecord['status'] = stopped ? 'interrupted' : outcome.status === 'killed' ? 'cancelled' : failed ? 'failed' : 'completed';
       await store.update(task.id, current => ({ ...settle(current), status, result: { summary: outcome.result?.trim() ?? '',
@@ -755,6 +763,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         ...(verify.verifyOutput !== undefined ? { verifyOutput: verify.verifyOutput } : {}),
         ...(verify.verifyChecks ? { verifyChecks: verify.verifyChecks } : {}),
         ...(outcome.detail ? { detail: outcome.detail } : {}) } }));
+      const report = taskReport(store.get(task.id) ?? task, outcome, verify);
       const detail = status === 'failed' && outcome.status === 'completed'
         ? (verify.verifyOk === false ? (verify.verifyExecuted === false ? '验证未执行' : '验证命令失败') : '改动越出根目录') : outcome.detail;
       job?.append(`${clock(Date.now())} 结束：${STATUS_LABEL[status]}${detail ? `（${oneLine(detail, 100)}）` : ''}，改动文件 ${verify.changedFiles.length} 个`
@@ -818,7 +827,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_task',
-    description: '任务使用派发时固定的权限和时间预算，三次重复拒绝或失败会暂停；续接不扩大权限。把一个编码任务交给本机的编码工具（Codex 或 Claude Code）在后台执行。模式只能从编码工具设置选择，模型参数不能改权；完全权限以当前系统用户权限执行，关闭编码沙箱及 DSH 执行审批与拦截规则，仍保留目标澄清、取消和时限。其他模式下监工替用户把关：凭据读取和硬规则禁止的破坏性操作直接拒绝；项目内配置模板经内容检查后正常处理，标准模式下真实环境配置写入须单次用户确认；标准模式命令可联网，命令与额外权限按具体内容安全审核，不确定时询问用户；严格模式保留文件和网络沙箱。非完全权限模式的文件工具默认限任务目录；所有模式的提问都发给任务所属用户。你不需要参与审批。任务结束后你会收到 background job 完成通知，用 job_output 读取汇报后向用户总结。运行期间用户问进展时，用 coder_status 看它当前在做什么和最近几步再回答。要调整一个已经停下或结束的任务时，带 resume_task_id 续接它：编码工具接着原来的会话，记得之前做过什么。默认最多同时运行两个独立工作区的任务，可在编码工具设置中调整为 1–4 个，Codex 和 Claude Code 共用上限；同一目录、包含关系的目录或同一 Git 工作树串行，其他可执行任务按入队顺序调度（另有最多 10 个等待名额）；排队期间可以用 job_kill 取消。有前置任务时用 depends_on，只有前置任务执行成功且独立验证通过才启动。短暂模型限流、网络故障在编码工具自身重试结束后最多自动续接原会话两次，等待计入原总时限；额度耗尽、认证失败或无原会话时暂停，不能靠重新派发绕过恢复上限。重启后任务标记中断，不自动重放。',
+    description: '把完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行。派发后立即报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖必须执行成功且独立验证通过。短暂网络或限流在工具自身重试后最多自动续接原会话两次；额度或认证失败、等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。任务停止或完成后通过 resume_task_id 继续，失败恢复用 retry_task_id，仅复验用 verification_only。',
     parameters: {
       coder: { type: 'string', enum: ['codex', 'claude'], description: '执行任务的工具：codex 或 claude（Claude Code）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
       description: { type: 'string', description: '无计划的新任务必填完整说明。有 plan_step 时省略，系统采用已保存的步骤说明；续接补充内容用 continuation，不重复抄写或修改计划。' },
@@ -835,7 +844,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       resume_task_id: { type: 'string', description: '要续接的任务 ID（ct-xxxx），它必须已经停下、结束或因重启中断。用于用户叫停后要调整方向，或结束后要接着改：在原任务的编码工具会话里继续，而不是从头开始。' },
       verify_commands: { type: 'array', items: { type: 'string' }, description: '完整的独立验证命令列表（1 到 10 条），按顺序执行，每条单独审核，任一失败则停止；与 verify 二选一。覆盖验收所需的语法、逻辑和集成测试。' },
       verify_cwd: { type: 'string', description: '独立验证的项目子目录，相对 cwd 或绝对路径，必须仍在任务目录内。默认 cwd；多项目工作区必须明确绑定，不能依赖编码工具临时 cd。' },
-      verify_network: { type: 'string', enum: ['offline', 'loopback', 'ask'], description: '通常省略以沿用当前模式：标准模式默认 ask（由 DSH 审核验证命令），严格模式默认 offline（断网）。脚本本身不联网不等于需要强制断网，不要因此填写 offline。只有用户或验收明确要求网络隔离时才选择 offline；Windows 会在派发前检查其防火墙条件，条件不满足不得自动放宽。Windows 不支持隔离 loopback。本地服务与浏览器自检在 Linux 选 loopback：脚本须在同一次调用内启动服务和客户端，运行在独立回环网络中，不能访问宿主端口和外网，不需要联网审批。测试确实需要联网时选 ask，执行前向任务所属会话请求一次性批准。批准只对这条验证命令有效，可访问任意网络目标；仍限制文件写入，不继承密钥环境变量。拒绝则不执行验证，不回退到无隔离。' },
+      verify_network: { type: 'string', enum: ['offline', 'loopback', 'ask'], description: '通常省略以沿用当前模式：标准模式默认 ask（由 DSH 审核验证命令），严格模式默认 offline（断网）。脚本本身不联网不等于需要强制断网，不要因此填写 offline。只有用户或验收明确要求网络隔离时才选择 offline；Windows 会在派发前检查其防火墙条件，条件不满足不得自动放宽。Windows 不支持隔离 loopback。本地服务与浏览器自检在 Linux 选 loopback：脚本须在同一次调用内启动服务和客户端，运行在独立回环网络中，不能访问宿主端口和外网，不需要联网审批。测试确实需要联网时选 ask：标准模式按 DSH 审核设置自动审核或请求本次批准，严格模式请求一次性批准，完全权限直接执行。批准只对这条验证命令有效，可访问任意网络目标；非完全权限模式仍限制文件写入；验证环境不继承密钥变量。拒绝则不执行验证，不回退到无隔离。' },
       verify: { type: 'string', description: '可选的验证命令，任务结束后由监工在工作目录独立执行，例如 "npm test"。任务的完成标准里写了要跑测试、构建、检查或跑通某条命令时，都要填上：监工自己跑一遍才算数，不填就只有编码工具自己说做完了。不经过 shell：只能是一条命令，第一个词是程序，其余按空格分成参数；不能用 &&、|、;、>、引号或 $()，要检查多件事就写一个脚本或 npm script。' },
     },
     output: {
@@ -979,7 +988,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           ...(isActive(task) ? [runningFor(task)] : []),
           ...(currentActivity(task) ? [`当前：${currentActivity(task)}`] : []),
           ...(task.retry ? [retryText(task.retry), ...(task.retry.retryAt && task.retry.phase === 'waiting' ? [`预计重试时间：${clock(task.retry.retryAt)}`] : [])] : []),
-          `任务：${task.description}`,
+          `任务：${task.description}`, timingSummary(task),
           ...(task.planStep ? [`计划步骤：${task.planStep}`] : []),
           ...(task.brief ? [`任务说明单：${task.brief.id} v${task.brief.revision}；验收项：${task.brief.acceptance.map(item => item.id).join('、')}`] : []),
           ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []), ...(task.dependsOn?.length ? [`前置任务（均需独立验证通过）：${task.dependsOn.join('、')}`] : []), `目录：${task.cwd}`,
@@ -999,7 +1008,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_steer',
-    description: '在 Codex 任务运行中把用户的调整转给它，不停下任务：默认并入当前这一回合，Codex 下一步就会看到；interrupt 为 true 时先打断正在做的事（包括正在跑的命令），再以这段话开始下一回合，上下文都保留。用户在任务运行中说“改成……”“别做……了”“先做……”时用。Claude Code 任务不支持，改用 job_kill 停下再用 coder_task 带 resume_task_id 续接。',
+    description: '在 Codex 任务运行中补充执行细节，不改变已保存目标、约束和验收；关联说明单的实质变更必须先 coder_brief impact/amend，不能用本工具绕过版本。转交补充时不停下任务：默认并入当前这一回合，Codex 下一步就会看到；interrupt 为 true 时先打断正在做的事（包括正在跑的命令），再以这段话开始下一回合，上下文都保留。先区分执行细节与目标变更。Claude Code 任务不支持，改用 job_kill 停下再用 coder_task 带 resume_task_id 续接。',
     parameters: {
       message: { type: 'string', required: true, description: '转给编码工具的话，写清楚要改什么，按用户原意，不要扩大。' },
       task_id: { type: 'string', description: '任务 ID；省略时用正在运行的那个任务。' },
@@ -1141,7 +1150,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'nexus:coders',
     order: ctx.systemPrompt.getSectionOrder('TOOL_JOBS') + 1,
-    text: () => `当用户要求实现、修改或修复一个代码项目，而不是让你直接回答时，用 coder_task 把任务派给本机的编码工具（默认 ${CODER_NAMES[currentDefault()]}，用户指名时用 coder 参数选择），编码任务默认使用当前 DSH 会话工作区，通常省略 cwd；新项目可指定工作区内子目录，不得改用渠道默认目录。设置里的目录列表只作额外限制，不能扩大当前会话工作区。派发后向用户说明工具返回的实际项目目录。当前实例最多同时执行 ${maxConcurrent} 个编码任务，Codex 与 Claude Code 共用名额；独立工作区可并行，同一目录或同一 Git 工作树仍需排队。排队原因未被工具确认时，不要说正在等待其他任务；状态出现无新动作时，先如实报告无动作时长，再注明最后记录，不能把历史动作说成当前正在做的事。派发前确认用户要得到什么、使用平台、打开方式和交付格式；缺失信息会实质影响实现或验收时，先用简短问题澄清，已有明确约定就直接执行。低影响细节采用合理默认并告知，不机械地每次提问，也不擅自扩展功能清单。技术方案必须兼容打开方式，例如双击本地 HTML 不能默认依赖浏览器禁止的外部 ES Module 加载。复杂或分阶段需求先用 coder_brief save 记录用户目标、已明确的约束和可核验的验收项，并用 cwd 绑定项目根目录；能从项目查清的信息自己调查，仅关键歧义才问用户，不要求每次确认。已有原生 goal 时保持其目标一致，不另建目标生命周期或自动改变原生 goal 状态。拆分后先用 coder_brief plan 保存完整步骤，每步声明负责的验收项、前置步骤、验证命令和 outputs 预期文件；依赖已有环境的步骤可用 preflight 登记已有环境自检脚本，失败时不会启动编码工具。项目初始化步骤先准备并验证真实启动环境，下游不能用改写单测代替真实服务启动。修正工具报告的遗漏或循环。按返回的依赖顺序，用 plan_step 派发步骤，省略 description、验收项和 verify，直接沿用保存的计划；续接补充放在 continuation，不必为收尾反复保存新计划。程序会从持久任务记录解析前置任务 ID。结构检查不能代替语义判断，不要把未声明的真实依赖当作不存在。派发关联 brief_id、brief_revision 和本任务负责的 acceptance_ids，把共同约束传给编码工具。用户问整体进度、或收到关联任务完成通知后，用 coder_brief get 汇总全部验收项；未覆盖、失败和未验证的项必须明确报告，不把单个任务完成当作整个需求完成。派发后立即按工具返回的状态告知用户：排队中表示尚未启动，运行中才表示已经开跑，不要等待任务结束。多个任务存在前后依赖时，显式填写 depends_on，只能引用同一聊天会话已派发的任务（该会话更早的各代也算）；前置任务必须执行成功且独立验证通过，否则后续任务不会启动。不要因依赖失败而自动去掉依赖重新派发。任务说明里的完成标准要求跑测试、构建、检查或跑通某条命令时，派发时将完整验收写进 verify_commands（多条命令）或 verify（统一验收脚本）；不要仅检查某一个文件的语法就代替完整项目验收；标准模式和完全权限验证省略 verify_network；标准模式由 DSH 审核具体命令，完全权限直接执行；不要因为脚本不联网就主动选择 offline；严格模式验证默认断网，需要联网时设置 verify_network=ask。不能把标准模式描述成操作系统强隔离。监工会在任务结束后自己跑一遍；Windows 命令无输出且退出码为 3221225794 / 0xC0000142 时，应报告原生进程初始化失败，不要靠更换解释器反复重试或声称测试已执行；验证通过只代表指定命令通过，不代表所有业务需求已验收；不写 verify 的任务只有编码工具自己说做完了，你也只能这样转述。多文件交付用 coder_package 明确选择入口及其全部资源并生成 zip，再 present 此 zip；不能只发送 HTML 后声称可独立运行。编码工具权限以派发返回的权限摘要为准，只能在设置中更改，任务参数或描述不能开启完全权限。完全权限关闭编码工具沙箱和 DSH 执行审批，以当前系统用户权限执行；仍需澄清实质歧义，主助手不得代答。以下监工规则适用于非完全权限模式：凭据和硬规则禁止的破坏性命令直接拒绝；额外权限先核验具体范围，未获安全授权的请求和编码工具提问升级给用户，其余常规操作自动放行并记录。启用安全操作自动审核时，DSH 会对具体命令和额外请求调用本会话模型审核，安全且非破坏性的请求直接授权；理由留在任务记录，审核失败或不确定仍询问用户。主助手不要冒充用户回答审批。任务运行期间用户问进展，用 coder_status 查看当前动作和最近几步再回答，只转述记录到的内容，不要推测它进行到了哪个阶段，也不要说还没记录到的事已经发生（比如文件已写好）。对话轮换只换聊天上下文，不换任务：同一聊天更早各代派发、仍在运行的任务，coder_status 仍能查到它当前在做什么，也仍可用 coder_task 带 resume_task_id 续接；查不到任务记录时不要断言没有任务，先按任务 ID 或“最近的任务”确认一次。用户在任务运行中要调整方向时：Codex 任务用 coder_steer 把用户的话转过去，不用停下；Claude Code 任务或用户要整个停下时用 job_kill（"拒绝"只否决眼前这一步，编码工具会继续）；任务只是在等用户回答时不要自行停下。停下后用 coder_task 带 resume_task_id 续接原任务，continuation 写本次补充、description 沿用计划或原任务，编码工具接着原来的会话、记得之前做过什么；已经结束或因重启中断的任务要接着改，也这样续接。用户明确要换个思路从头来时才不带 resume_task_id。用户说禁止某类操作、或问到某事就固定回答时，用 coder_rules 添加规则（${Object.entries(KIND_LABEL).map(([kind, label]) => `${kind} 是${label}`).join('，')}；${RULE_DECISIONS.map(decision => `${decision} 是${DECISION_LABEL[decision]}`).join('，')}；常规操作本来就放行，不需要 allow 规则），用户问有哪些规则时用 coder_rules list。相同目标版本下已回答的相同澄清问题会复用，权限审批仍逐次进行。审批必须转述具体原因：证据不足、审核错误和约束冲突不是同一回事，不要笼统声称所有测试都必须人工批准，也不要要求用户看到提示一律允许。等待审批超时后先报告停止原因并等待用户明确续接，不自动派发相同任务制造新审批。同一会话的提问顺序显示；等待回答不消耗执行预算，超过等待时限会暂停任务，避免无限占用队列。用户在执行中修改目标时，先用 coder_brief impact 说明受影响步骤，再用 amend 停止旧版活动任务并保存新版本；两种编码工具使用同一入口。修改后再按新版本派发，不能让旧版继续执行。工作目录必须用实际项目目录，新项目可直接指定尚不存在的子目录，系统会创建。任务描述中的所有相对路径都以 cwd 为基准；cwd 已是项目目录时不要在文件名之前再加同名目录。验证默认在该目录执行；verify_cwd 相对于任务 cwd，根目录用 . 或省略，多项目时才绑定子目录。目录调整后显式更新 verify_cwd，不能沿用已删除的目录。本地浏览器验证应写成自带服务启动和关闭的脚本；Linux 通过 nexus_web.local_check 运行，或 verify_network=loopback 作最终验证。Windows 不支持隔离 loopback，需要本机服务时显式用 verify_network=ask 申请本次联网验证。不要逐条申请运行宿主开发服务器、浏览器和测试连接。失败先区分编码失败、测试失败和验证未执行；验证目录或进程启动问题应先修正验证条件；编码已完成且只需复验时，用 verification_only=true，显式指定正确 verify_cwd 和完整 verify_commands，不再启动编码工具，不得用编码工具自述替代独立验收。步骤失败时先用 coder_brief recover 查看恢复清单，保留已验证通过的独立步骤；只对需要恢复的最新任务用 retry_task_id，不从头重跑整套计划。整体交付时用 coder_brief delivery 查看逐项检查、业务验收和文件提交清单；业务效果需要用户确认时用 review 对具体验收项提问，不能把模型自述登记为用户验收。收到 coder job 的完成通知后，用 job_output 读取汇报，再用两三句话向用户总结：做了什么、改了哪些文件、验证是否通过、替用户决定或被拒绝了什么。`,
+    text: () => dispatchPrompt(CODER_NAMES[currentDefault()], maxConcurrent, config.manager?.current()?.securityMode ?? config.securityMode ?? 'standard', process.platform),
   }));
 
   return store;

@@ -1,3 +1,4 @@
+import { CODER_WORK_GUIDANCE } from './prompt.js';
 import { sameChat } from '../channels/protocol.js';
 import { analyzeChange, type BriefChange } from './change.js';
 import { recoveryReport } from './recovery.js';
@@ -145,10 +146,10 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
 }
 
 export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd' | 'permissions'>): string {
-  const description = task.description + (task.continuation ? `\n\n[本次续接说明]\n${task.continuation}\n仍须满足已保存的目标、共同约束和完整验收；不能用续接说明替换或缩小它们。` : '')
+  const description = task.description + CODER_WORK_GUIDANCE + (task.continuation ? `\n\n[本次续接说明]\n${task.continuation}\n仍须满足已保存的目标、共同约束和完整验收；不能用续接说明替换或缩小它们。` : '')
     + (task.permissions?.securityMode === 'full' ? '\n\n[执行权限]\n本任务已由设置授予完全权限：可用当前系统用户权限访问项目外文件、联网和运行命令，无执行沙箱或逐项权限审批；不需要为常规执行再申请权限。仍按用户目标工作，实质歧义应澄清；避免在输出中暴露密钥。' : '\n\n[环境配置与执行检查]\n项目内 .env.example、.env.sample、.env.template 可用原生文件工具创建或修改，只填空值、占位符及本地非敏感配置。实际 .env 写入在标准模式下申请所列文件的单次用户确认，不读取或打印已有密钥。不要用 shell 命令改写配置来绕过文件审批。运行测试优先指定测试文件或目录，使用可检查的项目脚本；避免反复申请同一被拒操作。')
     + (task.brief ? '\n先核对实际项目目录和所需运行环境。发现环境或依赖加载失败，先定位并采用可恢复的修复，不通过删除依赖、改写测试或换技术栈掩盖真实启动失败。' : '')
-    + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件；任何一项失败或未执行都不能报告全部验收通过。` : '');
+    + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件。修改中先做必要的针对性自测，不为收尾形式再重复整套验收；宿主会独立执行上述命令。任何一项失败或未执行都不能报告全部验收通过。` : '');
   if (!task.brief) return description;
   return `${description}\n\n[派发时的任务说明单 ${task.brief.id}，版本 ${task.brief.revision}]\n总体目标：${task.brief.objective}\n共同约束：${task.brief.constraints || '无补充'}\n本任务负责的验收项：\n${task.brief.acceptance.map(item => `${item.id}. ${item.text}`).join('\n')}\n只完成本任务负责的部分，不把单个子任务完成表述为整个目标已完成。已明确的目标不重复澄清；技术细节先查项目，只有影响目标、范围或授权的新问题才反馈。说明单不会扩大工具权限。`;
 }
@@ -158,7 +159,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
   ctx.effect(() => () => { void store.close(); });
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_brief',
-    description: '记录和查看编码需求的目标、共同约束与验收项。复杂或分阶段需求先保存说明单，再派发关联任务。它不启动任务，也不创建、完成或恢复原生 goal；查询时汇总当前版本的任务和验证证据，不能把子任务完成当作整个目标完成。',
+    description: '记录和查看编码需求的目标、共同约束与验收项。复杂需求先保存说明单，普通修复无需创建；默认一个完整任务，确需独立验收或阶段依赖时才 plan 拆分，每步声明验收项、前置步骤、验证和 outputs。先核实运行环境，项目初始化不能用改写测试掩盖服务启动失败。续接保留计划、约束和验收；目标变更先 impact 再 amend，失败用 recover，交付用 delivery 并按需 review。它不启动任务，也不创建、完成或恢复原生 goal；查询时汇总当前版本的任务和验证证据，不能把子任务完成当作整个目标完成。',
     parameters: {
       action: { type: 'string', enum: ['save', 'plan', 'get', 'list', 'delivery', 'review', 'recover', 'impact', 'amend'], required: true, description: 'save 新建或修改（清除旧步骤计划）；plan 保存完整步骤计划并检查覆盖、引用和循环依赖；get 查询覆盖；list 列表；delivery 交付汇总；review 用户验收；recover 恢复清单；impact 预览变更；amend 停止旧版活动任务后应用新版本。' },
       brief_id: { type: 'string', description: 'get 或修改时必填。' },

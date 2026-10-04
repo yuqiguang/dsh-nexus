@@ -1,3 +1,4 @@
+import { sameChat } from '../channels/protocol.js';
 import { z } from 'zod';
 import type { CoderBrief } from './brief.js';
 import { isActive, type TaskRecord } from './types.js';
@@ -56,7 +57,7 @@ export function resolvePlanStep(brief: CoderBrief, stepId: string | undefined, r
   }
   const step = brief.plan.find(step => step.id === stepId);
   if (!step) throw new Error('说明单已启用步骤计划，请指定有效的 plan_step。');
-  const tasks = records.filter(task => task.ownerSession === brief.ownerSession && task.brief?.id === brief.id && task.brief.revision === brief.revision);
+  const tasks = records.filter(task => sameChat(task.ownerSession, brief.ownerSession) && task.brief?.id === brief.id && task.brief.revision === brief.revision);
   const own = tasks.filter(task => task.planStep === step.id);
   if (own.length && !resumeFrom) throw new Error('该计划步骤已经派发；请查看已有任务，需要继续时显式续接或修改计划。');
   if (resumeFrom && own.length && !own.some(task => task.id === resumeFrom)) throw new Error('续接任务不属于当前计划步骤。');

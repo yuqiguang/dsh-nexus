@@ -1,3 +1,4 @@
+import { CODEX_RESULT_SCHEMA, parseTurnResult } from './turn-result.js';
 import { coderPrompt } from './brief.js';
 import { WINDOWS_CODER_GUIDANCE } from './runtime.js';
 import { requireWindowsFirewall } from './windows-firewall.js';
@@ -75,27 +76,6 @@ function textOf(item: unknown): string {
     && typeof (item as { text?: unknown }).text === 'string' ? (item as { text: string }).text : '';
 }
 
-/** Item types that are not work: messages, reasoning, plans, and bookkeeping. Anything else (commands, file changes, tool calls) is. */
-const NON_WORK_ITEMS = new Set(['agentMessage', 'reasoning', 'userMessage', 'plan', 'hookPrompt', 'contextCompaction', 'enteredReviewMode', 'exitedReviewMode']);
-/** A line that wants an answer: it ends in a question mark, or asks for a reply, confirmation, or choice in Chinese or English. */
-const ASKS = /[?？]\s*$|吗[。.]?\s*$|请(?:直接|先|您|你)*(?:回复|回答|确认|告诉我|告知|说明|提供|指定|选择|决定)|(?:需要|等|麻烦)(?:你|您)(?:先)?(?:确认|回复|回答|提供|指定|选择|决定)|\b(?:please|kindly)\s+(?:confirm|reply|respond|tell me|let me know|specify|choose|pick|provide|clarify|advise)\b|\blet me know\b|\bwhich (?:one|would you|do you)\b|\b(?:could|can|would|will) you\b|\bdo you (?:want|prefer|need)\b/i;
-/** A closing courtesy is not a question: "如需调整请告诉我", "let me know if you need anything else". */
-const COURTESY = /如(?:有|果)?需|若(?:有)?需|如果(?:你|您)?(?:需要|想|要)|\bif you (?:need|want|would like|have|prefer)\b|\bfeel free\b|\bhappy to\b/i;
-
-const asks = (line: string) => ASKS.test(line) && !COURTESY.test(line);
-
-const didWork = (items: readonly unknown[]) => items.some(item => item && typeof item === 'object' && !NON_WORK_ITEMS.has((item as { type?: string }).type ?? ''));
-
-/**
- * Whether a completed turn is Codex asking the user in plain text: it did no work, and some line of its message is a question or
- * asks for a reply, confirmation, or choice. A turn that did work is a result even when it closes with a question ("还需要别的吗？"
- * would otherwise turn every task into an escalation); the report carries the question and the user can dispatch a follow-up.
- */
-export function trailingQuestion(text: string, items: readonly unknown[]): boolean {
-  if (didWork(items)) return false;
-  return text.split('\n').map(line => line.trim()).filter(Boolean).some(asks);
-}
-
 /**
  * Run one task in Codex through `codex app-server`. Every approval request and
  * user-input request reaches `deps.decide`; the returned hooks fit a native job.
@@ -144,7 +124,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   async function startTurn(text: string): Promise<void> {
     turnText = '';
     turnItems = [];
-    const result = await send('turn/start', { threadId, input: [{ type: 'text', text }], ...(task.permissions?.securityMode === 'full' ? { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } : task.permissions ? { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite', writableRoots: task.permissions.writableRoots, networkAccess: task.permissions.securityMode === 'standard', excludeTmpdirEnvVar: true, excludeSlashTmp: true } } : {}) }) as { turn?: { id?: string } };
+    const result = await send('turn/start', { threadId, outputSchema: CODEX_RESULT_SCHEMA, input: [{ type: 'text', text }], ...(task.permissions?.securityMode === 'full' ? { approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' } } : task.permissions ? { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite', writableRoots: task.permissions.writableRoots, networkAccess: task.permissions.securityMode === 'standard', excludeTmpdirEnvVar: true, excludeSlashTmp: true } } : {}) }) as { turn?: { id?: string } };
     turnId = result?.turn?.id;
     turnAbort = new AbortController();
     turnActive = true;
@@ -208,7 +188,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         } else {
           turnItems.push(item);
           const text = textOf(item);
-          if (text) { turnText = text; lastAssistant = text; const said = narration(text); if (said) deps.onActivity?.(said); }
+          if (text) { turnText = text; lastAssistant = parseTurnResult(text)?.text ?? text; const said = narration(lastAssistant); if (said) deps.onActivity?.(said); }
           if (item.type === 'fileChange' && (item as { status?: unknown }).status === 'completed') deps.onSuccess?.();
           if (item.type === 'commandExecution') {
             const done = item as { command?: unknown; exitCode?: unknown; aggregatedOutput?: unknown };
@@ -254,8 +234,14 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
         ...(failure ? { providerFailure: failure } : {}) });
     }
     if (turn?.status === 'interrupted') return finish({ status: 'killed', detail: cancelReason ?? 'interrupted', result: lastAssistant });
-    const text = turnText || lastAssistant;
-    if (trailingQuestion(text, items) && questionRounds < MAX_QUESTION_ROUNDS) {
+    const raw = [...(items ?? [])].reverse().map(textOf).find(Boolean) ?? turnText;
+    const result = parseTurnResult(raw);
+    if (!result) return finish({ status: 'failed', detail: 'Codex 未返回有效的结构化任务结果；未确认完成，请检查编码工具版本或续接。', result: raw });
+    const text = result.text;
+    lastAssistant = text;
+    if (result.status === 'blocked') return finish({ status: 'failed', detail: '编码工具报告任务受阻', result: text });
+    if (result.status === 'needs_input') {
+      if (questionRounds >= MAX_QUESTION_ROUNDS) return finish({ status: 'failed', detail: '澄清次数达到上限，仍有问题未解决；请核对目标后续接。', result: text });
       questionRounds++;
       try {
         const decision = await deps.decide(codexTextQuestion(text), controller.signal);

@@ -14,7 +14,6 @@ export interface EscalationOutcome {
   record: DecisionRecord;
   /** The owner session has no live agent: the task cannot reach the user. */
   unreachable?: true;
-  verificationSkipped?: { at: number; command: string };
 }
 
 const DETAIL_LIMIT = 1500;
@@ -53,12 +52,6 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
   }
   const questions = request.kind === 'question' ? coderQuestions(task, request) : [approvalQuestion(task, request, reason)];
   if (questions.length === 0) return { decision: { behavior: 'deny', message: '提问内容为空。' }, record: { ...base, outcome: 'deny', reason: '提问内容为空' } };
-  if (request.kind === 'question' && task.verify && !task.verificationSkipped) questions.push({
-    id: 'nexus-verification', header: '本次任务验收',
-    question: `原定独立验证为 ${task.verify}。回答上面的问题后，本次是否仍保留这项验证？`,
-    options: [{ label: '保留验证', description: '执行结束后按原要求独立验证' },
-      { label: '本次仅交付文件', description: '本次不再运行验证，结果保留为未验证；不会当作验收通过' }],
-  });
   let answer: AskUserQuestionAnswer;
   try {
     signal.throwIfAborted();
@@ -77,15 +70,11 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
     return { decision: { behavior: 'allow' }, record: { ...base, outcome: 'allow', ...(reason ? { reason } : {}) } };
   }
   const answers: Record<string, string> = {};
-  const verification = answer.answers.find(item => item.id === 'nexus-verification');
-  const skip = !!task.verify && !task.verificationSkipped && verification?.selected.length === 1
-    && verification.selected[0] === '本次仅交付文件' && !verification.custom?.trim();
   for (const [index, question] of (request.questions ?? []).entries()) {
     const item = answer.answers.find(entry => entry.id === String(index));
     const value = item ? [...item.selected, ...(item.custom ? [item.custom] : [])].join(', ') : '';
-    answers[question.question] = value + (skip ? '\n用户同时明确选择：本次仅交付文件，不再运行验证。DSH 已记录本次验收调整。' : '');
+    answers[question.question] = value;
   }
   return { decision: { behavior: 'allow', updatedInput: { ...request.raw, answers } },
-    ...(skip ? { verificationSkipped: { at: Date.now(), command: task.verify! } } : {}),
     record: { ...base, outcome: 'answer', reason: Object.values(answers).join(' | ').slice(0, 200) } };
 }

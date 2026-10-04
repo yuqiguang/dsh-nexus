@@ -1,3 +1,4 @@
+import { advanceTiming, initialTiming, TIMING_PHASES } from './timing.js';
 import { REVIEW_FAILURES } from './review.js';
 import { briefSnapshotSchema } from './brief.js';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
@@ -31,6 +32,10 @@ const resultSchema = z.object({
 });
 
 export const taskSchema: ZodType<TaskRecord> = z.object({
+  timing: z.object({ since: z.number(), phase: z.enum(TIMING_PHASES).optional(),
+    ms: z.object({ queue: z.number().nonnegative(), execution: z.number().nonnegative(), review: z.number().nonnegative(), user: z.number().nonnegative(), verification: z.number().nonnegative(), retry: z.number().nonnegative() }),
+    reviews: z.number().int().nonnegative(), retries: z.number().int().nonnegative() }).optional(),
+  reviewDepth: z.number().int().nonnegative().optional(),
   verificationOnly: z.boolean().optional(),
   id: z.string(),
   coder: z.enum(['claude', 'codex']),
@@ -122,7 +127,7 @@ export class CoderStore {
 
   active(): TaskRecord[] { return this.list().filter(isActive); }
 
-  put(task: TaskRecord): Promise<void> { return this.tasks.put(task.id, task); }
+  put(task: TaskRecord): Promise<void> { return this.tasks.put(task.id, { ...task, timing: task.timing ?? initialTiming(task) }); }
 
   /** Linking UI placement must not change the task's last execution timestamp. */
   async linkNotice(id: string, notice: NonNullable<TaskRecord['completionNotice']>): Promise<void> {
@@ -137,7 +142,9 @@ export class CoderStore {
     return this.tasks.update(id, current => {
       const next = change(current);
       const decisions = next.decisions ?? current.decisions;
-      return { ...current, ...next, decisions: decisions.slice(-KEEP_DECISIONS), updatedAt: Date.now() };
+      const now = Date.now();
+      const merged = { ...current, ...next, decisions: decisions.slice(-KEEP_DECISIONS), updatedAt: now };
+      return { ...merged, timing: advanceTiming(current, merged, now) };
     });
   }
 
@@ -145,7 +152,7 @@ export class CoderStore {
   async markInterrupted(): Promise<string[]> {
     const interrupted = this.active();
     for (const task of interrupted) {
-      await this.update(task.id, () => ({ status: 'interrupted', pending: undefined, ...(task.retry ? { retry: { ...task.retry, phase: 'stopped' as const, retryAt: undefined, reason: 'DSH 已重启，自动续接已停止；请在所属会话检查后继续' } } : {}), result: {
+      await this.tasks.update(task.id, current => ({ ...current, timing: current.timing ? { ...advanceTiming(current, current, current.updatedAt)!, phase: undefined } : undefined, updatedAt: Date.now(), status: 'interrupted', pending: undefined, reviewDepth: 0, ...(task.retry ? { retry: { ...task.retry, phase: 'stopped' as const, retryAt: undefined, reason: 'DSH 已重启，自动续接已停止；请在所属会话检查后继续' } } : {}), result: {
         summary: task.status === 'queued' ? '进程重启，排队任务未自动启动；请确认后重新派发。' : '进程重启，任务中断；编码工具的会话 ID 已保留，可以续接。', changedFiles: [], outsideRoots: [],
         ...(task.result ?? {}),
       } }));

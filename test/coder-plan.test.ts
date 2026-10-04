@@ -34,3 +34,14 @@ test('step dependencies resolve only within owner and revision, follow explicit 
   assert.deepEqual(resolvePlanStep(brief, 'ui', [original, resumed])!.dependsOn, ['task2']);
   assert.throws(() => resolvePlanStep(brief, 'ui', [original, { ...original, id: 'branch' }]), /多个执行分支/);
 });
+
+test('rotated channel generations resolve latest dependencies and still reject duplicate dispatch', () => {
+  const owner = `nexus-wechat-${'a'.repeat(32)}`;
+  const brief: CoderBrief = { id: 'rotated', ownerSession: owner, revision: 2, objective: 'goal', constraints: '', acceptance: acceptance.map(item => ({ ...item, text: item.id })), createdAt: 0, updatedAt: 0, plan: validatePlan(steps, acceptance) };
+  const prior: TaskRecord = { id: 'prior', coder: 'codex', description: 'API', cwd: '/work', ownerSession: `${owner}-1`, status: 'completed', createdAt: 1, updatedAt: 1, escalations: 0, decisions: [], planStep: 'api', jobId: 'job1', brief };
+  const latest = { ...prior, id: 'latest', ownerSession: `${owner}-2`, resumedFrom: prior.id };
+  assert.deepEqual(resolvePlanStep(brief, 'ui', [prior, latest])!.dependsOn, ['latest']);
+  assert.throws(() => resolvePlanStep(brief, 'api', [prior, latest]), /已经派发/);
+  assert.throws(() => resolvePlanStep(brief, 'api', [prior, latest], prior.id), /后续执行/);
+  assert.throws(() => resolvePlanStep(brief, 'ui', [{ ...latest, ownerSession: `nexus-wechat-${'b'.repeat(32)}-2` }]), /尚未派发/);
+});

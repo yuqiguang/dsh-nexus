@@ -1,3 +1,4 @@
+import type { TaskTiming } from './timing.js';
 import type { TaskRetry } from './retry.js';
 import type { BriefSnapshot } from './brief.js';
 import type { TaskPermissions } from './permissions.js';
@@ -131,6 +132,9 @@ export interface TaskRecord {
   replaces?: string;
   /** Explicit earlier tasks in the same owner session; all must pass independent verification. */
   dependsOn?: string[];
+  timing?: TaskTiming;
+  /** Number of in-flight automatic reviews, including review queue waits. */
+  reviewDepth?: number;
   createdAt: number;
   /** Actual execution start; queue wait is excluded from the runtime budget. */
   startedAt?: number;
