@@ -21,7 +21,7 @@ npm test
 
 涉及 DSH 生命周期、审批、渠道投递或恢复时，再运行 `npm run smoke`。构建、测试和集成检查应串行执行；资源有限时先停止其他 DSH 实例。集成检查使用临时目录和本地夹具，真实账号或渠道消息测试需另行明确安排。
 
-受限本地检查需要 `bubblewrap`、`iproute2` 和允许非特权用户命名空间的内核。`npm test` 中相关用例缺少依赖时会**跳过并说明缺少哪一项**（例如 `# bubblewrap (bwrap) is not installed`），不会静默通过；`npm run smoke` 会真实走这条路径，缺少依赖时直接失败。CI 自动安装 `bubblewrap`，真实隔离覆盖不会因本机缺少依赖而丢失。
+受限本地检查、独立验证和派发用例都依赖非特权用户命名空间。`npm test` 在缺少 `bubblewrap`、`iproute2`，或内核拒绝非特权用户命名空间时**跳过并说明缺少哪一项**（例如 `# bubblewrap (bwrap) is not installed`），不会静默通过；`npm run smoke` 会真实走这条路径，缺少依赖时直接失败。CI 自动安装 `bubblewrap`，并解除 Ubuntu 24.04 的 AppArmor 用户命名空间限制，再用一次裸 `unshare --user` 确认能力真的可用，因此真实隔离覆盖不会因本机缺少依赖而丢失。
 
 先说明可复现的问题及原因，再在失败边界做最小修改。不要修改 `node_modules`、复制 DSH 执行循环，或为修复界面/投递而重跑用户任务。远程消息必须绑定明确的所有者，审批和工作区边界不得扩大。
 

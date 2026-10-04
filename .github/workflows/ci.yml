@@ -22,10 +22,22 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
-      # The confined local-check tests need bubblewrap and iproute2; the runner image ships
-      # iproute2 but not bubblewrap, and the tests skip (with a reason) rather than silently
-      # pass when it is missing. Install it so the real isolation keeps being exercised in CI.
+      # The confined pipeline needs bubblewrap and iproute2; the runner image ships iproute2 but not
+      # bubblewrap, and the tests skip (with a reason) rather than silently pass when it is missing.
+      # Install it so the real isolation keeps being exercised in CI.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap iproute2
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor
+      # (`kernel.apparmor_restrict_unprivileged_userns=1`). `bwrap` needs one to build its uid map,
+      # and so does the suite's own `unshare --user`, so the confined checks and verification tests
+      # would otherwise fail with "Operation not permitted" — or skip, which is honest but is not
+      # coverage. Lift it for the run, then prove the capability is really there: the bare `unshare`
+      # fails the step instead of letting a hollow green through.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user true
       # Serial on purpose: the suite runs against `dist/`, so `check` must pass and `build` must
       # finish before `test` starts. See CONTRIBUTING.
       - run: npm run check
