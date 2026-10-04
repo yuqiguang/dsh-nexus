@@ -296,7 +296,7 @@ test('empty and truncated reviewer outputs retry once with a larger bounded allo
   }}} as unknown as Context;
   const input={task:'run tests',scope:'this command only',operation:'node test.cjs',evidence:['original evidence']};
   const result=await nativeSafetyReviewer(ctx,async event=>{audits.push(event);})(task('/tmp'),input,new AbortController().signal);
-  assert.equal(result.safe,true);assert.equal(calls,2);assert.ok(budgets[0]!<budgets[1]!&&budgets[1]!<=4096);
+  assert.equal(result.safe,true);assert.equal(calls,2);assert.ok(budgets[0]!>=4096&&budgets[0]!<budgets[1]!,'the first attempt gets room for analysis and a verdict, the retry more');
   assert.equal(inputs[0],inputs[1]);assert.ok(signals.every(signal=>signal.aborted),'finished attempt streams are released');
   assert.equal(audits[1]!.failure,first==='stop'?'empty':'truncated');assert.equal(audits[1]!.finishReason,first);
   assert.equal(audits[1]!.usage?.reasoningTokens,800);assert.equal(audits[2]!.attempt,2);

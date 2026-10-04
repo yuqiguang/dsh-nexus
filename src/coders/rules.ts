@@ -122,7 +122,9 @@ export function isProtectedPath(path: string, roots?: readonly string[], standar
   return underHome && ['.bashrc', '.profile', '.zshrc', '.bash_profile'].includes(name);
 }
 
-function mentionsProtectedPath(command: string, roots: readonly string[], standard: boolean): string | undefined {
+/** Path-shaped words in a shell command, with quoting removed. A quoted argument that itself looks like a command line is
+ * split again, so `bash -c "cat .env"` yields the inner path too. Used for credential matching and template exemptions. */
+export function commandPathTokens(command: string, roots: readonly string[] = []): string[] {
   const split = (text: string, depth = 0): string[] => (text.match(/"[^"]*"|'[^']*'|[^\s'"`;|&<>()]+/g) ?? []).flatMap(token => {
     if (!/^['"]/.test(token)) return [token];
     const value = commandPath(token.slice(1, -1));
@@ -131,8 +133,15 @@ function mentionsProtectedPath(command: string, roots: readonly string[], standa
       && isAbsolute(part) && value.startsWith(part + ' ')));
     return isAbsolute(value) ? [value, ...nested] : nested;
   });
-  const tokens = split(command);
-  for (const token of tokens) if (/[\/.~]/.test(token) && isProtectedPath(token, roots, standard)) return token;
+  return split(command);
+}
+
+/** `exempt` is consulted per token and only ever skips that one mention: the remaining tokens still decide, so
+ * `cp .env.example .env` is denied on `.env` even when the template itself is a verified placeholder file. */
+function mentionsProtectedPath(command: string, roots: readonly string[], standard: boolean, exempt?: (token: string) => boolean): string | undefined {
+  for (const token of commandPathTokens(command, roots)) {
+    if (/[\/.~]/.test(token) && isProtectedPath(token, roots, standard) && !exempt?.(token)) return token;
+  }
   return undefined;
 }
 
@@ -155,6 +164,8 @@ export function isPublicWebRequest(request: CoderRequest): boolean {
 /**
  * First decision layer. Returns `undefined` when no hard rule applies, which
  * never means "allow": the caller continues with the next layer.
+ * `safeTemplates` holds paths already verified against their own content as placeholder-only project templates: they exempt a
+ * file operation on that exact file, and a command that merely names that exact file, from the credential rule.
  */
 export function hardRule(request: CoderRequest, roots: readonly string[], webResearch = false, standard = false,
   cwd = roots[0] ?? '', safeTemplates: readonly string[] = []): HardVerdict | undefined {
@@ -173,7 +184,11 @@ export function hardRule(request: CoderRequest, roots: readonly string[], webRes
   }
   if (request.kind === 'command') {
     if (!standard && request.tool === 'Bash' && (request.raw.dangerouslyDisableSandbox === true || outside)) return { verdict: 'deny', reason: 'Claude 命令不能临时解除沙箱限制。目录外文件请改用文件工具申请审批；缺少联网域名请在设置中授权后新建任务。', key: 'claude-sandbox-boundary' };
-    const mentioned = mentionsProtectedPath(request.detail, roots, standard);
+    const mentioned = mentionsProtectedPath(request.detail, roots, standard, token => {
+      if (!safeTemplates.length) return false;
+      const resolved = resolve(cwd, commandPath(token));
+      return insideAny(roots, resolved) && safeTemplates.includes(resolved);
+    });
     if (mentioned) return { verdict: 'deny', reason: `命令涉及凭据或密钥文件：${mentioned}`, key: `credential:${baseName(mentioned)}` };
     for (const [pattern, reason] of DENY_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'deny', reason, key: `command:${reason}` };
     for (const [pattern, reason] of ESCALATE_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'escalate', reason, manualOnly: true };

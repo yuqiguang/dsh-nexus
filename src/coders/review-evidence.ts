@@ -11,6 +11,14 @@ const FILE = new RegExp(`\\.${EXTENSIONS}$`, 'i');
 const MAX_FILE = 96 * 1024;
 const MAX_TOTAL = 192 * 1024;
 const MAX_FILES = 24;
+/**
+ * Module candidates tried against the filesystem before the scan gives up. Each absolute import is tried against three bases
+ * and each imported name against two forms, so an ordinary project spends several probes per import: a six-test Python
+ * project (kb-service, ct-4c671559) used more than 192 and was reported incomplete for it, which reads to the reviewer as
+ * "evidence missing" and turns every approval into an owner prompt. What bounds the evidence is the read budget above, not
+ * this: this only bounds how many paths are looked at.
+ */
+const MAX_MODULE_PROBES = 2000;
 
 /** Discover literal source references, not executable instructions. Dynamic references remain for the reviewer to assess. */
 function references(text: string): string[] {
@@ -21,14 +29,19 @@ function references(text: string): string[] {
   }
   const bare = new RegExp(`(?:^|[\\s=;(])([^\\s"'\x60;&|<>()]+\\.${EXTENSIONS})(?=$|::|[\\s"'\x60;&|<>()])`, 'gim');
   for (const match of text.matchAll(bare)) values.add(match[1]!);
-  return [...values];
+  // A flag, a glob or a bare extension is a word that happens to end in one, not a file the command names.
+  return [...values].filter(name => !/^[-*]/.test(name) && !/[?*]/.test(name) && !new RegExp(`^\\.${EXTENSIONS}$`, 'i').test(name));
 }
 
 /** A bounded, complete read per source, recursively including literal local inputs such as HTML and imported scripts. */
 export async function commandEvidence(command: string, cwd: string, within: (path: string) => Promise<string>): Promise<{ evidence: string[]; complete: boolean }> {
   const evidence: string[] = [];
   const seen = new Set<string>();
-  const queue: { path: string; optional?: boolean }[] = [{ path: resolve(cwd, 'package.json'), optional: true }];
+  // `optional` marks a path the command was not seen to name — one guessed from source text or probed because the run needs
+  // it. A missing optional path is not evidence, and listing every one of them buries the files that are (ct-4c671559);
+  // the probes are summarized in one line instead.
+  const queue: { path: string; optional?: boolean; probe?: boolean }[] = [{ path: resolve(cwd, 'package.json'), optional: true, probe: true }];
+  const missingProbes: string[] = [];
   let bytes = 0, complete = true;
   let moduleProbes = 0;
   const probes = new Map<string, boolean>();
@@ -36,7 +49,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   const localFile = async (path: string) => {
     if (probes.has(path)) return probes.get(path)!;
     if (!inProject(path)) { complete = false; return false; }
-    if (++moduleProbes > 192) { complete = false; return false; }
+    if (++moduleProbes > MAX_MODULE_PROBES) { complete = false; return false; }
     try { const real = await within(path); const exists = (await lstat(real)).isFile(); probes.set(path, exists); return exists; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -72,7 +85,10 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       const path = commandPath(name);
       // A quoted shell expression isn't itself a path; bare references inside it are collected separately.
       if (!isAbsolute(path) && /[\s;&|<>]/.test(path)) continue;
-      queue.push({ path: resolve(base, path), ...(fromSource && /\.(?:md|txt|json|html?|css)$/i.test(path) ? { optional: true } : {}) });
+      // A path named inside a file's content is a lead the command never claimed: when it exists it is read and hashed like
+      // any other, but its absence is not missing evidence. A test fixture name — `("程序.py", b"hello", 400)` in kb-service
+      // (ct-4c671559) — otherwise made the whole review "incomplete" and turned every approval into an owner prompt.
+      queue.push({ path: resolve(base, path), ...(fromSource ? { optional: true } : {}) });
       if (base !== cwd && !isAbsolute(path)) queue.push({ path: resolve(cwd, path), optional: true });
     }
   };
@@ -87,12 +103,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     evidence.push(...discovered.evidence);
     complete &&= discovered.complete;
     const targets = queue.filter(item => /\.py$/i.test(item.path));
-    if (!targets.length) { evidence.push('pytest 未找到默认命名的测试文件，不能确认测试发现范围。'); complete = false; }
-    for (const file of ['conftest.py', 'pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini']) queue.push({ path: resolve(cwd, file), optional: true });
+    // Only a scan that reached the end of the tree can report that the project has no tests; a truncated scan already said why.
+    if (!discovered.paths.length && discovered.complete) { evidence.push('pytest 未找到默认命名的测试文件，不能确认测试发现范围。'); complete = false; }
+    for (const file of ['conftest.py', 'pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini']) queue.push({ path: resolve(cwd, file), optional: true, probe: true });
     for (const target of targets) {
       for (let parent = dirname(target.path); inProject(parent); parent = dirname(parent)) {
-        queue.push({ path: resolve(parent, 'conftest.py'), optional: true });
-        queue.push({ path: resolve(parent, '__init__.py'), optional: true });
+        queue.push({ path: resolve(parent, 'conftest.py'), optional: true, probe: true });
+        queue.push({ path: resolve(parent, '__init__.py'), optional: true, probe: true });
         if (parent === cwd) break;
       }
     }
@@ -108,7 +125,11 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     try { real = await within(candidate.path); }
     catch { evidence.push(`${redact(candidate.path)}: 未读取，超出允许的审核边界`); complete = false; continue; }
     const info = await lstat(real).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });
-    if (!info) { evidence.push(`${redact(real)}: 不存在`); if (!candidate.optional) complete = false; continue; }
+    if (!info) {
+      if (!candidate.optional) complete = false;
+      if (candidate.probe) missingProbes.push(redact(real));
+      continue;
+    }
     if (++files > MAX_FILES) { evidence.push('关联文件超过审核数量上限，证据不完整；不得假定未读取的代码安全。'); complete = false; break; }
     if (!info.isFile() || info.size > MAX_FILE || bytes + info.size > MAX_TOTAL) {
       evidence.push(`${redact(real)}: 未读取完整内容（文件类型或大小超出审核上限），不能推断行为`); complete = false; continue;
@@ -143,7 +164,8 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       add(source, dirname(real), true);
     } finally { await file.close(); }
   }
-  if (moduleProbes > 192) evidence.push('Python 模块定位超过数量上限，未继续探测；证据不完整。');
+  if (moduleProbes > MAX_MODULE_PROBES) evidence.push(`Python 模块定位超过 ${MAX_MODULE_PROBES} 个候选路径，未继续探测；证据不完整。`);
+  if (missingProbes.length) evidence.push(`未找到的可选配置文件：${missingProbes.join('、')}。没有内容可作证据，也不代表其声明不存在。`);
   evidence.push('以上只收集可识别的文件引用和静态 Python 导入，不证明依赖完整；动态加载、间接执行、环境与网络行为须结合完整命令和代码判断。');
   return { evidence, complete };
 }

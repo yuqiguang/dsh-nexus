@@ -95,6 +95,47 @@ test('pytest discovery does not follow links and stops at a bounded number of di
   assert.match(many.evidence.join('\n'), /上限/);
 });
 
+test('a generated pytest tmp_path tree does not spend the discovery budget before the project tests', async t => {
+  const f = await fixture(t);
+  await f.write('pytest.ini', '[pytest]\ntestpaths = tests\n');
+  await f.write('tests/test_api.py', 'from app.main import run\n# BUDGET_TEST');
+  await f.write('app/main.py', '# BUDGET_APP');
+  // pytest keeps tmp_path fixtures under <basetemp>/pytest-of-<user>; a project whose TEMP points inside itself grows this on
+  // every run, and it sorts before `tests`. It is never a project test, so it must not use up the entry budget (ct-4c671559).
+  await mkdir(join(f.cwd, 'pytest-of-Administrator'), { recursive: true });
+  for (let i = 0; i < 300; i++) await writeFile(join(f.cwd, 'pytest-of-Administrator', `tmp${i}`), '');
+  const result = await f.inspect('python -m pytest -q tests');
+  assert.equal(result.evidenceComplete, true);
+  assert.doesNotMatch(result.evidence.join('\n'), /未找到默认命名的测试文件/);
+  for (const marker of ['BUDGET_TEST', 'BUDGET_APP']) assert.match(result.evidence.join('\n'), new RegExp(marker));
+});
+
+test('flags, globs and bare extensions are not reported as missing project files', async t => {
+  const f = await fixture(t);
+  await f.write('app/main.py', '# GREP_TARGET');
+  const result = await f.inspect('grep -rn --include=*.py load_dotenv .');
+  const text = result.evidence.join('\n');
+  assert.doesNotMatch(text, /\*\.py/, 'a glob is a word that ends in an extension, not a file the command named');
+  assert.doesNotMatch(text, /: 不存在/);
+  assert.match(text, /未找到的可选配置文件/);
+});
+
+test('a filename quoted in source that does not exist is not missing evidence', async t => {
+  const f = await fixture(t);
+  await f.write('pytest.ini', '[pytest]\ntestpaths = tests\n');
+  await f.write('tests/test_upload.py', 'import pytest\nCASES = [("程序.py", b"hello", 400), ("坏文件.md", b"\\xff", 400)]\n# UPLOAD_TEST');
+  const result = await f.inspect('python -m pytest -q');
+  assert.equal(result.evidenceComplete, true, 'a test fixture name is a string, not a claim that the file exists');
+  assert.match(result.evidence.join('\n'), /UPLOAD_TEST/);
+});
+
+test('many import statements are located without being mistaken for unreadable evidence', async t => {
+  const f = await fixture(t);
+  await f.write('many.py', Array.from({ length: 150 }, (_, i) => `import module${i}`).join('\n'));
+  const result = await f.inspect('python many.py');
+  assert.equal(result.evidenceComplete, true, 'module location is bounded by the read budget, not by a small probe count');
+});
+
 test('Python imports cannot disclose protected files or follow symlinks outside the review root', async t => {
   const f = await fixture(t);
   await writeFile(join(f.root, 'private.py'), '# OUTSIDE_SECRET_CONTENT');

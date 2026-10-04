@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import type { CoderKind } from './types.js';
 import type { CodexSettings } from './settings.js';
 import { redact } from './normalize.js';
+import { createOutputDecoder } from './decode.js';
 import type { DownloadProgress } from './install-download.js';
 import { MANAGED_PACKAGES, isManagedVersion, safeDownloadUrl } from './install-shared.js';
 export { MANAGED_PACKAGES, safeDownloadUrl } from './install-shared.js';
@@ -98,11 +99,12 @@ export function probe(command: string, args: string[], env: NodeJS.ProcessEnv, t
     // On timeout, do not wait for `close`: a grandchild may keep the pipes open long after the child is gone.
     const timer = setTimeout(() => { child.kill('SIGKILL'); child.stdout.destroy(); child.stderr.destroy(); settle({ ok: false, output: `${output}\n[probe timed out after ${timeoutMs} ms]`.trim() }); }, timeoutMs);
     timer.unref();
-    const collect = (chunk: Buffer) => { output = (output + chunk.toString()).slice(-4096); };
+    const decoder = createOutputDecoder();
+    const collect = (chunk: Buffer) => { output = (output + decoder.push(chunk)).slice(-4096); };
     child.stdout.on('data', collect);
     child.stderr.on('data', collect);
-    child.on('error', error => settle({ ok: false, output: `${output}\n${error.message}`.trim() }));
-    child.on('close', code => settle({ ok: code === 0, output: output.trim() }));
+    child.on('error', error => { output += decoder.flush(); settle({ ok: false, output: `${output}\n${error.message}`.trim() }); });
+    child.on('close', code => { output += decoder.flush(); settle({ ok: code === 0, output: output.trim() }); });
   });
 }
 
@@ -342,8 +344,11 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
       let killer: NodeJS.Timeout | undefined;
       const abort = () => { group('SIGTERM'); killer = setTimeout(() => group('SIGKILL'), killGraceMs); killer.unref(); };
       if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
-      child.stdout!.on('data', chunk => onOutput(chunk.toString()));
-      child.stderr!.on('data', chunk => onOutput(chunk.toString()));
+      // One decoder per stream: an installer's own output follows the console code page on Windows, and its progress lines
+      // reach the owner directly, so they are read back as text rather than as UTF-8 with replacement characters.
+      const logDecoder = createOutputDecoder(), errorDecoder = createOutputDecoder();
+      child.stdout!.on('data', chunk => onOutput(logDecoder.push(chunk)));
+      child.stderr!.on('data', chunk => onOutput(errorDecoder.push(chunk)));
       let metrics = '', workerError: string | undefined;
       child.stdio[3]?.on('data', chunk => {
         metrics += chunk.toString();
@@ -367,6 +372,7 @@ export function createNpmRunner(command = 'npm', killGraceMs = 5_000): NpmRunner
         }
       });
       const finish = (result: { code: number | null; error?: string }) => {
+        onOutput(logDecoder.flush()); onOutput(errorDecoder.flush());
         signal.removeEventListener('abort', abort);
         if (killer) clearTimeout(killer);
         resolvePromise(signal.aborted ? { ...result, error: result.error ?? 'install_timeout' } : { ...result, ...(workerError ? { error: workerError } : {}) });

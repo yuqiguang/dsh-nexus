@@ -41,7 +41,7 @@ import { decideLayers } from './decide.js';
 import { escalateToUser } from './escalate.js';
 import { DECISION_LABEL, HABIT_KINDS, KIND_LABEL, describeRule, isOpaque, projectRules, tokens } from './habits.js';
 import { isInside, isProtectedPath, isProjectEnvironment, isEnvironmentFile } from './rules.js';
-import { checkedEnvironmentTemplates, environmentApprovalDisplay } from './environment-files.js';
+import { checkedCommandTemplates, checkedEnvironmentTemplates, environmentApprovalDisplay } from './environment-files.js';
 import { canonical, taskPermissions, permissionSummary } from './permissions.js';
 import type {} from '@deepseek-ai/dsh-sandbox';
 import type {} from '@deepseek-ai/dsh-sandbox-policy';
@@ -345,14 +345,18 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const requestedPaths = request.paths;
     try { request = { ...request, paths: await Promise.all(request.paths.map(canonical)) }; }
     catch { const stop = repeated(task, 'path-unresolved', '无法确认请求路径的真实边界'); return { behavior: 'deny', message: '无法确认请求路径的真实边界。', ...(stop ? { interrupt: true } : {}) }; }
-    const safeTemplates = await checkedEnvironmentTemplates(request, task.cwd, task.permissions?.securityMode === 'standard');
+    const standard = task.permissions?.securityMode === 'standard';
+    const safeTemplates = await checkedEnvironmentTemplates(request, task.cwd, standard);
+    // A command that only names a template the file tools may already read is not a credential operation; treat it the same
+    // way instead of denying a read-only command for mentioning a file the owner just approved (ct-4c671559).
+    if (request.kind === 'command') safeTemplates.push(...await checkedCommandTemplates(request.detail, task.cwd, standard));
     request = environmentApprovalDisplay(request);
     const currentTask = store.get(taskId);
     if (signal.aborted || !currentTask || currentTask.stopReason || !isActive(currentTask)) return { behavior: 'deny', message: '任务已停止。', interrupt: true };
     const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
     const environmentRedirect = requestedPaths.some((path, index) => isEnvironmentFile(path) && !samePath(path, request.paths[index]!));
     const verdict = environmentRedirect ? { layer: 'hard' as const, key: 'environment-link', reason: '环境配置路径通过链接重定向，请使用项目内真实文件路径' }
-      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard', safeTemplates);
+      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates);
     const at = Date.now();
     const step = liveOf.get(taskId)?.record ?? (() => {});
     if (verdict.layer === 'auto') {

@@ -1,7 +1,9 @@
 import { constants } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { canonical } from './permissions.js';
-import { isEnvironmentFile, isEnvironmentTemplate, isProjectEnvironment } from './rules.js';
+import { commandPath } from './command-path.js';
+import { commandPathTokens, isEnvironmentFile, isEnvironmentTemplate, isProjectEnvironment } from './rules.js';
 import type { CoderRequest } from './types.js';
 
 const LIMIT = 32 * 1024;
@@ -77,6 +79,28 @@ export async function checkedEnvironmentTemplates(request: CoderRequest, cwd: st
     } catch { /* Unknown state keeps the normal credential decision. */ }
   }
   return approved;
+}
+
+/**
+ * The same content check `checkedEnvironmentTemplates` applies to file tools, for a command that only names a template.
+ * Nothing here trusts the name: a real secret saved as `.env.example`, a symlink to one, or a hard link all keep the
+ * credential answer, because the file's own readable content has to be placeholder-only. Only that exact path is exempt;
+ * any other token in the command is still matched by the credential rule on its own.
+ */
+export async function checkedCommandTemplates(detail: string, cwd: string, standard: boolean): Promise<string[]> {
+  const approved: string[] = [];
+  for (const token of commandPathTokens(detail)) {
+    if (!isEnvironmentTemplate(token)) continue;
+    const path = resolve(cwd, commandPath(token));
+    if (!isProjectEnvironment(path, cwd, standard)) continue;
+    try {
+      if (await canonical(path) !== path) continue;
+      const content = await readEnvironmentTemplate(path);
+      if (content === undefined || !safeEnvironmentTemplate(content)) continue;
+      if (await canonical(path) === path) approved.push(path);
+    } catch { /* Unknown state keeps the normal credential decision. */ }
+  }
+  return [...new Set(approved)];
 }
 
 /** Owner approvals name the file and operation; never put dotenv values into messages or stored decisions. */

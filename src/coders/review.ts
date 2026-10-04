@@ -18,7 +18,13 @@ import { commandRuntimeEvidence } from './runtime.js';
 export interface ReviewInput { task: string; goal?: string; constraints?: string; securityMode?: 'standard' | 'strict'; scope: string; operation: string; evidence: string[]; evidenceComplete?: boolean; reviewInstructions?: string }
 export interface ReviewResult { safe: boolean; reason: string; repeatable?: boolean }
 export type SafetyReviewer = (task: TaskRecord, input: ReviewInput, signal: AbortSignal) => Promise<ReviewResult>;
-export const REVIEW_TIMEOUT_MS = 60_000;
+/**
+ * The whole review phase — queue wait, both evidence preparations and both attempts — shares this one deadline, so it has to
+ * cover the output budgets the reviewer may spend. The truncating attempt recorded in ct-4c671559 produced its 2048 tokens in
+ * 19.7 s, so a 4096-token first attempt can take about 40 s and a 6144-token retry about 60 s; 60 s in total only ever fit one
+ * of them, and a deadline turns into a `timeout`, which is not retried. Measured rates, not a guess.
+ */
+export const REVIEW_TIMEOUT_MS = 180_000;
 
 /** Do not depend on a provider honoring cancellation to release an approval waiter. */
 export async function reviewUntilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -210,8 +216,10 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
     for (let attempt = 1; attempt <= 2; attempt++) {
       active.throwIfAborted();
       const id = `review-${randomBytes(8).toString('hex')}`;
-      // Reasoning models need room to produce the final JSON after their analysis.
-      const maxTokens = attempt === 1 ? 2048 : 4096;
+      // Reasoning models need room to produce the final JSON after their analysis. A project-wide command review spent a
+      // whole 2048-token first attempt on analysis and only reached a verdict on the retry, so the first attempt is no longer
+      // the smaller one (ct-4c671559); the retry still gets more. DSH owns provider retries; this is only the output budget.
+      const maxTokens = attempt === 1 ? 4096 : 6144;
       const base = { id, taskId: task.id, attempt, maxTokens };
       await audit({ ...base, phase: 'request', provider: config.provider, model: config.model, system, input: text });
       let output = '', finishReason: string | undefined, usage: ReviewAudit['usage'];
@@ -227,7 +235,7 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
             if (next.done) break;
             const chunk = next.value;
             if (chunk.type === 'text-delta') output += chunk.text;
-            if (output.length > 8000) { failure = 'too-long'; break; }
+            if (output.length > 32_000) { failure = 'too-long'; break; }
             if (chunk.type === 'usage') {
               const { inputTokens, outputTokens, reasoningTokens, totalTokens } = chunk.usage;
               // Keep counts, never reasoning text, provider errors or authenticated URLs.
