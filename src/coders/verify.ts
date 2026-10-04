@@ -213,15 +213,15 @@ export async function runVerifyCommand(command: string, cwd: string, signal?: Ab
       kill();
       resolvePromise(result);
     };
-    const decoder = createOutputDecoder();
-    const collect = (chunk: Buffer) => { output = (output + decoder.push(chunk)).slice(-OUTPUT_LIMIT); };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    const stdoutDecoder = createOutputDecoder(), stderrDecoder = createOutputDecoder();
+    const collect = (text: string) => { output = (output + text).slice(-OUTPUT_LIMIT); };
+    child.stdout.on('data', chunk => collect(stdoutDecoder.push(chunk)));
+    child.stderr.on('data', chunk => collect(stderrDecoder.push(chunk)));
     const brokenPipe = () => { streamFailed = true; output += '\n验证进程输出连接中断。'; kill(); };
     child.stdout.on('error', brokenPipe);
     child.stderr.on('error', brokenPipe);
-    child.on('error', error => { output += decoder.flush(); settle({ ok: false, executed: !!child.pid, output: `${output}\n${child.pid ? '验证进程错误' : '验证未执行：进程启动失败'}：${error.message}`.trim() }); });
-    child.on('close', (code, signalName) => { output += decoder.flush(); settle({ ok: code === 0 && !timedOut && !streamFailed && !signal?.aborted && taskProcessCleaned(child),
+    child.on('error', error => { collect(stdoutDecoder.flush() + stderrDecoder.flush()); settle({ ok: false, executed: !!child.pid, output: `${output}\n${child.pid ? '验证进程错误' : '验证未执行：进程启动失败'}：${error.message}`.trim() }); });
+    child.on('close', (code, signalName) => { collect(stdoutDecoder.flush() + stderrDecoder.flush()); settle({ ok: code === 0 && !timedOut && !streamFailed && !signal?.aborted && taskProcessCleaned(child),
       output: !taskProcessCleaned(child) ? `${output}\n无法确认 Windows 验证进程已完全清理。` : code === 0 ? output : `${output}\n[exit ${code ?? signalName ?? 'unknown'}]`.trim() }); });
   });
 }

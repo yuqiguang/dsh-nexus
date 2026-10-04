@@ -1348,6 +1348,20 @@ test('coder_steer reaches the running Codex task, records what the user added, a
   assert.equal((fake.sent.find(message => message.method === 'turn/steer')!.params as { input: { text: string }[] }).input[0]!.text, '只改 src/，别动测试文件。');
   await until(() => harness.tasks.get(id)!.trace!.some(step => step.text === '用户补充：只改 src/，别动测试文件。'), 'the addition recorded as a step');
 
+  const original = harness.tasks.get(id)!;
+  const chat = `nexus-wechat-${'a'.repeat(32)}`;
+  harness.tasks.set(id, { ...original, ownerSession: `${chat}-1` });
+  Object.assign(harness.session, { header: { cwd: workdir } });
+  assert.match((await harness.run('coder_steer', { task_id: id, message: '同一项目继续' }, `${chat}-2`)).text!, /已转给/);
+  const otherWorkspace = join(workdir, 'other-project');
+  await mkdir(otherWorkspace);
+  Object.assign(harness.session, { header: { cwd: otherWorkspace } });
+  const beforeSteer = fake.sent.filter(message => message.method === 'turn/steer').length;
+  await assert.rejects(harness.run('coder_steer', { task_id: id, message: '不能修改旧项目' }, `${chat}-2`), /当前会话工作区/);
+  assert.equal(fake.sent.filter(message => message.method === 'turn/steer').length, beforeSteer);
+  Object.assign(harness.session, { header: { cwd: workdir } });
+  harness.tasks.set(id, { ...harness.tasks.get(id)!, ownerSession: original.ownerSession });
+
   const running = harness.tasks.get(id)!;
   harness.tasks.set(id, { ...running, status: 'waiting-user', pending: { at: 1, kind: 'command', summary: '命令：git push' } });
   await assert.rejects(harness.run('coder_steer', { message: '停', interrupt: true }), /正在等用户回答：命令：git push。先让用户回答/);
@@ -2786,4 +2800,21 @@ test('denied or cancelled preflight never launches its command or the coder', as
     assert.equal(codingRuns, 0);
     await assert.rejects(readFile(join(root, 'executed.txt')), { code: 'ENOENT' });
   });
+});
+
+
+test('verification keeps stdout and stderr byte fragments separate', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-output-pipes-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, 'output.cjs'), `
+    const bytes = Buffer.from('中');
+    process.stdout.write(bytes.subarray(0, 1));
+    setTimeout(() => {
+      process.stderr.write('ERR');
+      setTimeout(() => process.stdout.write(bytes.subarray(1)), 50);
+    }, 50);
+  `);
+  const result = await runVerifyCommand('node output.cjs', cwd);
+  assert.equal(result.ok, true, result.output);
+  assert.equal(result.output, 'ERR中');
 });

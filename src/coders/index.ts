@@ -1024,6 +1024,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       if (interrupt && task.status === 'waiting-user') {
         throw new Error(`任务 ${task.id} 正在等用户回答：${task.pending?.summary ?? ''}。先让用户回答（或拒绝）这条请求再打断；不打断的调整现在就能发，Codex 会在这条请求答完后看到。`);
       }
+      // A chat may rotate into another workspace. Reading its history does not grant
+      // this generation permission to change an old workspace's running task.
+      const directory = await coderDirectory(await scopeFor(exec.agent.session), task.cwd);
+      if (directory !== resolve(task.cwd)) throw new Error('任务目录已改变，请先核对原任务工作区。');
       await live.steer(message, interrupt);
       live.record(`${interrupt ? '用户打断' : '用户补充'}：${oneLine(message, 100)}`);
       return { text: interrupt ? `已打断 Codex 正在做的事，这段话会作为下一回合的开始（任务 ${task.id}）。`

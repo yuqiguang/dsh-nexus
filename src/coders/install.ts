@@ -99,12 +99,12 @@ export function probe(command: string, args: string[], env: NodeJS.ProcessEnv, t
     // On timeout, do not wait for `close`: a grandchild may keep the pipes open long after the child is gone.
     const timer = setTimeout(() => { child.kill('SIGKILL'); child.stdout.destroy(); child.stderr.destroy(); settle({ ok: false, output: `${output}\n[probe timed out after ${timeoutMs} ms]`.trim() }); }, timeoutMs);
     timer.unref();
-    const decoder = createOutputDecoder();
-    const collect = (chunk: Buffer) => { output = (output + decoder.push(chunk)).slice(-4096); };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
-    child.on('error', error => { output += decoder.flush(); settle({ ok: false, output: `${output}\n${error.message}`.trim() }); });
-    child.on('close', code => { output += decoder.flush(); settle({ ok: code === 0, output: output.trim() }); });
+    const stdoutDecoder = createOutputDecoder(), stderrDecoder = createOutputDecoder();
+    const collect = (text: string) => { output = (output + text).slice(-4096); };
+    child.stdout.on('data', chunk => collect(stdoutDecoder.push(chunk)));
+    child.stderr.on('data', chunk => collect(stderrDecoder.push(chunk)));
+    child.on('error', error => { collect(stdoutDecoder.flush() + stderrDecoder.flush()); settle({ ok: false, output: `${output}\n${error.message}`.trim() }); });
+    child.on('close', code => { collect(stdoutDecoder.flush() + stderrDecoder.flush()); settle({ ok: code === 0, output: output.trim() }); });
   });
 }
 

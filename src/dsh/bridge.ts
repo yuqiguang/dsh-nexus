@@ -114,6 +114,31 @@ export class DshChannelBridge {
     return this.routes.get(sessionId) ?? this.bases.get(SessionId(baseSessionOf(sessionId)));
   }
 
+  /** History remains addressable for native jobs and scoped interactions, not new desktop conversation. */
+  private historicalWechat(sessionId: string): boolean {
+    const chatId = this.chatOf(SessionId(sessionId));
+    return this.config.channel === 'wechat' && !!chatId && this.chats.get(chatId) !== sessionId;
+  }
+
+  private historicalText(sessionId: string, text: string): string {
+    if (!this.historicalWechat(sessionId) || text.startsWith('[历史微信会话 ')) return text;
+    return `[历史微信会话 ${sessionId}]\n${text}\n普通聊天回复会进入当前微信会话；继续此任务请在电脑端打开上述会话。`;
+  }
+
+  private deliverableTurn(sessionId: string, events: readonly SessionEvent[], turn: number): boolean {
+    if (!this.historicalWechat(sessionId)) return true;
+    const start = events.findLastIndex(event => event.type === 'turn/start' && event.data.turn === turn);
+    if (start < 0) return false;
+    const typed = events.slice(start).filter(event => event.type === 'user/message');
+    // Use native origin metadata, never message wording. A desktop turn mixed with a job notice
+    // is still local; a WeChat turn admitted before rotation can finish in its original session.
+    return typed.length > 0 && typed.every(event => {
+      if (event.type !== 'user/message') return false;
+      const rpcId = String((event.data.source as { rpcId?: unknown }).rpcId ?? '');
+      return pluginInitiated(event.data) || rpcId.startsWith('wechat-') || rpcId.includes('-hook-');
+    });
+  }
+
   /**
    * Resume the sessions this bridge can route before any message arrives, so
    * pending native work and delivery recovery are attached after a restart. A session that was never
@@ -248,7 +273,7 @@ export class DshChannelBridge {
       this.caughtUp.add(`${sessionId}:${end.data.turn}`);
       if (end.data.reason.kind === 'interrupted') {
         const work = interruptedWork(scope);
-        if (work) await this.push(sessionId, chatId, interruptedNotice(work, this.extras.timeZone?.()), identity('interrupted', sessionId, String(end.data.turn)));
+        if (work && this.deliverableTurn(sessionId, scope, end.data.turn)) await this.push(sessionId, chatId, interruptedNotice(work, this.extras.timeZone?.()), identity('interrupted', sessionId, String(end.data.turn)));
       } else {
         await this.deliver(chatId, sessionId, end, scope);
       }
@@ -258,13 +283,14 @@ export class DshChannelBridge {
     const open = interruptedWork(events);
     if (open && open.turn > mark && !ends.some(end => end.data.turn === open.turn)) {
       this.caughtUp.add(`${sessionId}:${open.turn}`);
-      await this.push(sessionId, chatId, interruptedNotice(open, this.extras.timeZone?.()), identity('interrupted', sessionId, String(open.turn)));
+      if (this.deliverableTurn(sessionId, events, open.turn)) await this.push(sessionId, chatId, interruptedNotice(open, this.extras.timeZone?.()), identity('interrupted', sessionId, String(open.turn)));
       await ledger.set(sessionId, open.turn, this.now());
     }
   }
 
   /** A proactive text: held during quiet hours like any push, durable otherwise. */
   private async push(sessionId: SessionId, chatId: string, text: string, deliveryId: string): Promise<void> {
+    text = this.historicalText(sessionId, text);
     if (this.gate?.quiet()) { await this.gate.hold(sessionId, text, deliveryId); return; }
     await this.transport.sendText(chatId, text, deliveryId, { durable: true });
   }
@@ -307,7 +333,7 @@ export class DshChannelBridge {
   async notify(sessionId: string, text: string, deliveryId: string): Promise<boolean> {
     const chatId = this.chatOf(SessionId(sessionId));
     if (!chatId || this.stopped) return false;
-    await this.transport.sendText(chatId, text, deliveryId, { durable: true });
+    await this.transport.sendText(chatId, this.historicalText(sessionId, text), deliveryId, { durable: true });
     return true;
   }
 
@@ -651,11 +677,11 @@ export class DshChannelBridge {
   async ask(request: AskUserQuestionRequest, next: (signal?: AbortSignal) => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> {
     const chatId = request.agent && this.chatOf(request.agent.id);
     if (!chatId || this.stopped) return next();
-    const prompts = request.questions.map((question, index) => questionPrompt(question, index, request.questions.length));
+    const prompts = request.questions.map((question, index) => this.historicalText(request.agent!.id, questionPrompt(question, index, request.questions.length)));
     if (prompts.some(prompt => prompt.length > 2500)) {
       const local = new AbortController();
       const signal = AbortSignal.any([local.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
-      void this.transport.sendText(chatId, '这个问题需要在本机 DSH 查看完整内容并回答。',
+      void this.transport.sendText(chatId, this.historicalText(request.agent!.id, '这个问题需要在本机 DSH 查看完整内容并回答。'),
         identity('local-question', request.agent!.id, ...request.questions.map(question => question.id)), { signal })
         .catch(() => { if (!signal.aborted) this.promptDeliveryFailed(request, request.agent!.id); });
       try {
@@ -708,7 +734,7 @@ export class DshChannelBridge {
   private desktopReceipt(chatId: string, text: string | undefined, deliveryId: string, sessionId?: string): void {
     if (!text || this.stopped) return;
     this.outgoing = this.outgoing.then(async () => {
-      if (!this.stopped) await this.transport.sendText(chatId, text, deliveryId, { durable: true,
+      if (!this.stopped) await this.transport.sendText(chatId, sessionId ? this.historicalText(sessionId, text) : text, deliveryId, { durable: true,
         ...(sessionId ? { batchKey: identity('desktop-receipts', sessionId) } : {}) });
     }).catch(() => { this.report('channel_desktop_receipt_failed'); });
   }
@@ -746,12 +772,12 @@ export class DshChannelBridge {
         if (typeof parsed?.description === 'string') title = parsed.description;
       } catch { /* Preserve the exact original arguments if they cannot be formatted. */ }
     }
-    const prompt = `需要你确认后继续\n操作：${title}\n${request.reason ? `原因：${request.reason}\n` : ''}完整参数：\n${parameters}`;
+    const prompt = this.historicalText(request.agent.id, `需要你确认后继续\n操作：${title}\n${request.reason ? `原因：${request.reason}\n` : ''}完整参数：\n${parameters}`);
     // Exact arguments must fit in the remote prompt. Larger or unbound requests remain in the native UI.
     if (!args || prompt.length > 2500) {
       const local = new AbortController();
       const signal = AbortSignal.any([local.signal, this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
-      void this.transport.sendText(chatId, '此操作需要在本机 DSH 查看完整参数并审批。',
+      void this.transport.sendText(chatId, this.historicalText(request.agent.id, '此操作需要在本机 DSH 查看完整参数并审批。'),
         identity('local-approval', request.agent.id, String(request.callId)), { signal })
         .catch(() => { if (!signal.aborted) this.promptDeliveryFailed(request, request.agent.id); });
       try {
@@ -766,7 +792,7 @@ export class DshChannelBridge {
     void this.transport.sendText(chatId,
       `${prompt}\n\n也可在本机 DSH 审批；任一端处理后另一端失效。\n只有一项待审批时，直接回复“允许”或“拒绝”。\n` +
       `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
-      '有效期 10 分钟，仅本次操作。停止当前执行：/cancel',
+      (this.historicalWechat(request.agent.id) ? '有效期 10 分钟，仅本次操作。停止此历史任务请在电脑端操作。' : '有效期 10 分钟，仅本次操作。停止当前执行：/cancel'),
       identity('approval', pending.token), { signal }).then(pending.presented, () => {
         if (!signal.aborted) this.promptDeliveryFailed(request, request.agent.id);
         this.replies.answer(chatId, pending.token, 'unavailable');
@@ -812,6 +838,7 @@ export class DshChannelBridge {
     if (existing) clearTimeout(existing.timer);
     this.heartbeats.delete(session.id);
     const events = session.snapshotEvents();
+    if (!this.deliverableTurn(session.id, events, turn)) return;
     const start = events.findLastIndex(event => event.type === 'turn/start' && event.data.turn === turn);
     const typed = events.slice(Math.max(start, 0)).filter(event => event.type === 'user/message');
     const userStarted = typed.length > 0 && typed.some(event => event.type === 'user/message' && !pluginInitiated(event.data)
@@ -836,6 +863,7 @@ export class DshChannelBridge {
     if (this.config.channel === 'wechat' && state.count > 0) return;
     const reschedule = () => { state.timer = setTimeout(() => { void this.beat(session, chatId, turn); }, this.heartbeat.everyMs); state.timer.unref?.(); };
     const events = session.snapshotEvents();
+    if (!this.deliverableTurn(session.id, events, turn)) { this.disarmHeartbeat(session.id); return; }
     const boundary = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
     if (!boundary || boundary.type === 'turn/end' || boundary.data.turn !== turn) { this.disarmHeartbeat(session.id); return; }
     // The user already holds a prompt from us; a heartbeat on top would only add noise.
@@ -844,7 +872,7 @@ export class DshChannelBridge {
     const text = heartbeatText(this.now() - state.startedAt, lastCall?.type === 'tool/call' ? describeToolCall(lastCall.data) : undefined);
     state.count++;
     // Not durable: a heartbeat that cannot be sent now is stale by the time it could be.
-    await this.transport.sendText(chatId, text, identity('heartbeat', session.id, String(turn), String(state.count)))
+    await this.transport.sendText(chatId, this.historicalText(session.id, text), identity('heartbeat', session.id, String(turn), String(state.count)))
       .catch(() => { this.report('channel_heartbeat_failed'); });
     if (this.heartbeats.get(session.id) === state) reschedule();
   }
@@ -862,6 +890,7 @@ export class DshChannelBridge {
   private async deliver(chatId: string, sessionId: SessionId,
     end: Extract<SessionEvent, { type: 'turn/end' }>, events: readonly SessionEvent[]): Promise<void> {
     const turn = end.data.turn;
+    if (!this.deliverableTurn(sessionId, events, turn)) return;
     const last = events.findLast(event => event.type === 'assistant/message' && event.data.turn === turn);
     const text = last?.type === 'assistant/message'
       ? last.data.message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim() : '';
@@ -876,14 +905,14 @@ export class DshChannelBridge {
     const deliveryId = identity('turn', sessionId, String(turn));
     if (pushed && this.gate?.quiet()) {
       // The user asked not to be disturbed: keep the reply for the digest instead of sending it now.
-      await this.gate.hold(sessionId, completed ? (text || '本轮已结束，详情可在本机 DSH 查看。') : [text, '本轮执行未完成，详情可在本机 DSH 查看。'].filter(Boolean).join('\n\n'), deliveryId);
+      await this.gate.hold(sessionId, this.historicalText(sessionId, completed ? (text || '本轮已结束，详情可在本机 DSH 查看。') : [text, '本轮执行未完成，详情可在本机 DSH 查看。'].filter(Boolean).join('\n\n')), deliveryId);
       return;
     }
     const notice = completed ? (text || '本轮已结束，详情可在本机 DSH 查看。')
       : [text, '本轮执行未完成，详情可在本机 DSH 查看。'].filter(Boolean).join('\n\n');
     // The words always go out as text. A spoken reply was tried on 2026-09-22 and removed: iLink accepted the voice
     // item but the WeChat client rendered nothing for it, in both upload slots and with either codec it declares.
-    await this.transport.sendText(chatId, notice, deliveryId, { durable: true });
+    await this.transport.sendText(chatId, this.historicalText(sessionId, notice), deliveryId, { durable: true });
     if (!completed) return;
     const files = new Set(events.flatMap(event =>
       event.type === 'deliverables/presented' && event.data.turn === turn ? event.data.files.map(file => file.path) : []));

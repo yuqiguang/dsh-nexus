@@ -31,6 +31,10 @@ const userTurn = (turn: number, text: string, reply: string, time: number, usage
   ev('turn/end', { turn, reason: { kind: 'completed' } }, time + 1000),
 ];
 
+const pushedTurn = (turn: number, text: string, reply: string, time: number) =>
+  userTurn(turn, text, reply, time).map(event => event.type === 'user/message'
+    ? { ...event, data: { ...event.data, source: { kind: 'plugin', plugin: 'jobs' } } } : event);
+
 test('session ids carry a generation and fold back to their base; /new is a command', () => {
   const base = sessionIdFor('acc', 'owner', 'owner', 'wechat');
   assert.equal(sessionIdAt(base, 0), base);
@@ -132,7 +136,7 @@ test('assistant settings keep rotation with validation and expose it in the view
 
 /** A bridge over fake sessions whose logs the test controls, with a roster and a memory sink. */
 function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: number }; roster?: boolean; failCreate?: (sessionId: string) => boolean; failFlush?: (sessionId: string) => boolean; failAttach?: (sessionId: string) => boolean; failList?: boolean; sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
-  busy?: (base: string) => Promise<boolean>;
+  heartbeatMs?: number; busy?: (base: string) => Promise<boolean>;
   formerBases?: () => Promise<string[]>; onResolve?: (id: string, session: { append(type: string, data: unknown): unknown }) => void } = {}) {
   let clock = T0;
   const owner = { channel: 'wechat' as const, accountId: 'rot-bot', ownerId: 'rot-owner' };
@@ -221,7 +225,7 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
   const rosterPromise = SessionRoster.open(fakeRoster().opener);
   const make = async () => {
     const roster = await rosterPromise;
-    const bridge = new DshChannelBridge(ctx, transport, owner, dir, code => codes.push(code), { firstMs: 60_000, everyMs: 300_000 }, () => clock, {
+    const bridge = new DshChannelBridge(ctx, transport, owner, dir, code => codes.push(code), { firstMs: options.heartbeatMs ?? 60_000, everyMs: 300_000 }, () => clock, {
       ledger, timeZone: () => ZONE, ...(options.roster === false ? {} : { sessions: roster }), rotation: () => options.rotation ?? DEFAULT_ROTATION,
       ...(options.busy ? { busy: options.busy } : {}),
       memory: { async remember(text, sessionId) { remembered.push({ text, sessionId }); } }, ...(options.formerBases ? { formerBases: options.formerBases } : {}) });
@@ -258,7 +262,7 @@ test('the first message of a new day opens the next generation: the user is told
   assert.match(f.remembered[0]!.text, /^9\/21 微信对话（1 件事）：两点提醒我开会→好的$/);
   assert.deepEqual(bridge.bound(), [next], 'pushes now address the new generation only');
   assert.equal(await bridge.notify(f.base, '提醒', 'n1'), true, 'the base id still routes to the chat');
-  assert.equal(f.texts.at(-1), '提醒');
+  assert.match(f.texts.at(-1)!, /历史微信会话[\s\S]*提醒/);
   // The same day again: no second rotation.
   await bridge.receive(f.inbound('m3', '再问一句'));
   assert.equal(f.prompts.at(-1)!.sessionId, next);
@@ -343,16 +347,16 @@ test('after a restart the previous generation is still routed: its late turn is 
   assert.equal(f.prompts.at(-1)!.sessionId, next);
   await first.close();
   // A turn of the old generation ends while no bridge is mounted (a job the old session started).
-  for (const event of userTurn(2, 'late', '旧会话的任务结束了', f.now())) old.snapshotEvents().push(event);
+  for (const event of pushedTurn(2, 'late', '旧会话的任务结束了', f.now())) old.snapshotEvents().push(event);
   const second = await f.make();
   t.after(() => second.close());
   await second.catchUp();
-  assert.ok(f.texts.includes('旧会话的任务结束了'), `late turn delivered: ${JSON.stringify(f.texts)}`);
+  assert.ok(f.texts.some(text => text.includes('旧会话的任务结束了')), `late turn delivered: ${JSON.stringify(f.texts)}`);
   assert.deepEqual(second.bound(), [next]);
   await second.receive(f.inbound('s', '状态'));
   assert.match(f.texts.at(-1)!, /当前没有任务记录|上一轮已完成/);
   await second.catchUp();
-  assert.equal(f.texts.filter(text => text === '旧会话的任务结束了').length, 1, 'never delivered twice');
+  assert.equal(f.texts.filter(text => text.includes('旧会话的任务结束了')).length, 1, 'never delivered twice');
 });
 
 test('a rotation that cannot create the next session answers in the current one instead of dropping the message', async t => {
@@ -608,13 +612,14 @@ test('restart catches up a native result from a generation older than the active
   const roster = await f.roster;
   for (let i = 0; i < 4; i++) await roster.rotate(f.base, 'day', T0 + i);
   const source = `${f.base}-1`;
-  f.sessionOf(source).snapshotEvents().push(...userTurn(1, '提醒', '原会话完成的提醒', T0));
+  f.sessionOf(source).snapshotEvents().push(...pushedTurn(1, '提醒', '原会话完成的提醒', T0));
   f.marks.set(source, 0);
   const bridge = await f.make();
   t.after(() => bridge.close());
   await bridge.catchUp();
   await bridge.catchUp();
-  assert.deepEqual(f.texts, ['原会话完成的提醒']);
+  assert.equal(f.texts.length, 1);
+  assert.match(f.texts[0]!, /历史微信会话[\s\S]*原会话完成的提醒/);
   assert.deepEqual(f.prompts, [], 'delivery recovery must not submit a task');
   assert.equal(f.marks.get(source), 1);
 });
@@ -631,10 +636,112 @@ test('multiple QR rebinds retain routes to the original task session through own
   t.after(() => bridge.close());
   await bridge.resumeBound();
   assert.equal(await bridge.notify(`${oldest}-2`, '最初会话的提醒', 'original'), true);
-  assert.deepEqual(f.texts, ['最初会话的提醒']);
+  assert.equal(f.texts.length, 1);
+  assert.match(f.texts[0]!, /历史微信会话[\s\S]*最初会话的提醒/);
   await roster.supersede(prior, oldest, T0 + 2);
   const restarted = await f.make();
   t.after(() => restarted.close());
   await restarted.resumeBound();
   assert.equal(await restarted.notify(oldest, 'cycle', 'cycle'), false);
+});
+
+
+test('desktop turns in historical WeChat sessions stay local, including recovery and files', async t => {
+  const f = bridgeFixture();
+  const bridge = await f.make(); t.after(() => bridge.close());
+  const old = f.sessionOf(f.base);
+  old.snapshotEvents().push(...userTurn(1, 'before', 'current desktop reply', T0));
+  bridge.onEvent(old as never, old.snapshotEvents().at(-1));
+  await bridge.drain();
+  assert.equal(f.texts.at(-1), 'current desktop reply');
+  await bridge.receive(f.inbound('new', '/new'));
+  const next = `${f.base}-1`;
+  const before = f.texts.length;
+  const local = userTurn(2, 'run it', 'LOCAL-ONLY', T0 + HOUR);
+  local.splice(-1, 0, ev('deliverables/presented', { turn: 2, files: [{ path: 'missing-local-only.txt' }] }));
+  old.snapshotEvents().push(...local);
+  bridge.onEvent(old as never, old.snapshotEvents().at(-1));
+  await bridge.drain();
+  assert.equal(f.texts.length, before, 'neither reply nor file error reaches WeChat');
+  assert.equal(f.marks.get(f.base), 2, 'the skipped turn is accounted for');
+  old.snapshotEvents().push(...userTurn(3, 'offline desktop work', 'OFFLINE-LOCAL', T0 + HOUR));
+  await bridge.close();
+  const restarted = await f.make(); t.after(() => restarted.close());
+  await restarted.catchUp();
+  assert.equal(f.texts.length, before, 'restart does not replay a local turn');
+  assert.equal(f.marks.get(f.base), 3);
+  await restarted.receive(f.inbound('reply', '好的'));
+  assert.equal(f.prompts.at(-1)!.sessionId, next);
+});
+
+test('old WeChat turns, native job notices and explicit notifications retain labeled delivery', async t => {
+  const f = bridgeFixture();
+  const bridge = await f.make(); t.after(() => bridge.close());
+  const old = f.sessionOf(f.base);
+  old.snapshotEvents().push(...userTurn(1, 'before', 'before', T0));
+  await bridge.receive(f.inbound('new', '/new'));
+  const remote = userTurn(2, 'remote work', 'REMOTE-RESULT', T0);
+  remote.find(event => event.type === 'user/message')!.data.source.rpcId = 'wechat-fixture';
+  old.snapshotEvents().push(...remote);
+  bridge.onEvent(old as never, remote.at(-1)); await bridge.drain();
+  assert.match(f.texts.at(-1)!, /历史微信会话[\s\S]*REMOTE-RESULT/);
+  old.snapshotEvents().push(...pushedTurn(3, 'job notice', 'JOB-RESULT', T0));
+  bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+  assert.match(f.texts.at(-1)!, /历史微信会话[\s\S]*JOB-RESULT/);
+  await bridge.notify(f.base, 'SCHEDULE-RESULT', 'schedule');
+  assert.match(f.texts.at(-1)!, /历史微信会话[\s\S]*SCHEDULE-RESULT/);
+  const local = userTurn(4, 'desktop plus context', 'MIXED-LOCAL', T0);
+  local.splice(2, 0, ev('user/message', { source: { kind: 'plugin' }, content: [] }));
+  old.snapshotEvents().push(...local);
+  bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+  assert.ok(!f.texts.some(text => text.includes('MIXED-LOCAL')));
+});
+
+test('historical approval stays bound to its request without changing the current chat', async t => {
+  const f = bridgeFixture();
+  const bridge = await f.make(); t.after(() => bridge.close());
+  const old = f.sessionOf(f.base);
+  old.snapshotEvents().push(...userTurn(1, 'before', 'before', T0));
+  await bridge.receive(f.inbound('new', '/new'));
+  old.append('tool/call', { turn: 2, callId: 'old-call', name: 'bash', arguments: '{"command":"echo fixture"}' });
+  const outcome = bridge.approve({ agent: { id: f.base, session: old }, callId: 'old-call', toolName: 'bash' } as never,
+    () => new Promise(() => {}));
+  await new Promise(resolve => setImmediate(resolve));
+  const prompt = f.texts.at(-1)!;
+  assert.match(prompt, /历史微信会话/);
+  assert.doesNotMatch(prompt, /\/cancel/);
+  const token = /允许 ([a-f0-9]{32})/.exec(prompt)![1];
+  await bridge.receive(f.inbound('approve', `允许 ${token}`));
+  assert.equal(await outcome, 'allowed-once');
+  assert.deepEqual(bridge.bound(), [`${f.base}-1`]);
+  await bridge.receive(f.inbound('reply', '好的'));
+  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`);
+});
+
+
+test('historical desktop heartbeats and interrupted recovery remain local', async t => {
+  const f = bridgeFixture({ heartbeatMs: 1 });
+  const bridge = await f.make(); t.after(() => bridge.close());
+  const old = f.sessionOf(f.base);
+  old.snapshotEvents().push(...userTurn(1, 'before', 'before', T0));
+  f.marks.set(f.base, 1);
+  await bridge.receive(f.inbound('new', '/new'));
+  const before = f.texts.length;
+  const pending = userTurn(2, 'desktop work', '', T0).slice(0, 2);
+  pending.push(ev('step/start', { turn: 2, step: 1 }));
+  old.snapshotEvents().push(...pending);
+  bridge.onEvent(old as never, pending.at(-1));
+  await new Promise(resolve => setTimeout(resolve, 15));
+  assert.equal(f.texts.length, before, 'no progress reminder for the local turn');
+  await bridge.close();
+  const restarted = await f.make(); t.after(() => restarted.close());
+  await restarted.catchUp();
+  assert.equal(f.texts.length, before, 'no open-turn interruption notice after restart');
+  assert.equal(f.marks.get(f.base), 2);
+  const repaired = userTurn(3, 'desktop repaired turn', '', T0);
+  repaired.at(-1)!.data.reason.kind = 'interrupted';
+  old.snapshotEvents().push(...repaired);
+  await restarted.catchUp();
+  assert.equal(f.texts.length, before, 'no repaired-turn interruption notice either');
+  assert.equal(f.marks.get(f.base), 3);
 });
