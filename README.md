@@ -4,7 +4,7 @@
 
 基于 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness)，在桌面端、微信和飞书中安排、跟进与验收本机编码任务。你可以交代目标，让本机 Codex 或 Claude Code 执行，查看进度、回答关键问题，再根据验证结果继续修改。
 
-Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话、后台任务、审批和恢复服务。目前源码插件版本为 **0.2.51**，精确匹配 **DSH 0.2.0-rc.2**，处于实验阶段。本机 DSH 和编码工具需要保持运行；手机渠道用于远程交互。
+Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话、后台任务、审批和恢复服务。目前源码插件版本为 **0.2.51**，精确匹配 **DSH 0.2.0-rc.2**，从本版本起正式发布。本机 DSH 和编码工具需要保持运行；手机渠道用于远程交互。
 
 插件列表的名称与简介随 DSH 界面语言显示中文或英文：中文名为“Nexus 个人编码助理”，英文名为“Nexus for DSH”。安装预览提供中英双语简介。DSH 同时展示技术标识 `dsh-nexus`，以及 `dsh-nexus/memory` 等组件入口；从 0.2.32 起，安装包名和 GitHub 仓库名统一为 `dsh-nexus`；已有 `nexus-next` 安装需按[迁移说明](RENAME.md)替换旧包。组件 ID 与数据存储标识保持不变。
 
@@ -38,7 +38,7 @@ Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话
 ## 安装到桌面端
 
 1. 从 [DSH 官网](https://deepseek.com/harness/) 安装桌面端，确认版本为 `0.2.0-rc.2`，并先完成模型配置。
-2. 在 **插件 → 添加插件** 中填写 npm 包名 `dsh-nexus@next`（实验版），也可填写下面的固定地址。安装完成后点击 **立即启用**。如果提示重启，从托盘完全退出后重新打开。
+2. 在 **插件 → 添加插件** 中填写 npm 包名 `dsh-nexus`，也可填写下面的固定地址。安装完成后点击 **立即启用**。如果提示重启，从托盘完全退出后重新打开。
 
    ```text
    https://github.com/yuqiguang/dsh-nexus/releases/download/install/dsh-nexus.tgz
@@ -47,9 +47,9 @@ Nexus 是第三方插件，通过公开接口接入 DSH 的模型、原生会话
 3. 先打开 **设置 → 编码工具** 完成上面的首次任务，再按需配置 **渠道连接** 和其他扩展。
 4. 需要提醒功能时，在 **插件 → 官方** 启用 **自动化任务**（`@deepseek-ai/dsh-experimental-schedule-bundle`）。
 
-npm 从 0.2.41 起提供安装包，实验版入口为 [`dsh-nexus@next`](https://www.npmjs.com/package/dsh-nexus)，直接填写 `dsh-nexus` 也可（`latest` 与 `next` 均指向最新实验版），或填写 `dsh-nexus@0.2.51` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
+npm 从 0.2.41 起提供安装包，推荐入口为 [`dsh-nexus`](https://www.npmjs.com/package/dsh-nexus)，默认获取 `latest` 正式版（`next` 暂同步兼容旧安装入口），或填写 `dsh-nexus@0.2.51` 固定版本。npm 和 GitHub 分发相同安装包；npm 镜像可能延迟同步，新版暂时找不到时可选择 npm 官方源，或使用上面的 GitHub 地址。通过 DSH 添加才能注册插件，普通 `npm install` 不会自动完成这一步。
 
-固定地址及 npm 的 `next` 标签随实验版发布更新，不需要改版本号；已安装插件从 0.2.39 起可选择空闲自动安装，见下方“插件更新”。当前固定地址指向的版本及兼容性说明见 [固定安装入口](https://github.com/yuqiguang/dsh-nexus/releases/tag/install)。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
+固定地址及 npm 的 `latest` 标签随正式版发布更新，不需要改版本号；已安装插件从 0.2.39 起可选择空闲自动安装，见下方“插件更新”。当前固定地址指向的版本及兼容性说明见 [固定安装入口](https://github.com/yuqiguang/dsh-nexus/releases/tag/install)。旧包 `nexus-next` 用户请先阅读[迁移说明](RENAME.md)，避免同时加载两个包。
 
 也可以从 [版本 Releases](https://github.com/yuqiguang/dsh-nexus/releases) 下载指定版本的 `.tgz` 和 `SHA256SUMS`，核对后填写本机绝对路径。Windows 示例：`C:\Users\<user>\Downloads\dsh-nexus-0.2.51.tgz`；不要填写 WSL 路径。桌面端自带安装所需的 CLI 和 pnpm。需要固定历史版本时，使用对应版本的下载链接。
 
@@ -248,7 +248,7 @@ npm run build
 npm pack
 ```
 
-安装包包含编译后的插件、客户端设置页、配置层、许可证和发布说明。账号、会话、工作区、测试文件和内部文档不随安装包分发。公开发行包使用 npm 的 `next` 标签发布实验版，同一份包同时上传 GitHub Release。维护者打包和发布步骤见 [PUBLISHING.md](PUBLISHING.md)。
+安装包包含编译后的插件、客户端设置页、配置层、许可证和发布说明。账号、会话、工作区、测试文件和内部文档不随安装包分发。公开发行包使用 npm 的 `latest` 标签发布正式版，同一份包同时上传 GitHub Release。维护者打包和发布步骤见 [PUBLISHING.md](PUBLISHING.md)。
 
 ## 验证
 

@@ -79,7 +79,7 @@ class FixtureModel extends LlmAdapter {
     // DSH projects the assembled system prompt into the message history, so look at both places.
     const prompt = [options.system ?? '', ...options.messages.flatMap(message => message.content.flatMap(block =>
       block.type === 'text' ? [block.text] : []))].join('\n');
-    assert.ok(prompt.includes('用 coder_task 把任务派给本机的编码工具'), 'system prompt must describe coder_task');
+    assert.match(prompt, /用 coder_task[^\n]*本机编码工具/, 'system prompt must describe coder_task');
     const step = this.calls++;
     if (step === 0) {
       yield* this.toolCall('brief', 'coder_brief', { action: 'save', objective: '检查目录并准备后续工作', constraints: '不修改已有文件', acceptance: ['目录检查通过', '后续业务验收'] });
