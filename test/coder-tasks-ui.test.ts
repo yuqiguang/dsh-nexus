@@ -194,7 +194,7 @@ const summary = (extra: Partial<TaskSummary> = {}): TaskSummary => ({ id: 'ct-00
   status: 'running', statusLabel: '运行中', active: true, description: '修复任务显示', updatedAt: 10, ...extra });
 const settleUI = async () => { await act(async () => { await new Promise(resolve => setTimeout(resolve, 35)); }); };
 
-test('the session dock keeps a finished task until its native notice card mounts; other tasks remain and navigation is shared', async t => {
+test('the session dock hands a finished task to its persisted notice before rendering; other tasks remain and navigation is shared', async t => {
   let tasks = [summary(), summary({ id: 'ct-00000002', updatedAt: 9 })];
   const opened: string[] = [], calls: string[] = [];
   const api: TaskFeedApi = async <T,>(method: string) => { calls.push(method); return (method === 'list' ? tasks : null) as T; };
@@ -210,7 +210,7 @@ test('the session dock keeps a finished task until its native notice card mounts
   tasks = [summary({ status: 'completed', statusLabel: '执行结束，尚未独立验证', active: false }), tasks[1]!]; await settleUI();
   assert.equal(doc.querySelectorAll('.nexus-coder-dock [data-task-id]').length, 2);
   tasks = [{ ...tasks[0]!, completionNotice: { seq: 40, at: 30, messageId: 'message-40' } }, tasks[1]!]; await settleUI();
-  assert.equal(doc.querySelectorAll('.nexus-coder-dock [data-task-id]').length, 2, 'a delayed renderer must not lose the finished card');
+  assert.deepEqual([...doc.querySelectorAll('.nexus-coder-dock [data-task-id]')].map(row => row.getAttribute('data-task-id')), ['ct-00000002'], 'the persisted notice owns the result before its renderer mounts');
   await doc.rerender({ show: true }); await settleUI();
   assert.equal(doc.querySelector('[data-turn-trigger]')!.previousElementSibling?.getAttribute('data-task-id'), 'ct-0000abcd');
   assert.match(doc.querySelector('[data-turn-trigger]')!.previousElementSibling!.textContent!, /尚未独立验证/);
@@ -287,12 +287,21 @@ test('notification decoration preserves native props, locale, unrelated notices 
   unload();
 });
 
-test('a mapped notice that is folded as native context still leaves a bottom result after reload', async t => {
+test('a folded persisted notice never leaves a bottom result, including after leaving and reopening the session', async t => {
   const task = summary({ active: false, status: 'completed', statusLabel: '执行结束，尚未独立验证', completionNotice: { seq: 4, at: 30, messageId: 'm' } });
-  const api: TaskFeedApi = async <T,>() => [task] as T;
-  const doc = await render(t, coderTaskDock(() => {}, taskFeeds(api)) as ComponentType<never>, { sessionId: 'owner' });
-  assert.match(doc.querySelector('.nexus-coder-dock')!.textContent!, /尚未独立验证/);
-  assert.equal(doc.querySelectorAll('[data-task-id]').length, 1);
+  let reads = 0;
+  const api: TaskFeedApi = async <T,>() => { reads++; return [task] as T; };
+  const Dock = coderTaskDock(() => {}, taskFeeds(api));
+  const App = ({ visible }: { visible: boolean }) => visible ? createElement(Dock, { sessionId: 'owner' }) : null;
+  const doc = await render(t, App as ComponentType<never>, { visible: true });
+  assert.ok(reads > 0);
+  assert.equal(doc.querySelector('.nexus-coder-dock'), null);
+  await doc.rerender({ visible: false });
+  const before = reads;
+  await doc.rerender({ visible: true }); await settleUI();
+  assert.ok(reads > before, 'reopening creates a fresh feed instead of relying on an in-memory dismissal');
+  assert.equal(doc.querySelector('.nexus-coder-dock'), null);
+  assert.equal(doc.querySelectorAll('[data-task-id]').length, 0);
 });
 
 test('pending task cards and the detail panel show the actual automatic-review fallback reason', async t => {

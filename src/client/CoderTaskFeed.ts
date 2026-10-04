@@ -45,7 +45,9 @@ export class TaskFeed {
   placedNotice(id: string) { if (!this.placed.has(id)) { this.placed.add(id); this.publish(); } }
   dismiss(id: string) { this.dismissed.add(id); this.publish(); }
   inDock(task: TaskSummary) {
-    return task.active || (!this.dismissed.has(task.id) && !this.placed.has(task.id));
+    // A persisted notice owns the result even while folded or outside the rendered history.
+    // Keep only results still awaiting a notice in the dock; scrolling must not re-pin them.
+    return task.active || (!task.completionNotice && !this.dismissed.has(task.id) && !this.placed.has(task.id));
   }
   private async poll(signal: AbortSignal) {
     try {
