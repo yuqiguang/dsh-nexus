@@ -61,7 +61,6 @@ const ESCALATE_COMMANDS: readonly [RegExp, string][] = [
   [/\bssh\s/, '远程登录'],
   [/\bscp\s/, '远程复制'],
   [/\b(npm|pnpm|yarn)\s+(install|add|i)\s+(-g|--global)\b/, '安装全局依赖'],
-  [/\b(pip|pip3)\s+install\b(?![^|;&]*--user)/, '安装 Python 依赖到系统'],
   [/\b(apt|apt-get|yum|dnf|brew)\s+(install|remove|purge)\b/, '修改系统软件'],
   [/\bsystemctl\s+(start|stop|restart|enable|disable)\b/, '修改系统服务'],
   [/\bcrontab\b/, '修改定时任务'],
@@ -168,7 +167,7 @@ export function isPublicWebRequest(request: CoderRequest): boolean {
  * file operation on that exact file, and a command that merely names that exact file, from the credential rule.
  */
 export function hardRule(request: CoderRequest, roots: readonly string[], webResearch = false, standard = false,
-  cwd = roots[0] ?? '', safeTemplates: readonly string[] = []): HardVerdict | undefined {
+  cwd = roots[0] ?? '', safeTemplates: readonly string[] = [], projectPip = false): HardVerdict | undefined {
   if (request.tool === 'codex.permissions') return { verdict: 'deny', reason: '无人值守任务不授予整个回合额外权限，请按具体命令或文件操作申请', key: 'turn-permissions' };
   const scopedWrite = request.kind === 'file-write' && ['Write', 'Edit', 'codex.fileChange'].includes(request.tool) && !request.raw.grantRoot && !request.raw.additionalPermissions;
   const environment = request.paths.filter(path => isProjectEnvironment(path, cwd, standard));
@@ -192,6 +191,8 @@ export function hardRule(request: CoderRequest, roots: readonly string[], webRes
     if (mentioned) return { verdict: 'deny', reason: `命令涉及凭据或密钥文件：${mentioned}`, key: `credential:${baseName(mentioned)}` };
     for (const [pattern, reason] of DENY_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'deny', reason, key: `command:${reason}` };
     for (const [pattern, reason] of ESCALATE_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'escalate', reason, manualOnly: true };
+    if (/\bpip(?:3)?\s+install\b/i.test(request.detail)) return { verdict: 'escalate',
+      reason: standard && projectPip ? '项目虚拟环境依赖安装，需审核本次命令和安装来源' : 'Python 依赖安装目标尚未核验，需要你确认', manualOnly: !(standard && projectPip) };
     if (outside) return { verdict: 'escalate', reason: `命令访问任务根目录之外的路径：${outside}` };
     return undefined;
   }

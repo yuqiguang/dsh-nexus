@@ -1,9 +1,10 @@
+import { projectPipEvidence } from './python-install.js';
 import { readonlyReview } from './readonly-review.js';
 import { UserWaits } from './user-waits.js';
 import { dispatchPrompt } from './prompt.js';
 import { timingSummary } from './timing.js';
 import { taskNotices, taskSummary } from './presentation.js';
-import { nativeSafetyReviewer, prepareReview, reviewFingerprint, reviewUntilAborted, ReviewCache, REVIEW_TIMEOUT_MS, type SafetyReviewer } from './review.js';
+import { nativeSafetyReviewer, prepareReview, reviewFingerprint, reviewUntilAborted, ReviewCache, acquireReviewSlot, type SafetyReviewer } from './review.js';
 import { installCoderPackaging } from './package.js';
 import { hostInstructions } from './instructions.js';
 import { localCheck } from './local-check.js';
@@ -374,8 +375,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     if (signal.aborted || !currentTask || currentTask.stopReason || !isActive(currentTask)) return { behavior: 'deny', message: '任务已停止。', interrupt: true };
     const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
     const environmentRedirect = requestedPaths.some((path, index) => isEnvironmentFile(path) && !samePath(path, request.paths[index]!));
+    const projectPip = standard && request.kind === 'command' && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId));
     const verdict = environmentRedirect ? { layer: 'hard' as const, key: 'environment-link', reason: '环境配置路径通过链接重定向，请使用项目内真实文件路径' }
-      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates);
+      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates, projectPip);
     const at = Date.now();
     const step = liveOf.get(taskId)?.record ?? (() => {});
     if (verdict.layer === 'auto') {
@@ -416,8 +418,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       let recorded = false;
       let reviewSignal: AbortSignal | undefined;
       try {
-        reviewSignal = AbortSignal.any([signal, shutdown.signal, AbortSignal.timeout(REVIEW_TIMEOUT_MS)]);
-        release = await reviewQueue.acquire(reviewSignal);
+        step('DSH 审核排队中；等待不占用本次审核时限，可取消任务。');
+        const slot = await acquireReviewSlot(reviewQueue, AbortSignal.any([signal, shutdown.signal]));
+        release = slot.release;
+        reviewSignal = slot.signal;
         for (let attempt = 0; attempt < 2; attempt++) {
           const preparation = await prepareReview(task, request, reviewEnvs.get(taskId));
           const envelope = preparation.input;
@@ -431,7 +435,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           const after = rechecked.input;
           const readonlyUnchanged = !deterministic || !!await readonlyReview(task, request, reviewEnvs.get(taskId));
           const current = store.get(taskId);
-          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard');
+          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard', safeTemplates, projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
+          if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
           // A newly added deny must still win, even if the reviewer was already in flight.
           if (latest.layer === 'hard' || (latest.layer === 'habit' && latest.verdict.decision === 'deny')) return decide(taskId, request, signal);
           if (attempt === 0 && task.permissions?.securityMode === 'standard' && request.kind === 'command' && result.safe && after && current && isActive(current) && !current.stopReason && reviewFingerprint(after) !== reviewFingerprint(envelope)) {

@@ -26,8 +26,8 @@ function outsideTask(request: CoderRequest, cwd: string): string | undefined {
  * question. Anything left is routine and allowed without asking. Allow rules
  * stored before routine requests were allowed by default no longer decide anything.
  */
-export function decideLayers(request: CoderRequest, roots: readonly string[], rules: readonly HabitRule[], cwd: string, webResearch = false, standard = false, safeTemplates: readonly string[] = []): LayerVerdict {
-  const hard = hardRule(request, roots, webResearch, standard, cwd, safeTemplates);
+export function decideLayers(request: CoderRequest, roots: readonly string[], rules: readonly HabitRule[], cwd: string, webResearch = false, standard = false, safeTemplates: readonly string[] = [], projectPip = false): LayerVerdict {
+  const hard = hardRule(request, roots, webResearch, standard, cwd, safeTemplates, projectPip);
   if (hard?.verdict === 'deny') return { layer: 'hard', reason: hard.reason, key: hard.key };
   const habit = habitRule(request, rules.filter(rule => rule.decision !== 'allow'), cwd);
   if (habit?.decision === 'deny') return { layer: 'habit', verdict: habit };

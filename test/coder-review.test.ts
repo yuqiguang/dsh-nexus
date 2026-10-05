@@ -187,7 +187,7 @@ test('native reviewer uses the owner model, records exact input, and requires a 
  }}} as unknown as Context;
  const reviewer=nativeSafetyReviewer(ctx,async record=>{events.push(record);});const input={task:'docs',scope:'read',operation:'cat README.md',evidence:[]};
  assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,true);
- assert.equal((events[0] as {input:string}).input,JSON.stringify(input));
+ assert.deepEqual(JSON.parse((events[0] as {input:string}).input),input);
  for(const value of ['{"safe":"true","reason":"ok"}','{"safe":true}','not-json']) {response=value;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);}
  response='{"safe":true,"reason":"ok"}';stopped=false;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);
  stopped=true;fail=true;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);
@@ -371,4 +371,20 @@ test('transient exceptions are bounded and an explicit negative verdict is never
   assert.match(result.reason,deny?/requires owner/:/TIMEOUT.*已重试一次/);
   assert.doesNotMatch(JSON.stringify(audits),/private provider/);
  }
+});
+
+test('review payload leads with the concrete operation without discarding task constraints or unknown permissions', async () => {
+  let submitted = '';
+  const ctx = { sessionController: { async resolveAgent() { return { agent: { session: { id: 'owner', requestHeader: () => ({ config: { provider: 'fixture', model: 'fixture' } }) } } }; } },
+    llm: { async *stream(options: { system: string; messages: { content: { text: string }[] }[] }) {
+      submitted = options.messages[0]!.content[0]!.text;
+      assert.match(options.system, /不得因未来步骤的脚本尚未提供而拒绝当前只读操作/);
+      yield { type: 'text-delta', text: '{"safe":false,"reason":"fixture only"}' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    } } } as unknown as Context;
+  const input = { task: 'Later install dependencies and import documents', constraints: 'Do not read .env', scope: 'one command', operation: '{"command":"Get-Content app/retrieval.py","extraPermission":"unknown"}', evidence: ['fixture source'] };
+  await nativeSafetyReviewer(ctx, async () => {})(task('/tmp'), input, new AbortController().signal);
+  const actual = JSON.parse(submitted);
+  assert.deepEqual(Object.keys(actual).slice(0, 3), ['scope', 'operation', 'evidence']);
+  assert.deepEqual(actual, input);
 });
