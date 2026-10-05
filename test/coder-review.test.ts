@@ -79,6 +79,30 @@ test('real default DSH workspace is usable in standard mode without exposing cre
  } finally { if(saved===undefined)delete process.env.DSH_HOME;else process.env.DSH_HOME=saved; await rm(root,{recursive:true,force:true}); }
 });
 
+test('project dotenv references provide only state, cannot be cached, and do not authorize execution or outside secrets', async () => {
+ const cwd = await mkdtemp(join(tmpdir(), 'nexus-env-evidence-'));
+ try {
+  const t = task(cwd); t.permissions = await taskPermissions(cwd, [cwd], 'claude', undefined, 60, [], true, 'standard');
+  const path = join(cwd, '.env'); await writeFile(path, 'VALUE=fixture-private-value');
+  const request = normalizeClaudeRequest('Bash', { command: 'cat .env' }, {}, cwd);
+  const input = await reviewEnvelope(t, request);
+  assert.ok(input); assert.equal(input.evidenceComplete, false);
+  assert.match(input.evidence.join('\n'), /项目环境配置.*内容不读取/);
+  assert.doesNotMatch(JSON.stringify(input), /fixture-private-value/);
+  const cache = new ReviewCache(); cache.set(t, input, { safe: true, reason: 'fixture', repeatable: true });
+  assert.equal(cache.get(t, input), undefined);
+  await writeFile(path, 'VALUE=changed-private-value-longer');
+  assert.notEqual(reviewFingerprint(input), reviewFingerprint((await reviewEnvelope(t, request))!));
+  const source = await reviewEnvelope(t, normalizeClaudeRequest('Bash', { command: '. ./.env' }, {}, cwd));
+  assert.ok(source); assert.equal(source.evidenceComplete, false);
+  assert.match(source.evidence.join('\n'), /作为脚本执行.*隐藏内容不能作为安全证据/);
+  assert.doesNotMatch(JSON.stringify(source), /changed-private-value/);
+  assert.equal(await reviewEnvelope(t, normalizeClaudeRequest('Write', { file_path: path, content: 'VALUE=secret' }, {}, cwd)), undefined, 'exceptional file writes never expose values to reviewer');
+  t.permissions.securityMode = 'strict';
+  assert.equal(await reviewEnvelope(t, normalizeClaudeRequest('Read', { file_path: path }, {}, cwd)), undefined);
+ } finally { await rm(cwd, { recursive: true, force: true }); }
+});
+
 test('review reads a realistic large test harness and its HTML and script dependencies, invalidating on edits', async () => {
  const root=await mkdtemp(join(tmpdir(),'nexus-review-game-'));
  try {
@@ -113,8 +137,8 @@ test('evidence limits and symlink escapes are explicit without reading protected
   assert.match(input.evidence.join('\n'),/超出允许的审核边界/);
   assert.match(input.evidence.join('\n'),/超出审核上限/);
   assert.doesNotMatch(input.evidence.join('\n'),/DO_NOT_READ_OUTSIDE|ZZZZZZ/);
-  for(let i=0;i<30;i++) await writeFile(join(cwd,`part${i}.js`),'// small source');
-  await writeFile(join(cwd,'check.js'),Array.from({length:30},(_,i)=>`require('./part${i}.js');`).join('\n'));
+  for(let i=0;i<70;i++) await writeFile(join(cwd,`part${i}.js`),'// small source');
+  await writeFile(join(cwd,'check.js'),Array.from({length:70},(_,i)=>`require('./part${i}.js');`).join('\n'));
   const many=await reviewEnvelope(t,normalizeClaudeRequest('Bash',{command:'node check.js'},{},cwd)); assert.ok(many);
   assert.equal(many.evidenceComplete,false); assert.match(many.evidence.join('\n'),/数量上限/);
  } finally { await rm(root,{recursive:true,force:true}); }
@@ -191,6 +215,23 @@ test('native reviewer uses the owner model, records exact input, and requires a 
  for(const value of ['{"safe":"true","reason":"ok"}','{"safe":true}','not-json']) {response=value;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);}
  response='{"safe":true,"reason":"ok"}';stopped=false;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);
  stopped=true;fail=true;assert.equal((await reviewer(task('/tmp'),input,new AbortController().signal)).safe,false);
+});
+
+test('reviewer accepts a single JSON fence but rejects prose, multiple verdicts and unfinished positive responses', async () => {
+ for (const [output, finish, safe] of [
+  ['```json\n{"safe":true,"reason":"fixture"}\n```', 'stop', true],
+  ['```\n{"safe":false,"reason":"requires a person"}\n```', 'stop', false],
+  ['explanation\n```json\n{"safe":true,"reason":"fixture"}\n```', 'stop', false],
+  ['```json\n{"safe":true,"reason":"fixture"}\n```\n```json\n{"safe":false,"reason":"deny"}\n```', 'stop', false],
+  ['```json\n{"safe":true,"reason":"fixture"}\n```', 'max-tokens', false],
+  ['```json\n{"safe":true,"reason":"fixture"}\n```', 'error', false],
+ ] as const) {
+  const ctx={sessionController:{async resolveAgent(){return {agent:{session:{id:'owner',requestHeader:()=>({config:{provider:'fixture',model:'model'}})}}};}},llm:{async *stream(){
+   yield {type:'text-delta',text:output};yield {type:'finish',reason:{kind:finish}};
+  }}} as unknown as Context;
+  const result=await nativeSafetyReviewer(ctx,async()=>{})(task('/tmp'),{task:'x',scope:'s',operation:'c',evidence:[]},new AbortController().signal);
+  assert.equal(result.safe,safe,output);
+ }
 });
 
 test('standard review includes concrete commands and script evidence; edits and network grants are reviewed without whole-turn grants', async () => {

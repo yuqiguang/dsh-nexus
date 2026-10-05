@@ -1,13 +1,48 @@
 import { constants } from 'node:fs';
 import { lstat, open } from 'node:fs/promises';
-import { resolve } from 'node:path';
-import { canonical } from './permissions.js';
+import { isAbsolute, resolve } from 'node:path';
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths';
+import { canonical, credentialPaths } from './permissions.js';
 import { commandPath } from './command-path.js';
-import { commandPathTokens, isEnvironmentFile, isEnvironmentTemplate, isProjectEnvironment } from './rules.js';
+import { commandPathTokens, isEnvironmentFile, isEnvironmentTemplate, isProjectEnvironment, isInside, isDshWorkspacePath } from './rules.js';
 import type { CoderRequest } from './types.js';
 
 const LIMIT = 32 * 1024;
 const PLACEHOLDER = /^(?:|<[A-Z_][A-Z0-9_]*>|\$\{[A-Z_][A-Z0-9_]*\}|(?:your|replace|change|example|sample|dummy|placeholder)(?:[-_][a-z0-9]+)*)$/i;
+
+/** Local project configuration is permitted in standard mode. Never read values to establish this boundary. */
+export async function projectEnvironmentState(path: string, cwd: string, standard: boolean): Promise<string | undefined> {
+  if (!standard || !isProjectEnvironment(path, cwd, true)) return;
+  const same = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+  try {
+    const home = await canonical(dshHomePath());
+    for (const root of await Promise.all(credentialPaths().map(canonical))) {
+      if (isInside(root, path) && !(same(root, home) && isDshWorkspacePath(path, [cwd]))) return;
+    }
+    if (!same(await canonical(path), path)) return;
+    const info = await lstat(path).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (info && (!info.isFile() || info.nlink !== 1)) return;
+    if (!same(await canonical(path), path)) return;
+    return info ? `${info.dev}:${info.ino}:${info.mode}:${info.nlink}:${info.size}:${info.mtimeMs}:${info.ctimeMs}` : 'new file';
+  } catch { return; }
+}
+
+/** Exceptions are exact checked paths, not a global relaxation of credential/export rules. */
+export async function checkedProjectEnvironments(request: CoderRequest, cwd: string, standard: boolean): Promise<string[]> {
+  if (!standard || request.raw.grantRoot || request.tool === 'codex.permissions') return [];
+  const candidates = new Set(request.paths.filter(isEnvironmentFile));
+  if (request.kind === 'command') {
+    const base = typeof request.raw.cwd === 'string' ? commandPath(request.raw.cwd) : cwd;
+    if (!isAbsolute(base) || !isInside(cwd, base)) return [];
+    for (const token of commandPathTokens(request.command ?? request.detail)) {
+      const path = commandPath(token);
+      if (isEnvironmentFile(path) && !/[~$`*?]/.test(path)) candidates.add(resolve(base, path));
+    }
+  } else if (!['Read', 'Write', 'Edit', 'codex.fileChange'].includes(request.tool) || request.raw.additionalPermissions) return [];
+  const checked: string[] = [];
+  for (const path of candidates) if (await projectEnvironmentState(path, cwd, standard) !== undefined) checked.push(path);
+  return checked;
+}
 
 /** Conservative template validation. Unrecognized values go to the owner, never into review evidence. */
 export function safeEnvironmentTemplate(content: string): boolean {

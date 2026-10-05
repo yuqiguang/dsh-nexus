@@ -147,7 +147,7 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
 
 export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd' | 'permissions'>): string {
   const description = task.description + CODER_WORK_GUIDANCE + (task.continuation ? `\n\n[本次续接说明]\n${task.continuation}\n仍须满足已保存的目标、共同约束和完整验收；不能用续接说明替换或缩小它们。` : '')
-    + (task.permissions?.securityMode === 'full' ? '\n\n[执行权限]\n本任务已由设置授予完全权限：可用当前系统用户权限访问项目外文件、联网和运行命令，无执行沙箱或逐项权限审批；不需要为常规执行再申请权限。仍按用户目标工作，实质歧义应澄清；避免在输出中暴露密钥。' : '\n\n[环境配置与执行检查]\n项目内 .env.example、.env.sample、.env.template 可用原生文件工具创建或修改，只填空值、占位符及本地非敏感配置。实际 .env 写入在标准模式下申请所列文件的单次用户确认，不读取或打印已有密钥。不要用 shell 命令改写配置来绕过文件审批。运行测试优先指定测试文件或目录，使用可检查的项目脚本；避免反复申请同一被拒操作。')
+    + (task.permissions?.securityMode === 'full' ? '\n\n[执行权限]\n本任务已由设置授予完全权限：可用当前系统用户权限访问项目外文件、联网和运行命令，无执行沙箱或逐项权限审批；不需要为常规执行再申请权限。仍按用户目标工作，实质歧义应澄清；避免在输出中暴露密钥。' : '\n\n[环境配置与执行检查]\n' + (task.permissions?.securityMode === 'standard' ? '本任务工作区内经真实路径核验的 .env 及 .env.* 可以按项目配置读取、创建和修改，优先用原生文件工具，无需仅因文件名再次申请用户确认。读取结果仅用于本任务配置处理，不得把配置值复制到对话回复、普通日志、代码提交或交付物；工作区外凭据和受保护目录仍禁止访问。涉及配置的命令仍按具体行为审核，source / 点加载会执行文件内容，不能视为普通读取。' : '项目内 .env.example、.env.sample、.env.template 可用原生文件工具创建或修改，只填空值、占位符及本地非敏感配置。严格模式下实际 .env 仍受保护，不读取或打印已有密钥，不用 shell 绕过文件限制。') + '运行测试优先指定测试文件或目录，使用可检查的项目脚本；避免反复申请同一被拒操作。')
     + (task.brief ? '\n先核对实际项目目录和所需运行环境。发现环境或依赖加载失败，先定位并采用可恢复的修复，不通过删除依赖、改写测试或换技术栈掩盖真实启动失败。' : '')
     + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件。修改中先做必要的针对性自测，不为收尾形式再重复整套验收；宿主会独立执行上述命令。任何一项失败或未执行都不能报告全部验收通过。` : '');
   if (!task.brief) return description;

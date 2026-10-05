@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm, symlink, link } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { checkedCommandTemplates, checkedEnvironmentTemplates, environmentApprovalDisplay, safeEnvironmentTemplate } from '../src/coders/environment-files.js';
+import { checkedCommandTemplates, checkedEnvironmentTemplates, checkedProjectEnvironments, environmentApprovalDisplay, safeEnvironmentTemplate, projectEnvironmentState } from '../src/coders/environment-files.js';
 import { normalizeClaudeRequest, codexFileChangeRequest } from '../src/coders/normalize.js';
 import { decideLayers } from '../src/coders/decide.js';
 import { hardRule } from '../src/coders/rules.js';
@@ -18,11 +18,12 @@ async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
   const cwd = join(root, 'project'); await mkdir(cwd);
   const request = (name: string, content = template) => normalizeClaudeRequest('Write', { file_path: join(cwd, name), content }, {}, cwd);
   const decide = async (request: CoderRequest, standard = true) => {
+    const projectEnvironments = await checkedProjectEnvironments(request, cwd, standard);
     request = { ...request, paths: await Promise.all(request.paths.map(canonical)) };
     const safeTemplates = await checkedEnvironmentTemplates(request, cwd, standard);
     // Mirrors src/coders/index.ts: a command that only names a verified template is treated as a file read of it.
     if (request.kind === 'command') safeTemplates.push(...await checkedCommandTemplates(request.detail, cwd, standard));
-    return decideLayers(request, [cwd], [], cwd, false, standard, safeTemplates);
+    return decideLayers(request, [cwd], [], cwd, false, standard, safeTemplates, false, projectEnvironments);
   };
   return { root, cwd, request, decide };
 }
@@ -44,30 +45,31 @@ test('project template creation, reading and editing are routine after inspectin
   }
 });
 
-test('unknown template values and real environment writes require the owner, with hidden approval content', async t => {
+test('standard project environment reads and writes are routine with hidden display values', async t => {
   const f = await fixture(t);
   for (const name of ['.env', '.env.local', '.env.example']) {
     const request = f.request(name, 'API_KEY=fixture-private-value');
     const decision = await f.decide(request);
-    assert.equal(decision.layer, 'user'); assert.equal(decision.layer === 'user' && decision.manualOnly, true);
+    assert.equal(decision.layer, 'auto');
     const display = environmentApprovalDisplay(request);
     assert.doesNotMatch(display.detail + display.summary, /fixture-private-value/);
     assert.equal(request.raw.content, 'API_KEY=fixture-private-value', 'display masking must not change the actual write');
   }
   assert.equal((await f.decide(f.request('.env'), false)).layer, 'hard', 'strict tasks keep their credential restriction');
   await writeFile(join(f.cwd, '.env.example'), 'API_KEY=fixture-private-value');
-  assert.equal((await f.decide(f.request('.env.example'))).layer, 'user', 'do not overwrite an existing secret as a routine template update');
-  assert.equal((await f.decide(normalizeClaudeRequest('Read', { file_path: join(f.cwd, '.env.example') }, {}, f.cwd))).layer, 'hard');
+  assert.equal((await f.decide(f.request('.env.example'))).layer, 'auto', 'standard mode permits project configuration updates');
+  assert.equal((await f.decide(normalizeClaudeRequest('Read', { file_path: join(f.cwd, '.env.example') }, {}, f.cwd))).layer, 'auto');
   assert.equal(hardRule(normalizeClaudeRequest('Bash', { command: 'cat .env' }, {}, f.cwd), [f.cwd], false, true)?.verdict, 'deny');
 });
 
-test('a command that only names a content-verified template is not a credential operation, and the name alone never exempts', async t => {
+test('standard project environment commands need review while strict commands only exempt verified templates', async t => {
   const f = await fixture(t), bash = (text: string) => normalizeClaudeRequest('Bash', { command: text }, {}, f.cwd);
   await writeFile(join(f.cwd, '.env.example'), template);
   for (const standard of [true, false]) {
     assert.notEqual((await f.decide(bash('git check-ignore -v .env.example'), standard)).layer, 'hard', `naming an approved template is not a credential denial (standard=${standard})`);
-    assert.equal((await f.decide(bash('cat .env'), standard)).layer, 'hard', 'the real environment file stays a credential operation');
-    assert.equal((await f.decide(bash('cp .env.example .env'), standard)).layer, 'hard', 'naming a template never exempts another path in the same command');
+    assert.equal((await f.decide(bash('cat .env'), standard)).layer, standard ? 'user' : 'hard', 'standard commands need concrete review; strict mode keeps its restriction');
+    assert.equal((await f.decide(bash('cp .env.example .env'), standard)).layer, standard ? 'user' : 'hard');
+    assert.equal((await f.decide(bash('cat .env ~/.ssh/id_rsa'), standard)).layer, 'hard');
   }
   await writeFile(join(f.cwd, '.env.example'), 'API_KEY=fixture-private-value');
   assert.equal((await f.decide(bash('cat .env.example'), false)).layer, 'hard', 'a real secret saved as a template keeps the credential answer');
@@ -75,14 +77,16 @@ test('a command that only names a content-verified template is not a credential 
   assert.equal((await f.decide(bash('cat .env.example'), false)).layer, 'hard', 'a missing file has no verified content to exempt');
 });
 
-test('Codex uses full per-file native diffs and cannot infer safe templates from a truncated display or directory grant', async t => {
+test('Codex allows scoped environment changes but retains strict template checks and refuses directory grants', async t => {
   const f = await fixture(t), path = join(f.cwd, '.env.example');
   const diff = '@@ -0,0 +1,2 @@\n+PORT=3000\n+API_KEY=\n';
   const request = codexFileChangeRequest({}, ['.env.example', 'app.py'], 'display only', f.cwd, [{ path: '.env.example', diff }, { path: 'app.py', diff: '+pass' }]);
   assert.equal((await f.decide(request)).layer, 'auto');
-  assert.equal((await f.decide(codexFileChangeRequest({}, ['.env.example'], diff, f.cwd))).layer, 'user');
+  assert.equal((await f.decide(request, false)).layer, 'auto');
+  assert.equal((await f.decide(codexFileChangeRequest({}, ['.env.example'], diff, f.cwd), false)).layer, 'hard');
+  assert.equal((await f.decide(codexFileChangeRequest({}, ['.env.example'], diff, f.cwd))).layer, 'auto');
   const full = diff + '+SECRET=fixture-private-value\n';
-  assert.equal((await f.decide(codexFileChangeRequest({}, ['.env.example'], diff, f.cwd, [{ path, diff: full }]))).layer, 'user');
+  assert.equal((await f.decide(codexFileChangeRequest({}, ['.env.example'], diff, f.cwd, [{ path, diff: full }]))).layer, 'auto');
   assert.equal((await f.decide({ ...request, raw: { grantRoot: f.cwd } })).layer, 'hard');
   assert.equal((await f.decide({ ...request, raw: { additionalPermissions: { network: true } } })).layer, 'hard');
 });
@@ -110,4 +114,34 @@ test('selected safe templates can be packaged but secrets and true environment f
   await assert.rejects(packageFiles(f.cwd, ['.env.example']), /非占位/);
   await writeFile(join(f.cwd, '.env'), template);
   await assert.rejects(packageFiles(f.cwd, ['.env']), /受保护/);
+});
+
+test('environment exceptions are exact, checked paths and never grant directories or other credential access', async t => {
+  const f = await fixture(t), path = join(f.cwd, '.env');
+  await writeFile(path, 'VALUE=fixture-private-value');
+  assert.equal((await f.decide(normalizeClaudeRequest('Read', { file_path: path }, {}, f.cwd))).layer, 'auto');
+  assert.equal((await f.decide(normalizeClaudeRequest('Edit', { file_path: path, old_string: 'fixture-private-value', new_string: 'new-private-value' }, {}, f.cwd))).layer, 'auto');
+  assert.deepEqual(await checkedProjectEnvironments(f.request('.env'), f.cwd, true), [path]);
+  assert.deepEqual(await checkedProjectEnvironments(f.request('.env'), f.cwd, false), []);
+  const before = await projectEnvironmentState(path, f.cwd, true);
+  assert.ok(before); assert.doesNotMatch(before, /fixture-private-value/);
+  await writeFile(path, 'VALUE=changed-private-value-longer');
+  assert.notEqual(await projectEnvironmentState(path, f.cwd, true), before);
+  for (const raw of [{ grantRoot: f.cwd }, { additionalPermissions: { network: true } }]) {
+    assert.deepEqual(await checkedProjectEnvironments({ ...f.request('.env'), raw }, f.cwd, true), []);
+  }
+  await symlink(path, join(f.cwd, '.env.link'));
+  await link(path, join(f.cwd, '.env.hard'));
+  for (const name of ['.env', '.env.link', '.env.hard', '../.env', '.ssh/.env']) {
+    assert.deepEqual(await checkedProjectEnvironments(f.request(name), f.cwd, true), [], name);
+  }
+  await rm(join(f.cwd, '.env.hard'));
+  const request = f.request('.env');
+  const checked = await checkedProjectEnvironments(request, f.cwd, true);
+  const deny = decideLayers(request, [f.cwd], [{ id: 'deny-env', source: 'user', kind: 'file-write', pattern: '.env', decision: 'deny', createdAt: 0 }], f.cwd, false, true, [], false, checked);
+  assert.equal(deny.layer, 'habit');
+  const mixed = normalizeClaudeRequest('Bash', { command: 'cat .env ../.env' }, {}, f.cwd);
+  assert.equal((await f.decide(mixed)).layer, 'hard');
+  const extraRoot = await checkedProjectEnvironments(normalizeClaudeRequest('Bash', { command: 'cat .env', cwd: f.root }, {}, f.cwd), f.cwd, true);
+  assert.deepEqual(extraRoot, []);
 });

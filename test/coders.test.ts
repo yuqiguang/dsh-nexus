@@ -411,6 +411,21 @@ test('the Claude adapter reports each tool call and what it says as steps, in or
   assert.deepEqual(logs, ['FAIL login.test.ts\nexpected 200']);
 });
 
+test('the Claude adapter hides environment file values from live tool logs', async () => {
+  const logs: string[] = [], steps: string[] = [];
+  const query = scriptedQuery(async function* () {
+    for (const name of ['Read', 'Write', 'Edit', 'Bash']) {
+      yield { type: 'assistant', message: { content: [{ type: 'tool_use', id: name, name, input: { file_path: `${cwd}/.env`, command: "printf 'VALUE=fixture-private-value' > .env", content: 'VALUE=fixture-private-value' } }] } };
+      yield { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: name, content: 'VALUE=fixture-private-value' }] } };
+    }
+    yield { type: 'result', subtype: 'success', result: 'configuration ready' };
+  });
+  const outcome = await runClaudeTask(task(), { query, onActivity: text => { steps.push(text); }, onLog: text => { logs.push(text); }, async decide() { return { behavior: 'allow' }; } }).done;
+  assert.equal(outcome.status, 'completed'); assert.equal(logs.length, 4);
+  assert.doesNotMatch(JSON.stringify({ logs, steps }), /fixture-private-value/);
+  assert.ok(logs.every(log => log.includes('已隐藏')));
+});
+
 test('the Claude adapter reports SDK errors and cancellation without rejecting', async () => {
   const failing = runClaudeTask(task(), { query: scriptedQuery(async function* () {
     yield { type: 'result', subtype: 'error_max_turns', is_error: true, errors: ['too many turns'] };
@@ -1161,7 +1176,10 @@ test('model queue admission refreshes evidence and obeys newly added deny rules 
         return { safe: true, reason: 'fixture check' };
       } });
       const id = (await harness.run('coder_task', { description: 'check fixture' })).task_id!;
-      await until(() => queued && harness.tasks.get(id)?.reviewDepth === 2, 'two concurrent approval requests');
+      // reviewDepth includes evidence preparation. Mutate only after both requests actually reach the queue,
+      // otherwise this tests a read-in-progress race (correctly refused), not refresh after queue admission.
+      await until(() => queued && harness.tasks.get(id)?.reviewDepth === 2
+        && harness.panels[0]!.progress.filter(line => line.startsWith('DSH 审核排队中')).length === 2, 'two requests reached the model queue');
       if (mode === 'changed') await writeFile(join(cwd, 'check.cjs'), 'console.log("after-fixture")');
       else if (mode === 'deny') harness.rules.set('late-deny', { id: 'late-deny', kind: 'command', pattern: 'node check.cjs', decision: 'deny', source: 'user', createdAt: Date.now() });
       else cancel.abort();
@@ -1537,6 +1555,26 @@ test('a Claude Code session becomes the task\'s process, pairing each tool call 
     ['command', 'npm test'], ['edit', '改文件：/p/src/login.ts']]);
   assert.deepEqual([entries[3]!.body, entries[3]!.error, entries[3]!.durationMs], ['FAIL login.test.ts', true, 3000]);
   assert.equal(entries[4]!.body, '- a\n+ b');
+});
+
+test('dotenv tool bodies, diffs and paired outputs are hidden in task transcripts', () => {
+  const timestamp = '2026-09-27T12:00:01Z', window = { from: 0, to: Date.now() };
+  const secret = 'VALUE=fixture-private-value';
+  const claude = ['Read', 'Write', 'Edit', 'Bash'].flatMap((name, index) => [
+    { type: 'assistant', timestamp, message: { content: [{ type: 'tool_use', id: String(index), name, input: { file_path: '/project/.env', content: secret, old_string: secret, new_string: secret, command: `printf '${secret}' > .env` } }] } },
+    { type: 'user', timestamp, message: { content: [{ type: 'tool_result', tool_use_id: String(index), content: secret }] } },
+  ]).map(item => JSON.stringify(item)).join('\n');
+  const entries = parseClaudeSession(claude, window);
+  assert.equal(entries.length, 4);
+  assert.doesNotMatch(JSON.stringify(entries), /fixture-private-value/);
+  assert.ok(entries.every(entry => entry.body?.includes('已隐藏')));
+  const codex = [
+    { type: 'FileChange', changes: { '/project/.env': { diff: secret }, '/project/app.py': { diff: '+print(1)' } } },
+    { type: 'CommandExecution', command: ['cat .env'], aggregated_output: secret, exit_code: 0 },
+  ].map(item => JSON.stringify({ timestamp, type: 'event_msg', payload: { type: 'item_completed', item } })).join('\n');
+  const parsed = parseCodexRollout(codex, window);
+  assert.equal(parsed.length, 2); assert.doesNotMatch(JSON.stringify(parsed), /fixture-private-value/);
+  assert.match(parsed[0]!.body!, /print\(1\)/);
 });
 
 test('session files are found where each coder keeps them, and a task without one says why', async () => {
@@ -2399,7 +2437,7 @@ test('standard Claude reuses only repeatable safety reviews and rechecks changed
    assert.equal(reviews,1,'unchanged repeated check reuses the model verdict');
    await writeFile(join(cwd,'index.html'),'<p>changed</p>');
    assert.equal((await ask('node check.js')).behavior,'allow'); assert.equal(reviews,2);
-   assert.equal((await ask('cat .env')).behavior,'deny','hard protection still runs before review');
+   assert.equal((await ask('cat ~/.ssh/id_rsa')).behavior,'deny','hard protection still runs before review');
    for(let i=0;i<2;i++) assert.equal((await ask('node unknown.js')).behavior,'allow');
    yield {type:'result',subtype:'success',result:'fixture finished'};
   });
@@ -2822,7 +2860,7 @@ test('environment preflight failure prevents coding and remains distinct from fi
   assert.equal(passed.result?.verifyOk, true);
 });
 
-test('environment template work avoids approval while true environment writes ask once each without exposing values', async t => {
+test('standard environment file operations avoid human and model approvals without exposing values', async t => {
   const cwd = await mkdtemp(join(tmpdir(), 'nexus-env-approval-'));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const harness = coderHarness(questions => {
@@ -2844,9 +2882,29 @@ test('environment template work avoids approval while true environment writes as
   await harness.jobs.at(-1)!.done;
   const record = harness.tasks.get(result.task_id!)!;
   assert.equal(reviews, 0, 'sensitive writes cannot be delegated to the review model');
-  assert.equal(harness.asked.length, 2, 'a human approval never silently becomes a lasting credential grant');
-  assert.equal(record.autoAllowed, 1);
+  assert.equal(harness.asked.length, 0);
+  assert.equal(record.autoAllowed, 3);
   assert.doesNotMatch(JSON.stringify(record.decisions), /fixture-private-value/);
+});
+
+test('standard commands naming project dotenv still reach the reviewer and retain real commands', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-env-command-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, '.env'), 'VALUE=fixture-private-value');
+  const harness = coderHarness(); let reviews = 0;
+  const query = scriptedQuery(async function* (options) {
+    const decision = await options.canUseTool('Bash', { command: 'test -f .env' }, { signal: options.abortController.signal });
+    assert.equal(decision.behavior, 'allow');
+    yield { type: 'result', subtype: 'success', result: 'configuration checked' };
+  });
+  await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard', safetyReviewer: async (_task, input) => {
+    reviews++; assert.match(input.operation, /test -f \.env/); assert.doesNotMatch(JSON.stringify(input), /fixture-private-value/);
+    return { safe: true, reason: 'fixture checks only file existence' };
+  } });
+  const result = await harness.run('coder_task', { cwd, description: 'check project config exists' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(reviews, 1); assert.equal(harness.asked.length, 0);
+  assert.equal(harness.tasks.get(result.task_id!)!.decisions.at(-1)?.layer, 'supervisor');
 });
 
 test('environment approval cannot authorize a link changed while waiting or override a new user deny', async t => {
@@ -2856,15 +2914,15 @@ test('environment approval cannot authorize a link changed while waiting or over
     try {
       const harness = coderHarness(questions => {
         if (scenario === 'link') symlinkSync(join(root, 'outside'), join(cwd, '.env'));
-        else harness.rules.set('deny-env', { id: 'deny-env', source: 'user', kind: 'file-write', pattern: '.env', decision: 'deny', createdAt: Date.now() });
+        else harness.rules.set('deny-env', { id: 'deny-env', source: 'user', kind: 'command', pattern: 'cp', decision: 'deny', createdAt: Date.now() });
         return questions.map(q => ({ id: q.id, selected: ['允许'] }));
       });
       const query = scriptedQuery(async function* (options) {
-        const decision = await options.canUseTool('Write', { file_path: join(cwd, '.env'), content: 'API_KEY=' }, { signal: options.abortController.signal });
+        const decision = await options.canUseTool('Bash', { command: 'cp .env.example .env' }, { signal: options.abortController.signal });
         assert.equal(decision.behavior, 'deny');
         yield { type: 'result', subtype: 'success', result: 'write not performed' };
       });
-      await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard' });
+      await installCoders(harness.ctx, { roots: [cwd], query, defaultCoder: 'claude', securityMode: 'standard', reviewPolicy: { ...DEFAULT_REVIEW_POLICY, commands: 'ask' } });
       const result = await harness.run('coder_task', { cwd, description: 'prepare config' });
       await harness.jobs.at(-1)!.done;
       const record = harness.tasks.get(result.task_id!)!;

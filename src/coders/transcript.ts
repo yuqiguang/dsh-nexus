@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { unwrapShell } from './habits.js';
 import { redact } from './normalize.js';
+import { isEnvironmentFile, commandMentionsEnvironment } from './rules.js';
 import { isActive, type CoderKind, type TaskRecord } from './types.js';
 
 /**
@@ -37,6 +38,7 @@ export interface CoderHomes { codex: string[]; claude: string[] }
 const ENTRY_LIMIT = 400;
 const BODY_LIMIT = 20_000;
 const REASONING_LIMIT = 4_000;
+const ENVIRONMENT_HIDDEN = '环境配置内容已隐藏。';
 /** Slack around the task's own time span: a session file is shared by every task that resumed it. */
 const WINDOW_SLACK_MS = 2_000;
 
@@ -119,7 +121,8 @@ export function parseCodexRollout(file: string, window: Window): TranscriptEntry
       const parsed = Array.isArray(item.parsed_cmd) ? text((item.parsed_cmd[0] as { cmd?: unknown } | undefined)?.cmd) : '';
       const command = parsed || unwrapShell(Array.isArray(item.command) ? item.command.map(text).join(' ') : text(item.command));
       const duration = item.duration as { secs?: unknown; nanos?: unknown } | undefined;
-      entries.push({ at, kind: 'command', title: redact(command), body: clipBody(text(item.aggregated_output) || text(item.formatted_output)),
+      const environment = commandMentionsEnvironment(command);
+      entries.push({ at, kind: 'command', title: environment ? '环境配置命令（内容已隐藏）' : redact(command), body: environment ? ENVIRONMENT_HIDDEN : clipBody(text(item.aggregated_output) || text(item.formatted_output)),
         ...(typeof item.exit_code === 'number' ? { exitCode: item.exit_code } : {}),
         ...(typeof duration?.secs === 'number' ? { durationMs: duration.secs * 1000 + Math.round(Number(duration.nanos ?? 0) / 1e6) } : {}) });
     } else if (type === 'FileChange' || type === 'PatchApply') {
@@ -128,7 +131,7 @@ export function parseCodexRollout(file: string, window: Window): TranscriptEntry
       const list: Record<string, unknown>[] = Array.isArray(changes) ? changes as Record<string, unknown>[]
         : changes && typeof changes === 'object' ? Object.entries(changes).map(([path, change]) => ({ path, ...(change as Record<string, unknown>) })) : [];
       const paths = list.map(change => text(change.path)).filter(Boolean);
-      const diff = list.map(change => `--- ${text(change.path)}\n${text(change.unified_diff) || text(change.diff) || text(change.content)}`).join('\n');
+      const diff = list.map(change => `--- ${text(change.path)}\n${isEnvironmentFile(text(change.path)) ? ENVIRONMENT_HIDDEN : text(change.unified_diff) || text(change.diff) || text(change.content)}`).join('\n');
       entries.push({ at, kind: 'edit', title: `改文件：${paths.join('，') || '（未知路径）'}`, body: clipBody(diff) });
     } else if (type && !['ContextCompaction', 'Plan', 'HookPrompt'].includes(type)) {
       entries.push({ at, kind: 'tool', title: type, body: clipBody(JSON.stringify(item, null, 2), 2_000) });
@@ -141,6 +144,7 @@ export function parseCodexRollout(file: string, window: Window): TranscriptEntry
 export function parseClaudeSession(file: string, window: Window): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
   const calls = new Map<string, TranscriptEntry>();
+  const privateCalls = new Set<string>();
   for (const record of records(file)) {
     const at = Date.parse(text(record.timestamp));
     if (!within(at, window) || record.isSidechain === true) continue;
@@ -153,7 +157,7 @@ export function parseClaudeSession(file: string, window: Window): TranscriptEntr
           const call = calls.get(text(block.tool_use_id));
           if (!call) continue;
           const output = texts(block.content);
-          if (output.trim()) call.body = call.body ? `${call.body}\n\n${clipBody(output)}` : clipBody(output);
+          if (output.trim() && !privateCalls.has(text(block.tool_use_id))) call.body = call.body ? `${call.body}\n\n${clipBody(output)}` : clipBody(output);
           if (block.is_error === true) call.error = true;
           call.durationMs = at - call.at;
         }
@@ -165,12 +169,15 @@ export function parseClaudeSession(file: string, window: Window): TranscriptEntr
         else if (block.type === 'tool_use') {
           const name = text(block.name);
           const input = (block.input ?? {}) as Record<string, unknown>;
-          const entry: TranscriptEntry = name === 'Bash' ? { at, kind: 'command', title: redact(text(input.command)) }
+          const environment = isEnvironmentFile(text(input.file_path)) || isEnvironmentFile(text(input.path)) || name === 'Bash' && commandMentionsEnvironment(text(input.command));
+          const entry: TranscriptEntry = environment ? { at, kind: name === 'Bash' ? 'command' : ['Write', 'Edit'].includes(name) ? 'edit' : 'tool', title: `${name}：环境配置（内容已隐藏）`, body: ENVIRONMENT_HIDDEN }
+            : name === 'Bash' ? { at, kind: 'command', title: redact(text(input.command)) }
             : name === 'Edit' ? { at, kind: 'edit', title: `改文件：${text(input.file_path)}`, body: clipBody(`- ${text(input.old_string)}\n+ ${text(input.new_string)}`) }
               : name === 'Write' ? { at, kind: 'edit', title: `写文件：${text(input.file_path)}`, body: clipBody(text(input.content)) }
                 : { at, kind: 'tool', title: name, body: clipBody(JSON.stringify(input, null, 2), 2_000) };
           entries.push(entry);
           if (text(block.id)) calls.set(text(block.id), entry);
+          if (environment) privateCalls.add(text(block.id));
         }
       }
     }

@@ -149,12 +149,12 @@ test('Python imports cannot disclose protected files or follow symlinks outside 
 
 test('Python import traversal remains bounded and dynamic imports never claim complete evidence', async t => {
   const f = await fixture(t);
-  await f.write('check.py', Array.from({ length: 30 }, (_, i) => `import part${i}`).join('\n'));
-  for (let i = 0; i < 30; i++) await f.write(`part${i}.py`, `# PART_${i}\n`);
+  await f.write('check.py', Array.from({ length: 70 }, (_, i) => `import part${i}`).join('\n'));
+  for (let i = 0; i < 70; i++) await f.write(`part${i}.py`, `# PART_${i}\n`);
   const many = await f.inspect('python check.py');
   assert.equal(many.evidenceComplete, false);
   assert.match(many.evidence.join('\n'), /上限/);
-  assert.ok(many.evidence.filter(line => line.includes('完整内容')).length <= 24);
+  assert.ok(many.evidence.filter(line => line.includes('完整内容')).length <= 64);
   await f.write('check.py', 'import importlib\nimportlib.import_module(module_name)');
   assert.equal((await f.inspect('python check.py')).evidenceComplete, false);
 });

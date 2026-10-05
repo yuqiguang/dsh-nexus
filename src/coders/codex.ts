@@ -7,6 +7,7 @@ import type { TaskPermissions } from './permissions.js';
 import { isInside } from './rules.js';
 import { codexFailure, exceptionFailure, failureLabel, safeFailureDetail, RESUME_PROMPT, type CodexError, type CoderRun, type CoderOutcome as JobOutcome, type RetryNotice } from './retry.js';
 import { codexCommandRequest, codexFileChangeRequest, codexPermissionRequest, codexQuestionRequest, codexStep, codexTextQuestion, narration, outputTail } from './normalize.js';
+import { commandMentionsEnvironment } from './rules.js';
 import type { CoderDecision, CoderRequest, TaskRecord } from './types.js';
 
 import { spawnCodexAppServer, type CodexProcess, type CodexLaunch, type CodexSpawn } from './codex-process.js';
@@ -195,7 +196,7 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
             if (typeof done.exitCode === 'number' && done.exitCode !== 0 && typeof done.command === 'string') deps.onFailure?.(`command:${done.command}`);
             else if (done.exitCode === 0) deps.onSuccess?.();
             const output = typeof done.aggregatedOutput === 'string' ? done.aggregatedOutput : '';
-            deps.onLog?.([typeof done.exitCode === 'number' ? `退出码 ${done.exitCode}` : '', output.trim() ? outputTail(output) : ''].filter(Boolean).join('\n'));
+            deps.onLog?.([typeof done.exitCode === 'number' ? `退出码 ${done.exitCode}` : '', typeof done.command === 'string' && commandMentionsEnvironment(done.command) ? '环境配置内容已隐藏。' : output.trim() ? outputTail(output) : ''].filter(Boolean).join('\n'));
           }
         }
         return;

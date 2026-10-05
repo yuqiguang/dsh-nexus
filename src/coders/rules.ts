@@ -31,6 +31,11 @@ const PROTECTED_DIRS = ['.ssh', '.dsh', '.nexus', '.gnupg', '.aws', '.config/gh'
 export function isEnvironmentFile(path: string): boolean { return /^\.env(?:\..+)?$/i.test(baseName(path)); }
 export function isEnvironmentTemplate(path: string): boolean { return /^\.env\.(?:example|sample|template)$/i.test(baseName(path)); }
 
+/** Only for hiding displays; this lexical observation never grants a permission. */
+export function commandMentionsEnvironment(command: string): boolean {
+  return commandPathTokens(command).some(token => isEnvironmentFile(commandPath(token)));
+}
+
 /** Naming an output is not permission to read/write it. Credential directories still win. */
 export function isProjectEnvironment(path: string, cwd: string, standard: boolean): boolean {
   return isAbsolute(path) && isInside(cwd, path) && isEnvironmentFile(path)
@@ -167,31 +172,35 @@ export function isPublicWebRequest(request: CoderRequest): boolean {
  * file operation on that exact file, and a command that merely names that exact file, from the credential rule.
  */
 export function hardRule(request: CoderRequest, roots: readonly string[], webResearch = false, standard = false,
-  cwd = roots[0] ?? '', safeTemplates: readonly string[] = [], projectPip = false): HardVerdict | undefined {
+  cwd = roots[0] ?? '', safeTemplates: readonly string[] = [], projectPip = false, projectEnvironments: readonly string[] = []): HardVerdict | undefined {
   if (request.tool === 'codex.permissions') return { verdict: 'deny', reason: '无人值守任务不授予整个回合额外权限，请按具体命令或文件操作申请', key: 'turn-permissions' };
   const scopedWrite = request.kind === 'file-write' && ['Write', 'Edit', 'codex.fileChange'].includes(request.tool) && !request.raw.grantRoot && !request.raw.additionalPermissions;
   const environment = request.paths.filter(path => isProjectEnvironment(path, cwd, standard));
   const safeTemplate = (path: string) => environment.includes(path) && isEnvironmentTemplate(path) && safeTemplates.includes(path);
-  const protectedPath = request.paths.find(path => isProtectedPath(path, roots, standard) && !safeTemplate(path)
+  const projectEnvironment = (path: string) => standard && isProjectEnvironment(path, cwd, standard)
+    && projectEnvironments.some(checked => process.platform === 'win32' ? checked.toLowerCase() === path.toLowerCase() : checked === path);
+  const protectedPath = request.paths.find(path => isProtectedPath(path, roots, standard) && !safeTemplate(path) && !projectEnvironment(path)
     && !(standard && scopedWrite && environment.includes(path)));
   if (protectedPath) return { verdict: 'deny', reason: `涉及凭据或密钥文件：${protectedPath}`, key: `credential:${baseName(protectedPath)}` };
-  if (environment.some(path => !safeTemplate(path))) return { verdict: 'escalate', manualOnly: true,
+  if (environment.some(path => !safeTemplate(path) && !projectEnvironment(path))) return { verdict: 'escalate', manualOnly: true,
     reason: '本次写入项目环境配置文件，可能包含凭据；需你确认，仅授权所列文件的这次修改，内容不在审批消息中展示' };
   const outside = request.paths.find(path => !insideAny(roots, path));
   if (outside && (request.kind === 'file-write' || request.kind === 'file-read' || request.kind === 'other')) {
     return { verdict: 'escalate', reason: `路径在任务根目录之外：${outside}` };
   }
   if (request.kind === 'command') {
+    // Display text may hide environment values. Always enforce command rules on the actual operation.
+    const command = request.command || request.detail;
     if (!standard && request.tool === 'Bash' && (request.raw.dangerouslyDisableSandbox === true || outside)) return { verdict: 'deny', reason: 'Claude 命令不能临时解除沙箱限制。目录外文件请改用文件工具申请审批；缺少联网域名请在设置中授权后新建任务。', key: 'claude-sandbox-boundary' };
-    const mentioned = mentionsProtectedPath(request.detail, roots, standard, token => {
-      if (!safeTemplates.length) return false;
-      const resolved = resolve(cwd, commandPath(token));
-      return insideAny(roots, resolved) && safeTemplates.includes(resolved);
+    const mentioned = mentionsProtectedPath(command, roots, standard, token => {
+      const base = typeof request.raw.cwd === 'string' && isAbsolute(request.raw.cwd) ? request.raw.cwd : cwd;
+      const resolved = resolve(base, commandPath(token));
+      return insideAny(roots, resolved) && (safeTemplates.includes(resolved) || projectEnvironment(resolved));
     });
     if (mentioned) return { verdict: 'deny', reason: `命令涉及凭据或密钥文件：${mentioned}`, key: `credential:${baseName(mentioned)}` };
-    for (const [pattern, reason] of DENY_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'deny', reason, key: `command:${reason}` };
-    for (const [pattern, reason] of ESCALATE_COMMANDS) if (pattern.test(request.detail)) return { verdict: 'escalate', reason, manualOnly: true };
-    if (/\bpip(?:3)?\s+install\b/i.test(request.detail)) return { verdict: 'escalate',
+    for (const [pattern, reason] of DENY_COMMANDS) if (pattern.test(command)) return { verdict: 'deny', reason, key: `command:${reason}` };
+    for (const [pattern, reason] of ESCALATE_COMMANDS) if (pattern.test(command)) return { verdict: 'escalate', reason, manualOnly: true };
+    if (/\bpip(?:3)?\s+install\b/i.test(command)) return { verdict: 'escalate',
       reason: standard && projectPip ? '项目虚拟环境依赖安装，需审核本次命令和安装来源' : 'Python 依赖安装目标尚未核验，需要你确认', manualOnly: !(standard && projectPip) };
     if (outside) return { verdict: 'escalate', reason: `命令访问任务根目录之外的路径：${outside}` };
     return undefined;

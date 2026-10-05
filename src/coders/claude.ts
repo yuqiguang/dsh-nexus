@@ -7,6 +7,7 @@ import { credentialPaths } from './permissions.js';
 import { counter, exceptionFailure, failureLabel, providerFailure, safeFailureDetail, RESUME_PROMPT, type CoderRun, type CoderOutcome, type ProviderFailure, type RetryNotice } from './retry.js';
 import { pathToFileURL } from 'node:url';
 import { claudeStep, claudeToolOutput, narration, normalizeClaudeRequest, outputTail, type ClaudePermissionContext } from './normalize.js';
+import { commandMentionsEnvironment, isEnvironmentFile } from './rules.js';
 import type { CoderDecision, CoderRequest, TaskRecord } from './types.js';
 
 /** The slice of the Agent SDK message stream this adapter reads. */
@@ -110,6 +111,7 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
   const failed = (detail: string, result: string, failure = providerFailure({ message: detail }) ?? lastFailure ?? quota): CoderOutcome =>
     ({ status: 'failed', detail: failure ? failureLabel(failure) : safeFailureDetail(detail), result, ...(failure ? { providerFailure: failure } : {}) });
   const calls = new Map<string, string>();
+  const privateCalls = new Set<string>();
   // AskUserQuestion may reach both the hook and canUseTool. Only dedupe that exact question;
   // a later command permission callback can carry a newly discovered blocked path and must be checked again.
   const decisions = new Set<Promise<CoderDecision>>();
@@ -197,17 +199,23 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
           const text = textOf(content);
           if (text) { lastAssistant = text; const said = narration(text); if (said) deps.onActivity?.(said); }
           if (Array.isArray(content)) for (const block of content) {
-            if (block && typeof block === 'object' && block.type === 'tool_use' && typeof block.id === 'string') calls.set(block.id, JSON.stringify([block.name, block.input]));
+            if (block && typeof block === 'object' && block.type === 'tool_use' && typeof block.id === 'string') {
+              calls.set(block.id, JSON.stringify([block.name, block.input]));
+              const input = block.input as Record<string, unknown> | undefined;
+              if (input && (typeof input.file_path === 'string' && isEnvironmentFile(input.file_path) || typeof input.path === 'string' && isEnvironmentFile(input.path) || block.name === 'Bash' && typeof input.command === 'string' && commandMentionsEnvironment(input.command))) privateCalls.add(block.id);
+            }
             const step = claudeStep(block, task.cwd); if (step) deps.onActivity?.(step); }
         }
         else if (message.type === 'user' && Array.isArray(message.message?.content)) {
           for (const block of message.message.content as unknown[]) {
+            let environment = false;
             if (block && typeof block === 'object' && 'tool_use_id' in block && typeof block.tool_use_id === 'string') {
+              environment = privateCalls.delete(block.tool_use_id);
               const key = calls.get(block.tool_use_id);
               if (key) { if ('is_error' in block && block.is_error === true) deps.onFailure?.(key); else deps.onSuccess?.(); }
               calls.delete(block.tool_use_id);
             }
-            const output = claudeToolOutput(block); if (output?.trim()) deps.onLog?.(outputTail(output)); }
+            const output = claudeToolOutput(block); if (output?.trim()) deps.onLog?.(environment ? '环境配置内容已隐藏。' : outputTail(output)); }
         }
         else if (message.type === 'result') {
           if (controller.signal.aborted) return interrupted(lastAssistant);

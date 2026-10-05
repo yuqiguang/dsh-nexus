@@ -154,5 +154,5 @@ test('standard commands reach DSH review; strict Claude cannot escape and high-i
   const dangerous = decideLayers({ ...request, command: 'git push', detail: 'git push' }, [cwd], [], cwd, true, true);
   assert.equal(dangerous.layer, 'user');
   assert.equal(dangerous.layer === 'user' && dangerous.manualOnly, true);
-  assert.equal(decideLayers({ ...request, detail: 'cat ~/.ssh/id_rsa' }, [cwd], [], cwd, true, true).layer, 'hard');
+  assert.equal(decideLayers({ ...request, command: 'cat ~/.ssh/id_rsa', detail: 'cat ~/.ssh/id_rsa' }, [cwd], [], cwd, true, true).layer, 'hard');
 });

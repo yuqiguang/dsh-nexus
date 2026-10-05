@@ -48,7 +48,7 @@ import { decideLayers } from './decide.js';
 import { escalateToUser } from './escalate.js';
 import { DECISION_LABEL, HABIT_KINDS, KIND_LABEL, describeRule, isOpaque, projectRules, tokens } from './habits.js';
 import { isInside, isProtectedPath, isProjectEnvironment, isEnvironmentFile } from './rules.js';
-import { checkedCommandTemplates, checkedEnvironmentTemplates, environmentApprovalDisplay } from './environment-files.js';
+import { checkedCommandTemplates, checkedEnvironmentTemplates, checkedProjectEnvironments, environmentApprovalDisplay } from './environment-files.js';
 import { canonical, taskPermissions, permissionSummary } from './permissions.js';
 import type {} from '@deepseek-ai/dsh-sandbox';
 import type {} from '@deepseek-ai/dsh-sandbox-policy';
@@ -375,6 +375,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     // A command that only names a template the file tools may already read is not a credential operation; treat it the same
     // way instead of denying a read-only command for mentioning a file the owner just approved (ct-4c671559).
     if (request.kind === 'command') safeTemplates.push(...await checkedCommandTemplates(request.detail, task.cwd, standard));
+    const checkedEnvironments = () => checkedProjectEnvironments({ ...request, paths: requestedPaths }, task.cwd, standard);
+    const projectEnvironments = await checkedEnvironments();
     request = environmentApprovalDisplay(request);
     const currentTask = store.get(taskId);
     if (signal.aborted || !currentTask || currentTask.stopReason || !isActive(currentTask)) return { behavior: 'deny', message: '任务已停止。', interrupt: true };
@@ -382,11 +384,18 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     const environmentRedirect = requestedPaths.some((path, index) => isEnvironmentFile(path) && !samePath(path, request.paths[index]!));
     const projectPip = standard && request.kind === 'command' && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId));
     const verdict = environmentRedirect ? { layer: 'hard' as const, key: 'environment-link', reason: '环境配置路径通过链接重定向，请使用项目内真实文件路径' }
-      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates, projectPip);
+      : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates, projectPip, projectEnvironments);
     const at = Date.now();
     const step = liveOf.get(taskId)?.record ?? (() => {});
     if (verdict.layer === 'auto') {
       await store.update(taskId, current => ({ autoAllowed: (current.autoAllowed ?? 0) + 1 }));
+      if (projectEnvironments.length) {
+        const checked = await checkedEnvironments();
+        const current = store.get(taskId);
+        const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip, checked);
+        if (signal.aborted || shutdown.signal.aborted || !current || current.stopReason || !isActive(current)) return { behavior: 'deny', message: '任务已停止。', interrupt: true };
+        if (projectEnvironments.some(path => !checked.includes(path)) || latest.layer !== 'auto') return { behavior: 'deny', message: '环境配置路径或规则已变化，请重新申请。' };
+      }
       return { behavior: 'allow' };
     }
     if (verdict.layer === 'hard') {
@@ -434,7 +443,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
             const slot = await acquireReviewSlot(reviewQueue, reviewSignal);
             release = slot.release; reviewSignal = slot.signal;
             // Admission may have taken minutes. Never send stale evidence or bypass a newly added owner rule.
-            const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
+            const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)), await checkedEnvironments());
             if (latest.layer === 'hard' || latest.layer === 'habit' && latest.verdict.decision === 'deny') return decide(taskId, request, signal);
             if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
             const queuedTask = store.get(taskId);
@@ -453,7 +462,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           const after = rechecked.input;
           const readonlyUnchanged = !deterministic || !!await readonlyReview(task, request, reviewEnvs.get(taskId));
           const current = store.get(taskId);
-          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard', [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
+          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)), await checkedEnvironments());
           if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
           // A newly added deny must still win, even if the reviewer was already in flight.
           if (latest.layer === 'hard' || (latest.layer === 'habit' && latest.verdict.decision === 'deny')) return decide(taskId, request, signal);
@@ -523,10 +532,11 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(taskId, () => ({ stopCause: 'user-wait-timeout' }));
       stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
     }
-    if (outcome.decision.behavior === 'allow' && requestedPaths.some(isEnvironmentFile)) {
+    if (outcome.decision.behavior === 'allow' && (requestedPaths.some(isEnvironmentFile) || projectEnvironments.length)) {
       const paths = await Promise.all(requestedPaths.map(path => canonical(path).catch(() => '')));
-      const currentRules = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard');
-      if (paths.some((path, index) => !samePath(path, request.paths[index]!)) || currentRules.layer === 'hard' || currentRules.layer === 'habit' && currentRules.verdict.decision === 'deny') {
+      const checked = await checkedEnvironments();
+      const currentRules = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], false, checked);
+      if (paths.some((path, index) => !samePath(path, request.paths[index]!)) || projectEnvironments.some(path => !checked.includes(path)) || currentRules.layer === 'hard' || currentRules.layer === 'habit' && currentRules.verdict.decision === 'deny') {
         outcome = { decision: { behavior: 'deny', message: '确认期间配置文件路径或规则已变化，请重新申请。' },
           record: { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user', outcome: 'deny', reason: '确认期间配置文件路径或规则已变化' } };
       }

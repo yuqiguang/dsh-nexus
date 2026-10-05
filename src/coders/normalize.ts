@@ -1,5 +1,6 @@
 import { isAbsolute, resolve } from 'node:path';
 import { unwrapShell } from './habits.js';
+import { commandMentionsEnvironment } from './rules.js';
 import type { CoderQuestion, CoderRequest, CoderRequestKind } from './types.js';
 
 /** The subset of the Agent SDK's `canUseTool` options that helps describe a request. */
@@ -224,7 +225,7 @@ export function claudeStep(block: unknown, cwd: string): string | undefined {
   const name = text((block as { name?: unknown }).name);
   const input = ((block as { input?: unknown }).input ?? {}) as Record<string, unknown>;
   if (!name) return undefined;
-  if (name === 'Bash') return step('执行', text(input.command));
+  if (name === 'Bash') return commandMentionsEnvironment(text(input.command)) ? '执行：环境配置命令（内容已隐藏）' : step('执行', text(input.command));
   if (FILE_WRITE_TOOLS.has(name)) return step('改文件', shortPath(text(input.file_path) || text(input.notebook_path), cwd));
   if (name === 'Read') return step('读文件', shortPath(text(input.file_path), cwd));
   if (name === 'Glob' || name === 'Grep') return step('搜索', text(input.pattern));
@@ -238,7 +239,7 @@ export function claudeStep(block: unknown, cwd: string): string | undefined {
 export function codexStep(item: unknown, cwd: string): string | undefined {
   if (!item || typeof item !== 'object') return undefined;
   const record = item as { type?: unknown; command?: unknown; changes?: { path?: unknown }[]; tool?: unknown; server?: unknown; query?: unknown };
-  if (record.type === 'commandExecution') return step('执行', unwrapShell(text(record.command)));
+  if (record.type === 'commandExecution') return commandMentionsEnvironment(text(record.command)) ? '执行：环境配置命令（内容已隐藏）' : step('执行', unwrapShell(text(record.command)));
   if (record.type === 'fileChange') return step('改文件', (record.changes ?? []).map(change => shortPath(text(change.path), cwd)).filter(Boolean).join('，'));
   if (record.type === 'mcpToolCall') return `调用 ${[text(record.server), text(record.tool)].filter(Boolean).join('.') || '工具'}`;
   if (record.type === 'webSearch') return step('搜索网页', text(record.query));
