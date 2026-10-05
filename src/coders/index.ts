@@ -435,7 +435,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           const after = rechecked.input;
           const readonlyUnchanged = !deterministic || !!await readonlyReview(task, request, reviewEnvs.get(taskId));
           const current = store.get(taskId);
-          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard', safeTemplates, projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
+          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, task.permissions?.securityMode === 'standard', [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
           if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
           // A newly added deny must still win, even if the reviewer was already in flight.
           if (latest.layer === 'hard' || (latest.layer === 'habit' && latest.verdict.decision === 'deny')) return decide(taskId, request, signal);
