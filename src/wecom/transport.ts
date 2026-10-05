@@ -10,6 +10,12 @@ export function normalizeWecom(body: TextMessage | undefined): InboundMessage | 
     chatType: 'p2p', text: body.text.content.trim() };
 }
 
+/** The SDK rejects explicit negative acknowledgments with a frame; network errors remain ambiguous. */
+export function wecomDeliveryError(error: unknown): ChannelError {
+  const code = error && typeof error === 'object' ? (error as { errcode?: unknown }).errcode : undefined;
+  return new ChannelError(typeof code === 'number' && Number.isSafeInteger(code) && code !== 0 ? 'delivery_rejected' : 'delivery_uncertain');
+}
+
 export class WecomTransport implements ChannelTransport {
   private client?: WSClient;
   private readonly lifetime = new AbortController();
@@ -54,13 +60,16 @@ export class WecomTransport implements ChannelTransport {
     if (!this.client) throw new ChannelError('not_connected');
     const characters = Array.from(text);
     for (let offset = 0; offset < characters.length; offset += 3500) {
-      await this.client.sendMessage(chatId, { msgtype: 'markdown', markdown: { content: characters.slice(offset, offset + 3500).join('') } });
+      try { await this.client.sendMessage(chatId, { msgtype: 'markdown', markdown: { content: characters.slice(offset, offset + 3500).join('') } }); }
+      catch (error) { throw wecomDeliveryError(error); }
     }
   }
 
   async sendFile(chatId: string, file: OutboundFile): Promise<void> {
     if (!this.client) throw new ChannelError('not_connected');
-    const media = await this.client.uploadMedia(file.bytes, { type: 'file', filename: file.name });
-    await this.client.sendMediaMessage(chatId, 'file', media.media_id);
+    try {
+      const media = await this.client.uploadMedia(file.bytes, { type: 'file', filename: file.name });
+      await this.client.sendMediaMessage(chatId, 'file', media.media_id);
+    } catch (error) { throw wecomDeliveryError(error); }
   }
 }

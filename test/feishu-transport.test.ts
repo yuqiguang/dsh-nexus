@@ -1,3 +1,5 @@
+import { ChannelDeliveryStore, DurableChannelTransport } from '../src/channels/durable.js';
+import { MemoryRecords, until } from './helpers.js';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -141,7 +143,7 @@ test('Feishu file delivery uploads first, then posts the returned key, and rejec
   fake.replies.file = { code: 0, data: { file_key: 'fk_1' } };
   fake.replies.message = { code: 0, data: { message_id: 'om_1' } };
   const transport = new LarkTransport(config, () => {}, () => {}, async () => fake.sdk);
-  await assert.rejects(transport.sendFile('oc_chat', { name: 'r.txt', bytes: Buffer.from('x') }, 'dlv_1'), /feishu_not_connected/);
+  await assert.rejects(transport.sendFile('oc_chat', { name: 'r.txt', bytes: Buffer.from('x') }, 'dlv_1'), /not_connected/);
   const started = transport.start(async () => {});
   await fake.connect();
   await transport.sendFile('oc_chat', { name: 'r.txt', bytes: Buffer.from('x') }, 'dlv_1');
@@ -159,7 +161,7 @@ test('a Feishu response that is not a success is rejected with a stable local co
   const started = transport.start(async () => {});
   await fake.connect();
   fake.replies.message = { code: 99, data: { message_id: 'om_1' } };
-  await assert.rejects(transport.sendText('oc_chat', 'hi', 'dlv_1'), /feishu_message_send_failed/);
+  await assert.rejects(transport.sendText('oc_chat', 'hi', 'dlv_1'), /delivery_rejected/);
   fake.replies.file = { code: 99 };
   await assert.rejects(transport.sendFile('oc_chat', { name: 'r.txt', bytes: Buffer.from('x') }, 'dlv_1'), /feishu_file_upload_failed/);
   fake.replies.file = { code: 0, data: {} };
@@ -167,4 +169,28 @@ test('a Feishu response that is not a success is rejected with a stable local co
     'a success code without a usable file key is still a failure');
   transport.stop();
   await started;
+});
+
+
+test('Feishu SDK adapter and durable wrapper retain wire UUIDs and resume only unsent fragments', async t => {
+  const records = new MemoryRecords();
+  const store = new ChannelDeliveryStore(records, 'feishu', config.appId, config.ownerOpenId, process.cwd());
+  const make = (fake: ReturnType<typeof fakeSdk>) => new DurableChannelTransport('feishu', config.ownerOpenId, process.cwd(), store, () => {},
+    publish => new LarkTransport(config, () => {}, publish, async () => fake.sdk));
+  const fake = fakeSdk();
+  Object.defineProperty(fake.replies, 'message', { get: () => fake.calls.messages.length === 2 ? { code: 99 } : { code: 0, data: { message_id: 'ok' } } });
+  const transport = make(fake); t.after(() => transport.stop());
+  const started = transport.start(async () => {}); await fake.connect(); await started;
+  await fake.handler('im.message.receive_v1')(event('bind'));
+  await transport.sendText('oc_1', 'x'.repeat(3501), 'durable', { durable: true });
+  await until(async () => (await store.read()).pending[0]?.error === 'delivery_rejected', 'partial SDK send persisted');
+  const secondId = fake.calls.messages[1]!.data.uuid;
+  await transport.stop();
+  const next = fakeSdk(); next.replies.message = { code: 0, data: { message_id: 'ok' } };
+  const restarted = make(next); t.after(() => restarted.stop());
+  const resuming = restarted.start(async () => { throw new Error('must not replay input'); }); await next.connect(); await resuming;
+  await until(async () => !(await store.read()).pending.length, 'remainder delivered');
+  assert.equal(next.calls.messages.length, 1);
+  assert.equal(next.calls.messages[0]!.data.uuid, secondId);
+  assert.equal(JSON.parse(next.calls.messages[0]!.data.content).text, 'x');
 });

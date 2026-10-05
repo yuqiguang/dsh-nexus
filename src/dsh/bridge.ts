@@ -18,7 +18,7 @@ import { readDelivery } from '../channels/files.js';
 import { formatBytes, saveInbound, type SavedAttachment } from '../channels/inbox.js';
 import type { FileLedgerWriter } from '../files/index.js';
 import { baseSessionOf, identity, parseCommand, sessionIdAt, sessionIdFor, type ChannelTransport, type ChannelIdentity, type DroppedAttachment, type InboundMessage } from '../channels/protocol.js';
-import { DEFAULT_ROTATION, ROTATION_NOTICES, adoptionNotice, rotationDue, sessionDigest, userTurns, type RotationReason, type RotationSettings, type SessionRosterView } from '../sessions/index.js';
+import { ROTATION_NOTICES, adoptionNotice, sessionDigest, userTurns, type RotationReason, type RotationSettings, type SessionRosterView } from '../sessions/index.js';
 import { DEFAULT_TIME_ZONE } from '../assistant/settings.js';
 import { imageMediaType } from '../wechat/media.js';
 import { ChannelError } from '../channels/types.js';
@@ -28,6 +28,8 @@ import { QuestionReplies, questionPrompt } from './questions.js';
 import { interruptedNotice, interruptedWork } from './recovery.js';
 import { activeLegacyReminders, describeReminders, isQuietReply, pluginInitiated } from './schedule.js';
 import { storedEvents } from './history.js';
+import { ChannelNavigation } from './navigation.js';
+import { CHANNEL_HELP } from '../channels/help.js';
 
 /** When a user-started turn is still running, the channel hears about it: once after `firstMs`, then every `everyMs`. */
 export interface HeartbeatOptions { firstMs: number; everyMs: number }
@@ -45,13 +47,9 @@ export interface BridgeExtras {
   files?: FileLedgerWriter;
   /** Which generation of each chat's session is active; without it a chat keeps one session forever. */
   sessions?: SessionRosterView;
+  /** @deprecated Retained for integration compatibility; automatic empty-session rotation is disabled. */
   rotation?: () => RotationSettings;
-  /**
-   * Whether the chat still has work that reports into it — today a coder task that has not settled. Such a task's result is
-   * delivered to the generation that dispatched it, so opening the next generation first leaves the user asking about work
-   * this chat's active session can no longer see (ct-4c671559). A `context` rotation waits for it; the next message after it
-   * settles still rotates, because the growth that asked for it does not go away.
-   */
+  /** Whether background coding work is active; explicit navigation waits for it. */
   busy?: (baseSessionId: string) => Promise<boolean>;
   /** Where the digest of a session that was just replaced goes (long-term memory). */
   memory?: { remember(text: string, sessionId: string): Promise<unknown> };
@@ -80,6 +78,7 @@ export class DshChannelBridge {
   private outgoing: Promise<void> = Promise.resolve();
   private stopped = false;
   private readonly lifetime = new AbortController();
+  private readonly navigation: ChannelNavigation;
   private gate?: PushGate;
   /** The workspace this channel's directory was registered as; see {@link adoptWorkspace}. */
   private registered?: Workspace;
@@ -94,6 +93,9 @@ export class DshChannelBridge {
     private readonly now: () => number = Date.now,
     private readonly extras: BridgeExtras = {},
   ) {
+    this.navigation = new ChannelNavigation(ctx, workspace, extras.sessions, this.lifetime.signal, now,
+      async (chatId, base) => this.replies.hasPending(chatId) || this.questions.hasPending(chatId) || await (extras.busy?.(base) ?? Promise.resolve(false)),
+      (base, chatId) => { this.route(SessionId(base), chatId); });
     // WeChat and WeCom private chats are addressed by the owner's own id, so their session is routable before any message arrives.
     // Feishu chat ids are only learned from an inbound message.
     if (config.channel !== 'feishu') this.route(SessionId(sessionIdFor(config.accountId, config.ownerId, config.ownerId, config.channel)), config.ownerId);
@@ -115,18 +117,19 @@ export class DshChannelBridge {
   }
 
   /** History remains addressable for native jobs and scoped interactions, not new desktop conversation. */
-  private historicalWechat(sessionId: string): boolean {
+  private historicalChannel(sessionId: string): boolean {
     const chatId = this.chatOf(SessionId(sessionId));
-    return this.config.channel === 'wechat' && !!chatId && this.chats.get(chatId) !== sessionId;
+    return !!chatId && this.chats.get(chatId) !== sessionId;
   }
 
   private historicalText(sessionId: string, text: string): string {
-    if (!this.historicalWechat(sessionId) || text.startsWith('[历史微信会话 ')) return text;
-    return `[历史微信会话 ${sessionId}]\n${text}\n普通聊天回复会进入当前微信会话；继续此任务请在电脑端打开上述会话。`;
+    const title = { wechat: '微信', feishu: '飞书', wecom: '企业微信' }[this.config.channel];
+    if (!this.historicalChannel(sessionId) || text.startsWith(`[历史${title}会话 `)) return text;
+    return `[历史${title}会话 ${sessionId}]\n${text}\n普通聊天回复会进入当前${title}会话；可发送“/s”选择旧会话，或在电脑端打开上述会话。`;
   }
 
   private deliverableTurn(sessionId: string, events: readonly SessionEvent[], turn: number): boolean {
-    if (!this.historicalWechat(sessionId)) return true;
+    if (!this.historicalChannel(sessionId)) return true;
     const start = events.findLastIndex(event => event.type === 'turn/start' && event.data.turn === turn);
     if (start < 0) return false;
     const typed = events.slice(start).filter(event => event.type === 'user/message');
@@ -135,7 +138,7 @@ export class DshChannelBridge {
     return typed.length > 0 && typed.every(event => {
       if (event.type !== 'user/message') return false;
       const rpcId = String((event.data.source as { rpcId?: unknown }).rpcId ?? '');
-      return pluginInitiated(event.data) || rpcId.startsWith('wechat-') || rpcId.includes('-hook-');
+      return pluginInitiated(event.data) || rpcId.startsWith(`${this.config.channel}-`) || rpcId.includes('-hook-');
     });
   }
 
@@ -145,6 +148,10 @@ export class DshChannelBridge {
    * created is left alone.
    */
   async resumeBound(): Promise<void> {
+    for (const chatId of await this.transport.knownChats?.() ?? []) {
+      const base = SessionId(sessionIdFor(this.config.accountId, this.config.ownerId, chatId, this.config.channel));
+      this.route(base, chatId);
+    }
     for (const [chatId, sessionId] of this.chats) await this.restoreFormerRoutes(baseSessionOf(sessionId), chatId);
     for (const sessionId of this.routes.keys()) {
       if (this.stopped) return;
@@ -354,7 +361,11 @@ export class DshChannelBridge {
     if (!message.text.trim() && !message.attachments?.length) return;
     // A picture with a caption is a task, never a control reply.
     const command = message.attachments?.length ? undefined : parseCommand(message.text);
-    if (command?.kind === 'approve' || command?.kind === 'deny' || command?.kind === 'answer') {
+    if (command?.kind === 'help') {
+      await this.transport.sendText(message.chatId, CHANNEL_HELP, identity('help-reply', message.messageId), { durable: true });
+      return;
+    }
+    if (command && ['approve', 'deny', 'answer', 'new', 'switch-session', 'switch-model'].includes(command.kind)) {
       const receipt = identity(message.chatId, message.messageId);
       if (this.controlReceipts.has(receipt)) return;
       // A retried control message must never settle a later question or approval.
@@ -387,10 +398,20 @@ export class DshChannelBridge {
         .catch(() => { this.report('channel_approval_ack_failed'); });
       return;
     }
+    if (command?.kind === 'sessions' || command?.kind === 'switch-session' || command?.kind === 'models' || command?.kind === 'model' || command?.kind === 'switch-model') {
+      let notice: string;
+      try { notice = await this.chain(base, () => this.navigation.run(base, message.chatId, command)); }
+      catch { notice = '操作未能完成，请确认会话空闲后重试，或在本机 DSH 查看会话和模型设置。'; this.report('channel_navigation_failed'); }
+      await this.transport.sendText(message.chatId, notice, identity('navigation-reply', message.messageId), { durable: true });
+      return;
+    }
     if (command?.kind === 'new') {
       let notice: string;
       try {
-        const opened = this.extras.sessions ? await this.chain(base, () => this.open(base, message.chatId, 'user')) : undefined;
+        const opened = this.extras.sessions ? await this.chain(base, () => {
+          if (this.replies.hasPending(message.chatId) || this.questions.hasPending(message.chatId)) throw new Error('interaction_pending');
+          return this.open(base, message.chatId, 'user');
+        }) : undefined;
         notice = opened ? ROTATION_NOTICES.user : (this.extras.sessions ? '当前会话还没有聊过什么，不用换新。' : '这个渠道没有开启会话换新。');
       } catch { notice = '开新会话失败，请稍后再试。'; this.report('channel_rotation_failed'); }
       await this.transport.sendText(message.chatId, notice, identity('new-reply', message.messageId));
@@ -623,39 +644,25 @@ export class DshChannelBridge {
   }
 
   /**
-   * Why this message should open the chat's next generation, if it should. Only the prompt-size reason waits: while the chat
-   * still owns work that reports into it, the generation that dispatched it is the one that can answer a question about it,
-   * and rotating first sent `有结果了吗` to a session with no task record at all (ct-4c671559). A new conversation day, an
-   * archived session or a moved workspace still rotate, whatever is running — those generations cannot answer at all — and
-   * `/new` is the user asking for it.
-   */
-  private async rotationReason(base: SessionId, events: readonly SessionEvent[], timeZone: string): Promise<RotationReason | undefined> {
-    const due = rotationDue(events, this.now(), timeZone, this.extras.rotation?.() ?? DEFAULT_ROTATION);
-    if (due !== 'context' || !this.extras.busy) return due;
-    // A collaborator that cannot answer must not hold the chat open: trouble reading the task store is not work.
-    return await this.extras.busy(base).catch(() => false) ? undefined : due;
-  }
-
-  /**
-   * Open the chat's next generation when one is due (a new conversation day,
-   * a prompt over the limit while nothing of the chat's is still running, the user's `/new`, the current session having
-   * been archived, or the channel's directory having changed) and return it; `undefined` when the current one stays. Native reminders keep their original session binding, and a
-   * digest of what it was about goes to memory. Must run on the chat's chain.
+   * Only explicit new-session requests, archives and workspace changes replace a session.
+   * Daily/context rotation used to create an empty history and rely on optional memory.
+   * Keep ordinary conversation in its native session; DSH owns context compaction.
+   * Native tasks and approvals therefore retain both their binding and their history.
    */
   private async open(base: SessionId, chatId: string, force?: RotationReason): Promise<{ sessionId: SessionId; reason: RotationReason } | undefined> {
     const roster = this.extras.sessions!;
     const current = SessionId(roster.activeFor(base));
-    const events = await this.eventsOf(current);
-    const timeZone = this.extras.timeZone?.() ?? DEFAULT_TIME_ZONE;
-    const reason = force ?? await this.rotationReason(base, events, timeZone);
     // A session the user archived in the Web UI answers nothing: DSH's archive gate rejects every one of
     // its steps, so the turn ends `blocked` and no model call is made. The chat has to move on, whatever
     // the calendar or the prompt size say — and it does, even when the session never had a user turn,
     // because there is nothing to wait for otherwise. A session created in the directory the channel worked in
     // before cannot follow it there, so the user's first message after the change opens the next generation
     // in the new one, on the same terms.
-    const why: RotationReason | undefined = reason ?? (this.archived(current) ? 'archived' : await this.movedAway(current) ? 'moved' : undefined);
-    if (!why || (why !== 'archived' && why !== 'moved' && userTurns(events) === 0)) return undefined;
+    const why: RotationReason | undefined = force ?? (this.archived(current) ? 'archived' : await this.movedAway(current) ? 'moved' : undefined);
+    if (!why) return undefined;
+    const events = await this.eventsOf(current);
+    const timeZone = this.extras.timeZone?.() ?? DEFAULT_TIME_ZONE;
+    if (why !== 'archived' && why !== 'moved' && userTurns(events) === 0) return undefined;
     // Create the next session before the roster moves. A failure here leaves the chat on the
     // current generation, and admit answers there instead of dropping the message.
     const sessionId = SessionId(sessionIdAt(base, (roster.get(base)?.generation ?? 0) + 1));
@@ -792,7 +799,7 @@ export class DshChannelBridge {
     void this.transport.sendText(chatId,
       `${prompt}\n\n也可在本机 DSH 审批；任一端处理后另一端失效。\n只有一项待审批时，直接回复“允许”或“拒绝”。\n` +
       `多项待审批时，请回复对应指令：\n允许 ${pending.token}\n拒绝 ${pending.token}\n` +
-      (this.historicalWechat(request.agent.id) ? '有效期 10 分钟，仅本次操作。停止此历史任务请在电脑端操作。' : '有效期 10 分钟，仅本次操作。停止当前执行：/cancel'),
+      (this.historicalChannel(request.agent.id) ? '有效期 10 分钟，仅本次操作。停止此历史任务请在电脑端操作。' : '有效期 10 分钟，仅本次操作。停止当前执行：/cancel'),
       identity('approval', pending.token), { signal }).then(pending.presented, () => {
         if (!signal.aborted) this.promptDeliveryFailed(request, request.agent.id);
         this.replies.answer(chatId, pending.token, 'unavailable');

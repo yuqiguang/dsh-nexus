@@ -5,20 +5,15 @@ import { formatLocal, localDate } from '../assistant/clock.js';
 import { sessionIdAt } from '../channels/protocol.js';
 import { pluginInitiated } from '../dsh/schedule.js';
 
-/**
- * Which generation of a chat's session is the active one. A chat keeps one
- * active session; a new day, a context that grew past the limit, the user's
- * `/new`, or the session having been archived starts the next generation, so
- * the model stops replaying weeks of history (and its own earlier reasoning)
- * on every turn.
- */
+/** The active native session for a chat. Only explicit new sessions, archives and workspace changes advance it. */
 export interface ChatSessionRecord {
   /** The chat's base session id (generation 0). */
   base: string;
+  /** Highest allocated generation; selecting an older session never lowers it. */
   generation: number;
-  /** The active session id, `sessionIdAt(base, generation)`. */
+  /** The selected native session id; may be older than the highest allocated generation. */
   sessionId: string;
-  /** The generation before this one, still routed after a restart so its late turns are delivered. */
+  /** Previously selected session, still routed after a restart so its late turns are delivered. */
   previous?: string;
   rotatedAt: number;
   reason?: RotationReason;
@@ -41,7 +36,7 @@ export interface SessionsDomainOpener { open(spec: typeof sessionsDomain): Promi
 
 export type RotationReason = 'day' | 'context' | 'user' | 'archived' | 'moved';
 
-/** When a chat's session is replaced: at the first message of a new day (days turn over at 04:00 local), and once the conversation grew past `contextTokens` since the session's opening turn (0 disables). */
+/** @deprecated Legacy stored settings, no longer used to replace native sessions. Previously: at the first message of a new day (days turn over at 04:00 local), and once the conversation grew past `contextTokens` since the session's opening turn (0 disables). */
 export interface RotationSettings { daily: boolean; contextTokens: number }
 export const DEFAULT_ROTATION: RotationSettings = { daily: true, contextTokens: 60_000 };
 export const ROTATION_LIMITS = { maxContextTokens: 1_000_000 };
@@ -59,6 +54,15 @@ export class SessionRoster {
 
   /** The active session id of a chat; the base itself until the first rotation. */
   activeFor(base: string): string { return this.get(base)?.sessionId ?? base; }
+
+  /** Select an existing, caller-validated session; only channel delivery metadata changes. */
+  async select(base: string, sessionId: string): Promise<void> {
+    const generation = sessionId === base ? 0 : Number(sessionId.slice(base.length + 1));
+    if (!Number.isSafeInteger(generation) || generation < 0 || sessionIdAt(base, generation) !== sessionId) throw new Error('invalid_session_selection');
+    const current = this.get(base);
+    await this.domain.table('chats').put(base, { ...(current ?? { base, rotatedAt: 0 }),
+      generation: Math.max(current?.generation ?? 0, generation), sessionId, previous: current?.sessionId ?? base });
+  }
 
   /** Start the next generation and return it. */
   async rotate(base: string, reason: RotationReason, now: number): Promise<ChatSessionRecord> {
@@ -79,7 +83,7 @@ export class SessionRoster {
 }
 
 /** What the bridge needs; tests fake it in memory. */
-export type SessionRosterView = Pick<SessionRoster, 'get' | 'activeFor' | 'rotate' | 'supersede'>;
+export type SessionRosterView = Pick<SessionRoster, 'get' | 'activeFor' | 'rotate' | 'supersede' | 'select'>;
 
 /** The calendar day a moment belongs to for rotation, with the boundary at `DAY_BOUNDARY_HOUR` instead of midnight. */
 export function conversationDay(now: number, timeZone: string): string {
@@ -138,6 +142,7 @@ export function lastUserMessageAt(events: readonly SessionEvent[]): number | und
  * Whether the next user message should open a new generation instead of
  * joining this one: the session is from an earlier conversation day, or its
  * conversation grew past the limit. A session with no user turn yet is kept.
+ * @deprecated Historical policy helper; the channel bridge no longer uses automatic rotation.
  */
 export function rotationDue(events: readonly SessionEvent[], now: number, timeZone: string, settings: RotationSettings): RotationReason | undefined {
   const lastAt = lastUserMessageAt(events);
@@ -198,11 +203,11 @@ export function sessionDigest(events: readonly SessionEvent[], timeZone: string,
 }
 
 export const ROTATION_NOTICES: Record<RotationReason, string> = {
-  day: '新的一天，开了新会话。之前聊的事记了摘要，需要时能想起来；原会话的提醒和监控仍会送到这里。',
-  context: '前面聊得太长了，开了新会话继续。之前的事记了摘要，需要时能想起来；原会话的提醒和监控仍会送到这里。',
-  user: '已开新会话。之前的事记了摘要，需要时能想起来；原会话的提醒和监控仍会送到这里。',
-  archived: '上一段对话已归档，开了新会话继续。之前的事记了摘要，需要时能想起来；归档时停止的提醒不会再触发。',
-  moved: '工作目录换了，在新目录里开了新会话。之前的事记了摘要，需要时能想起来；原会话的提醒和监控仍会送到这里。',
+  day: '新的一天，开了新会话。新会话不自动继承旧对话；原会话的提醒和监控仍会送到这里。',
+  context: '前面聊得太长了，开了新会话继续。新会话不自动继承旧对话；原会话的提醒和监控仍会送到这里。',
+  user: '已开新会话。新会话不自动继承旧对话；原会话的提醒和监控仍会送到这里。',
+  archived: '上一段对话已归档，开了新会话继续。新会话不自动继承旧对话；归档时停止的提醒不会再触发。',
+  moved: '工作目录换了，在新目录里开了新会话。新会话不自动继承旧对话；原会话的提醒和监控仍会送到这里。',
 };
 
 /** Sent once after native reminders under an earlier binding become deliverable; `lines` come from `describeReminders`. */

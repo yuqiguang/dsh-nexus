@@ -85,7 +85,7 @@ export class LarkTransport implements ChannelTransport {
   }
 
   async sendFile(chatId: string, file: OutboundFile, deliveryId: string): Promise<void> {
-    if (!this.client) throw new Error('feishu_not_connected');
+    if (!this.client) throw new ChannelError('not_connected');
     const response = await this.client.im.v1.file.create({
       data: { file_type: 'stream', file_name: file.name, file: file.bytes },
     });
@@ -94,11 +94,12 @@ export class LarkTransport implements ChannelTransport {
   }
 
   private async send(chatId: string, type: string, content: unknown, deliveryId: string): Promise<void> {
-    if (!this.client) throw new Error('feishu_not_connected');
+    if (!this.client) throw new ChannelError('not_connected');
     const response = await this.client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: { receive_id: chatId, msg_type: type, content: JSON.stringify(content), uuid: deliveryId },
     });
-    if (response.code !== 0 || !response.data?.message_id) throw new Error('feishu_message_send_failed');
+    if (response.code !== undefined && response.code !== 0) throw new ChannelError('delivery_rejected');
+    if (response.code !== 0 || !response.data?.message_id) throw new ChannelError('delivery_uncertain');
   }
 }

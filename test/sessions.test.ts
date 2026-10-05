@@ -43,7 +43,7 @@ test('session ids carry a generation and fold back to their base; /new is a comm
   assert.equal(baseSessionOf(base), base);
   assert.equal(baseSessionOf('session-abc-3'), 'session-abc-3', 'local sessions are not touched');
   assert.deepEqual(parseCommand('/new'), { kind: 'new' });
-  assert.deepEqual(parseCommand('新会话'), { kind: 'new' });
+  assert.equal(parseCommand('新会话'), undefined);
   assert.equal(parseCommand('新会话是什么'), undefined);
 });
 
@@ -135,12 +135,12 @@ test('assistant settings keep rotation with validation and expose it in the view
 });
 
 /** A bridge over fake sessions whose logs the test controls, with a roster and a memory sink. */
-function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: number }; roster?: boolean; failCreate?: (sessionId: string) => boolean; failFlush?: (sessionId: string) => boolean; failAttach?: (sessionId: string) => boolean; failList?: boolean; sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+function bridgeFixture(options: { channel?: 'wechat' | 'feishu' | 'wecom'; knownChats?: () => Promise<readonly string[]>; rotation?: { daily: boolean; contextTokens: number }; roster?: boolean; failCreate?: (sessionId: string) => boolean; failFlush?: (sessionId: string) => boolean; failAttach?: (sessionId: string) => boolean; failList?: boolean; sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   heartbeatMs?: number; busy?: (base: string) => Promise<boolean>;
   formerBases?: () => Promise<string[]>; onResolve?: (id: string, session: { append(type: string, data: unknown): unknown }) => void } = {}) {
   let clock = T0;
-  const owner = { channel: 'wechat' as const, accountId: 'rot-bot', ownerId: 'rot-owner' };
-  const base = sessionIdFor(owner.accountId, owner.ownerId, owner.ownerId, 'wechat');
+  const owner = { channel: options.channel ?? 'wechat', accountId: 'rot-bot', ownerId: 'rot-owner' };
+  const base = sessionIdFor(owner.accountId, owner.ownerId, owner.ownerId, owner.channel);
   const logs = new Map<string, any[]>();
   const created: string[] = [];
   // Every session this process resumed: resuming one starts its native reminder runtime.
@@ -178,9 +178,18 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
     const task = { sessionId, id: `schedule-${tasks.length + 1}`, title: prompt, prompt, kind: 'at', scheduledAt: '2026-09-25T06:00:00.000Z', status: 'active' };
     tasks.push(task); return task;
   };
+  const running = new Set<string>();
+  const selections: { sessionId: string; provider: string; model: string }[] = [];
+  const catalog = { default: { provider: 'first', model: 'chat' }, routableProviders: ['first', 'second'], failures: [],
+    groups: [{ id: 'first', name: 'First', models: [{ id: 'chat', name: 'Chat' }] }, { id: 'second', name: 'Second', models: [{ id: 'chat', name: 'Chat' }] }] };
   const ctx = {
     schedule: { async catalog() { return structuredClone(tasks); } },
     sessionController: {
+      async list() { return { items: [...logs.keys()].map(sessionId => ({ sessionId, cwd: cwdOf(sessionId), updatedAt: T0, running: running.has(sessionId),
+        projections: { values: { modelSelection: { next: selections.findLast(item => item.sessionId === sessionId) ?? null } } } })) }; },
+      async inspect(id: string) { if (!logs.has(id)) throw new Error('not found'); return { meta: { id, cwd: cwdOf(id) }, events: logs.get(id)! }; },
+      async modelCatalog() { return structuredClone(catalog); },
+      async selectModel(selection: { sessionId: string; provider: string; model: string }) { selections.push(selection); return { selected: selection }; },
       async create({ sessionId, cwd }: { sessionId: string; cwd: string }) {
         if (options.failCreate?.(sessionId)) throw new Error('create failed');
         // Like DSH's ensureSession: a session is resumed only under the cwd it was created with.
@@ -192,7 +201,7 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
         resolved.push(id);
         if (!logs.has(id)) return { error: new Error('not found') };
         options.onResolve?.(id, sessionOf(id));
-        return { agent: { id, session: sessionOf(id), cancel() { cancelled.push(id); } } };
+        return { agent: { id, session: sessionOf(id), inbox: { nextTurn: [], nextStep: [] }, async runMaintenance<T>(job: (signal: AbortSignal) => Promise<T>) { if (running.has(id)) throw new Error('busy'); return job(new AbortController().signal); }, cancel() { cancelled.push(id); } } };
       },
       async prompt({ sessionId, content }: { sessionId: string; content: { type: string; text?: string }[] }) { prompts.push({ sessionId, text: content.map(part => part.text ?? '').join('') }); },
     },
@@ -217,7 +226,7 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
     workspaceRegistry: { archivedSessionIds, create: async () => workspace },
   } as unknown as Context;
   const texts: string[] = [];
-  const transport: ChannelTransport = { async start() {}, stop() {}, async sendFile() {}, async sendText(_chatId, text) { texts.push(text); } };
+  const transport: ChannelTransport = { ...(options.knownChats ? { knownChats: options.knownChats } : {}), async start() {}, stop() {}, async sendFile() {}, async sendText(_chatId, text) { texts.push(text); } };
   const remembered: { text: string; sessionId: string }[] = [];
   const marks = new Map<string, number>();
   const ledger = { get: (id: string) => marks.get(id), async set(id: string, turn: number) { marks.set(id, turn); } };
@@ -233,52 +242,35 @@ function bridgeFixture(options: { rotation?: { daily: boolean; contextTokens: nu
   };
   const inbound = (messageId: string, text: string): InboundMessage => ({ messageId, text, chatId: owner.ownerId, senderId: owner.ownerId, chatType: 'p2p' });
   return { make, owner, base, logs, sessionOf, created, resolved, cancelled, roster: rosterPromise, prompts, texts, remembered, codes, marks, inbound, advance: (ms: number) => { clock += ms; }, now: () => clock,
-    workspace, attached, dir, elsewhere, cwds, tasks, schedule,
+    workspace, attached, dir, elsewhere, cwds, tasks, schedule, running, selections, catalog,
     archive: (sessionId: string) => { archivedSessionIds.push(sessionId); } };
 }
 
-test('the first message of a new day opens the next generation: the user is told, native task bindings stay intact, the old session is digested into memory', async t => {
-  const f = bridgeFixture();
+test('legacy daily rotation settings keep native history and tasks across days and restart, without memory', async t => {
+  const f = bridgeFixture({ rotation: { daily: true, contextTokens: 60_000 } });
   const bridge = await f.make();
-  t.after(() => bridge.close());
-  // Yesterday's session: one user turn and an active reminder.
   const old = f.sessionOf(f.base);
-  for (const event of userTurn(1, '两点提醒我开会', '好的', T0)) old.snapshotEvents().push(event);
+  old.snapshotEvents().push(...userTurn(1, '把 I:\\资料\\书籍 导入 kb-service，保留原文件', '先确认去重规则', T0));
+  const history = structuredClone(old.snapshotEvents());
   const reminder = f.schedule(f.base);
-  await bridge.receive(f.inbound('m1', '合同看完了吗'));
-  assert.deepEqual(f.prompts.map(p => p.sessionId), [f.base], 'same day: the message joins the current session');
+  f.advance(48 * HOUR);
+  await bridge.receive(f.inbound('m1', '把刚才的文档复制到知识库'));
+  assert.deepEqual(f.prompts.at(-1), { sessionId: f.base, text: '把刚才的文档复制到知识库' });
+  assert.deepEqual(old.snapshotEvents(), history, 'the native log, including exact paths and constraints, is preserved');
+  assert.deepEqual(f.tasks, [reminder]);
   assert.deepEqual(f.texts, []);
-  f.advance(23 * HOUR);
-  await bridge.receive(f.inbound('m2', '今天有什么安排'));
-  const next = `${f.base}-1`;
-  assert.deepEqual(f.prompts.at(-1), { sessionId: next, text: '今天有什么安排' });
-  assert.deepEqual(f.texts, [ROTATION_NOTICES.day]);
-  assert.deepEqual(f.created.at(-1), next);
-  const moved = f.sessionOf(next).snapshotEvents().filter(event => event.type === 'schedule/change');
-  assert.deepEqual(moved, [], 'rotation never fabricates native schedule events');
-  assert.deepEqual(f.tasks, [reminder], 'task identity, binding and due time are unchanged');
-  assert.equal(f.remembered.length, 1);
-  assert.equal(f.remembered[0]!.sessionId, f.base);
-  assert.match(f.remembered[0]!.text, /^9\/21 微信对话（1 件事）：两点提醒我开会→好的$/);
-  assert.deepEqual(bridge.bound(), [next], 'pushes now address the new generation only');
-  assert.equal(await bridge.notify(f.base, '提醒', 'n1'), true, 'the base id still routes to the chat');
-  assert.match(f.texts.at(-1)!, /历史微信会话[\s\S]*提醒/);
-  // The same day again: no second rotation.
-  await bridge.receive(f.inbound('m3', '再问一句'));
-  assert.equal(f.prompts.at(-1)!.sessionId, next);
-  assert.equal(f.texts.length, 2);
-  // An external event on the following day joins the active session without opening a new one; the user's next message does.
-  for (const event of userTurn(1, '再问一句', '好', f.now())) f.sessionOf(next).snapshotEvents().push(event);
-  f.advance(24 * HOUR);
-  assert.equal(await bridge.inject(f.base, '[外部事件] 来源：mail', 'h1'), true);
-  assert.equal(f.prompts.at(-1)!.sessionId, next, 'hook events never rotate');
-  assert.equal(f.texts.length, 2);
-  await bridge.receive(f.inbound('m4', '早'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-2`);
+  assert.deepEqual(f.remembered, [], 'continuity does not require writing or approving long-term memory');
+  assert.equal((await f.roster).get(f.base), undefined);
+  await bridge.close();
+  const restarted = await f.make();
+  t.after(() => restarted.close());
+  await restarted.receive(f.inbound('m2', '继续完善项目代码'));
+  assert.equal(f.prompts.at(-1)!.sessionId, f.base);
+  assert.deepEqual(f.sessionOf(f.base).snapshotEvents(), history);
   assert.deepEqual(f.codes, []);
 });
 
-test('an oversized context rotates; /new rotates on demand and refuses an empty session; without a roster nothing rotates', async t => {
+test('an oversized context retains native history; /new rotates on demand and refuses an empty session; without a roster nothing rotates', async t => {
   const f = bridgeFixture({ rotation: { daily: false, contextTokens: 50_000 } });
   const bridge = await f.make();
   t.after(() => bridge.close());
@@ -288,14 +280,15 @@ test('an oversized context rotates; /new rotates on demand and refuses an empty 
   for (const event of userTurn(1, '读这本书', '读完了', T0, { inputTokens: 1_000, cacheReadTokens: 16_000 })) old.snapshotEvents().push(event);
   for (const event of userTurn(2, '继续', '好', T0 + 60_000, { inputTokens: 1_000, cacheReadTokens: 70_000 })) old.snapshotEvents().push(event);
   await bridge.receive(f.inbound('m1', '总结一下'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`);
-  assert.equal(f.texts.at(-1), ROTATION_NOTICES.context);
-  for (const event of userTurn(1, '总结一下', '三点', T0 + 60_000)) f.sessionOf(`${f.base}-1`).snapshotEvents().push(event);
+  assert.equal(f.prompts.at(-1)!.sessionId, f.base);
+  assert.equal(f.texts.includes(ROTATION_NOTICES.context), false);
+  assert.equal(old.snapshotEvents().filter(event => event.type === 'user/message').length, 2);
   await bridge.receive(f.inbound('n1', '/new'));
   assert.equal(f.texts.at(-1), ROTATION_NOTICES.user);
   await bridge.receive(f.inbound('m2', '新的事'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-2`);
-  assert.equal(f.remembered.length, 2);
+  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`);
+  assert.equal(f.remembered.length, 1);
+  assert.deepEqual(f.sessionOf(`${f.base}-1`).snapshotEvents(), [], 'explicit /new creates an independent conversation');
   const plain = bridgeFixture({ roster: false });
   const fixed = await plain.make();
   t.after(() => fixed.close());
@@ -307,31 +300,24 @@ test('an oversized context rotates; /new rotates on demand and refuses an empty 
   assert.equal(plain.texts.at(-1), '这个渠道没有开启会话换新。');
 });
 
-test('a conversation that grew past the limit keeps its generation while the chat still has work running', async t => {
-  // The message that trips the limit is usually the one asking about that work, and the task's result is delivered to the
-  // generation that dispatched it: rotating first sent 有结果了吗 to a session with no task record at all while the task was
-  // still running (ct-4c671559). The next message after it settles rotates as it always would.
+test('context growth retains the same session during work, after completion and on the next day', async t => {
   let busy = true;
   const f = bridgeFixture({ rotation: { daily: true, contextTokens: 50_000 }, busy: async () => busy });
   const bridge = await f.make();
   t.after(() => bridge.close());
   const old = f.sessionOf(f.base);
-  for (const event of userTurn(1, '读这本书', '读完了', T0, { inputTokens: 1_000, cacheReadTokens: 16_000 })) old.snapshotEvents().push(event);
-  for (const event of userTurn(2, '继续', '好', T0 + 60_000, { inputTokens: 1_000, cacheReadTokens: 70_000 })) old.snapshotEvents().push(event);
+  old.snapshotEvents().push(...userTurn(1, '完善项目', '正在执行', T0, { inputTokens: 17_000 }));
+  old.snapshotEvents().push(...userTurn(2, '继续', '好', T0 + 60_000, { inputTokens: 71_000 }));
   await bridge.receive(f.inbound('m1', '有结果了吗'));
-  assert.equal(f.prompts.at(-1)!.sessionId, f.base, 'the answer stays in the conversation that can read the task');
-  assert.ok(!f.created.includes(`${f.base}-1`));
   busy = false;
-  await bridge.receive(f.inbound('m2', '那现在呢'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`, 'the growth that asked for a rotation is still there once the work settles');
-  assert.equal(f.texts.at(-1), ROTATION_NOTICES.context);
-  for (const event of userTurn(3, '那现在呢', '好', T0 + 120_000)) f.sessionOf(`${f.base}-1`).snapshotEvents().push(event);
-  // A new conversation day is not held back by running work: that generation cannot answer the message at all.
+  await bridge.receive(f.inbound('m2', '按刚才的方案继续'));
   busy = true;
   f.advance(30 * HOUR);
-  await bridge.receive(f.inbound('m3', '早上好'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-2`);
-  assert.equal(f.texts.at(-1), ROTATION_NOTICES.day);
+  await bridge.receive(f.inbound('m3', '昨天的任务怎么样了'));
+  assert.deepEqual(f.prompts.map(p => p.sessionId), [f.base, f.base, f.base]);
+  assert.deepEqual(f.texts, []);
+  assert.deepEqual(f.remembered, []);
+  assert.ok(!f.created.includes(`${f.base}-1`));
 });
 
 test('after a restart the previous generation is still routed: its late turn is delivered once and the status reply reads the active one', async t => {
@@ -342,6 +328,7 @@ test('after a restart the previous generation is still routed: its late turn is 
   await first.receive(f.inbound('m0', '记一下'));
   await first.catchUp();
   f.advance(24 * HOUR);
+  await first.receive(f.inbound('new', '/new'));
   await first.receive(f.inbound('m1', '今天'));
   const next = `${f.base}-1`;
   assert.equal(f.prompts.at(-1)!.sessionId, next);
@@ -359,12 +346,13 @@ test('after a restart the previous generation is still routed: its late turn is 
   assert.equal(f.texts.filter(text => text.includes('旧会话的任务结束了')).length, 1, 'never delivered twice');
 });
 
-test('a rotation that cannot create the next session answers in the current one instead of dropping the message', async t => {
+test('an explicit rotation that cannot create the next session answers in the current one instead of dropping the message', async t => {
   const f = bridgeFixture({ failCreate: id => /-\d+$/.test(id) });
   const bridge = await f.make();
   t.after(() => bridge.close());
   for (const event of userTurn(1, '昨天的事', '好', T0)) f.sessionOf(f.base).snapshotEvents().push(event);
   f.advance(24 * HOUR);
+  await bridge.receive(f.inbound('new', '/new'));
   await bridge.receive(f.inbound('m1', '今天呢'));
   assert.deepEqual(f.prompts.at(-1), { sessionId: f.base, text: '今天呢' });
   assert.equal(f.texts.some(text => text.includes('任务未能提交')), false);
@@ -383,9 +371,10 @@ test('rotation never needs to flush the old session to preserve its native remin
   for (const event of userTurn(1, '提醒我', '好', T0)) old.snapshotEvents().push(event);
   const reminder = f.schedule(f.base);
   f.advance(24 * HOUR);
+  await bridge.receive(f.inbound('new', '/new'));
   await bridge.receive(f.inbound('m1', '早'));
   assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`);
-  assert.equal(f.texts[0], ROTATION_NOTICES.day);
+  assert.equal(f.texts[0], ROTATION_NOTICES.user);
   assert.deepEqual(f.tasks, [reminder]);
   assert.deepEqual(f.codes, []);
   assert.equal(f.texts.some(text => text.includes('任务未能提交')), false);
@@ -409,7 +398,7 @@ test('a session the user archived is left behind: the next message opens a new g
   for (const event of userTurn(1, '第二条', '好', f.now())) f.sessionOf(next).snapshotEvents().push(event);
   f.advance(30 * HOUR);
   await bridge.receive(f.inbound('m3', '第三条'));
-  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-2`);
+  assert.equal(f.prompts.at(-1)!.sessionId, `${f.base}-1`);
   assert.equal(f.prompts.some(prompt => prompt.sessionId === f.base), true, 'only the message before the archive ever went there');
   assert.deepEqual(f.codes, []);
 });
@@ -711,6 +700,11 @@ test('historical approval stays bound to its request without changing the curren
   assert.match(prompt, /历史微信会话/);
   assert.doesNotMatch(prompt, /\/cancel/);
   const token = /允许 ([a-f0-9]{32})/.exec(prompt)![1];
+  await bridge.receive(f.inbound('pending-switch', '/s 0'));
+  assert.match(f.texts.at(-1)!, /等待审批或回答/);
+  await bridge.receive(f.inbound('pending-model', '/m first/chat'));
+  assert.match(f.texts.at(-1)!, /等待审批或回答/);
+  assert.deepEqual(f.selections, []);
   await bridge.receive(f.inbound('approve', `允许 ${token}`));
   assert.equal(await outcome, 'allowed-once');
   assert.deepEqual(bridge.bound(), [`${f.base}-1`]);
@@ -744,4 +738,215 @@ test('historical desktop heartbeats and interrupted recovery remain local', asyn
   await restarted.catchUp();
   assert.equal(f.texts.length, before, 'no repaired-turn interruption notice either');
   assert.equal(f.marks.get(f.base), 3);
+});
+
+test('navigation commands require explicit syntax, not requests mentioning models or sessions', () => {
+  for (const text of ['/s', '/sessions']) assert.deepEqual(parseCommand(text), { kind: 'sessions' });
+  assert.deepEqual(parseCommand('/s 0'), { kind: 'switch-session', value: '0' });
+  assert.deepEqual(parseCommand('/model first/chat'), { kind: 'switch-model', value: 'first/chat' });
+  assert.deepEqual(parseCommand('/m'), { kind: 'model' });
+  assert.deepEqual(parseCommand('/models'), { kind: 'models' });
+  for (const text of ['会话列表', '切换会话 0', '查看模型', '模型列表', '切换模型 2', '新会话', '切换模型 会影响上下文吗？', 's', 's 0', 'm 2', 'ml']) {
+    assert.equal(parseCommand(text), undefined, text);
+  }
+  assert.deepEqual(parseCommand('/s 0'), { kind: 'switch-session', value: '0' });
+  assert.deepEqual(parseCommand('/m 2'), { kind: 'switch-model', value: '2' });
+  assert.equal(parseCommand('/s\n普通聊天'), undefined);
+  assert.equal(parseCommand('帮我实现切换模型功能'), undefined);
+  assert.equal(parseCommand('会话列表中发生了什么'), undefined);
+});
+
+test('switching uses original native history, persists across restart and never reuses allocated generation ids', async t => {
+  const f = bridgeFixture();
+  const bridge = await f.make();
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, '保留项目上下文', '好', T0));
+  const task = f.schedule(f.base);
+  await bridge.receive(f.inbound('n1', '/new'));
+  f.sessionOf(`${f.base}-1`).snapshotEvents().push(...userTurn(1, '另一个问题', '好', T0));
+  const before = structuredClone([...f.logs]);
+  const resolved = f.resolved.length;
+  await bridge.receive(f.inbound('list', '/s'));
+  assert.match(f.texts.at(-1)!, /0.*\n1 \[当前\]/);
+  await Promise.all([bridge.receive(f.inbound('switch', '/s 0')), bridge.receive(f.inbound('follow', '继续之前的项目'))]);
+  assert.equal(f.prompts.at(-1)?.sessionId, f.base);
+  assert.deepEqual([...f.logs], before, 'navigation does not copy, reconstruct, or append to history');
+  assert.deepEqual(f.tasks, [task]);
+  assert.ok(f.resolved.slice(resolved).every(id => id === f.base), 'list and switch do not activate other sessions');
+  await bridge.close();
+  const restarted = await f.make(); t.after(() => restarted.close());
+  await restarted.receive(f.inbound('after-restart', '继续'));
+  assert.equal(f.prompts.at(-1)?.sessionId, f.base);
+  await restarted.receive(f.inbound('n2', '/new'));
+  assert.equal((await f.roster).activeFor(f.base), `${f.base}-2`);
+  assert.deepEqual(f.sessionOf(`${f.base}-1`).snapshotEvents(), before.find(([id]) => id === `${f.base}-1`)![1]);
+  await restarted.receive(f.inbound('n2', '/new'));
+  assert.equal((await f.roster).get(f.base)?.generation, 2, 'duplicate control cannot create another session');
+});
+
+test('session lists and selectors exclude other owners, directories, archives and missing ids without activating agents', async t => {
+  const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'hello', 'hi', T0));
+  await bridge.receive(f.inbound('new', '/new'));
+  f.sessionOf(`${f.base}-2`); f.cwds.set(`${f.base}-2`, f.elsewhere);
+  f.sessionOf(`${f.base}-3`); f.archive(`${f.base}-3`);
+  const other = sessionIdFor('someone-else', 'owner', 'owner', 'wechat'); f.sessionOf(other);
+  f.resolved.length = 0;
+  await bridge.receive(f.inbound('list', '/s'));
+  assert.doesNotMatch(f.texts.at(-1)!, /\n[23] |someone-else/);
+  for (const target of ['2', '3', '99', other, '-1', '01']) {
+    await bridge.receive(f.inbound(`switch-${target}`, `/s ${target}`));
+    assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
+  }
+  assert.deepEqual(f.resolved, []);
+  f.running.add(f.base);
+  await bridge.receive(f.inbound('busy', '/s 0'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  f.running.clear();
+  f.sessionOf(f.base).snapshotEvents().push(ev('turn/start', { turn: 2 }));
+  await bridge.receive(f.inbound('interrupted', '/s 0'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
+});
+
+test('native model selectors preserve history and distinguish providers; menu numbering expires and removed routes cannot be selected', async t => {
+  const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'context', 'reply', T0));
+  const before = structuredClone(f.sessionOf(f.base).snapshotEvents());
+  await bridge.receive(f.inbound('list', '/ml'));
+  assert.match(f.texts.at(-1)!, /1\. first\/chat\n2\. second\/chat/);
+  assert.match(f.texts.at(-1)!, /默认模型/);
+  f.catalog.groups.reverse();
+  await bridge.receive(f.inbound('select', '/m 2'));
+  assert.deepEqual(f.selections, [{ sessionId: f.base, provider: 'second', model: 'chat' }], 'number refers to displayed catalog even if native order changes');
+  await bridge.receive(f.inbound('select', '/m 2'));
+  assert.equal(f.selections.length, 1, 'duplicate command does not mutate model twice');
+  await bridge.receive(f.inbound('current', '/m'));
+  assert.match(f.texts.at(-1)!, /当前会话下一轮模型：second\/chat/);
+  assert.deepEqual(f.sessionOf(f.base).snapshotEvents(), before);
+  assert.deepEqual(f.prompts, [], 'controls never dispatch model prompts');
+  f.advance(10 * 60_000);
+  await bridge.receive(f.inbound('expired', '/m 1'));
+  assert.match(f.texts.at(-1)!, /已失效/);
+  await bridge.receive(f.inbound('list2', '/ml'));
+  f.catalog.routableProviders = ['second'];
+  await bridge.receive(f.inbound('gone', '/m first/chat'));
+  assert.match(f.texts.at(-1)!, /不可用/);
+  assert.equal(f.selections.length, 1);
+  f.running.add(f.base);
+  await bridge.receive(f.inbound('busy', '/m second/chat'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  assert.equal(f.selections.length, 1);
+});
+
+test('active background work blocks both selectors, while a first model selection can initialize an empty session', async t => {
+  let busy = false;
+  const f = bridgeFixture({ busy: async () => busy }); const bridge = await f.make(); t.after(() => bridge.close());
+  await bridge.receive(f.inbound('initial', '/m first/chat'));
+  assert.deepEqual(f.selections, [{ sessionId: f.base, provider: 'first', model: 'chat' }]);
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'hello', 'hi', T0));
+  await bridge.receive(f.inbound('new', '/new'));
+  busy = true;
+  await bridge.receive(f.inbound('switch', '/s 0'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  await bridge.receive(f.inbound('model', '/m first/chat'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  assert.equal(f.selections.length, 1);
+  assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
+});
+
+test('failed routing persistence keeps the old active session; an execution starting during model resolution prevents selection', async t => {
+  const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'first', 'done', T0));
+  await bridge.receive(f.inbound('new', '/new'));
+  (await f.roster).select = async () => { throw new Error('storage unavailable'); };
+  await bridge.receive(f.inbound('switch', '/s 0'));
+  assert.match(f.texts.at(-1)!, /未能完成/);
+  assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
+  await bridge.receive(f.inbound('next', '继续'));
+  assert.equal(f.prompts.at(-1)?.sessionId, `${f.base}-1`);
+
+  const race = bridgeFixture({ onResolve: id => { race.running.add(id); } });
+  const modelBridge = await race.make(); t.after(() => modelBridge.close());
+  race.sessionOf(race.base);
+  await modelBridge.receive(race.inbound('model', '/m first/chat'));
+  assert.match(race.texts.at(-1)!, /未能完成/);
+  assert.deepEqual(race.selections, []);
+});
+
+
+test('Chinese navigation phrases are admitted as chat and never change session or model', async t => {
+  const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, '原会话', '收到', T0));
+  const messages = ['会话列表', '切换会话 0', '模型列表', '查看模型', '切换模型 2', '切换模型 会影响上下文吗？', '新会话'];
+  for (const [index, text] of messages.entries()) await bridge.receive(f.inbound(`ordinary-${index}`, text));
+  assert.deepEqual(f.prompts.map(prompt => prompt.text), messages);
+  assert.ok(f.prompts.every(prompt => prompt.sessionId === f.base));
+  assert.equal((await f.roster).get(f.base), undefined);
+  assert.deepEqual(f.selections, []);
+  assert.deepEqual(f.texts, []);
+});
+
+
+test('/help is local, owner-scoped and does not activate a session or consume a chat request', async t => {
+  assert.deepEqual(parseCommand('  /help  '), { kind: 'help' });
+  for (const text of ['help', '帮助', '请解释 /help', '/help me']) assert.equal(parseCommand(text), undefined);
+  const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
+  await bridge.receive({ ...f.inbound('foreign', '/help'), senderId: 'other-owner' });
+  assert.equal(f.texts.length, 0);
+  await bridge.receive(f.inbound('help', '/help'));
+  const help = f.texts.at(-1)!;
+  for (const command of ['/help', '/s 0', '/new', '/m 2', '/ml', '/status', '/cancel', '/approve 审批编号', '/deny 审批编号', '/answer 1']) assert.ok(help.includes(command), command);
+  assert.equal(f.prompts.length, 0);
+  assert.deepEqual(f.created, []);
+  assert.deepEqual(f.resolved, []);
+  assert.deepEqual(f.selections, []);
+  assert.equal((await f.roster).get(f.base), undefined);
+  await bridge.receive(f.inbound('ordinary', '帮助'));
+  assert.equal(f.prompts.at(-1)?.text, '帮助');
+});
+
+
+for (const channel of ['wechat', 'feishu', 'wecom'] as const) {
+  test(`${channel}: historical desktop turns stay local, channel results are labeled, approvals keep their original session`, async t => {
+    const f = bridgeFixture({ channel }); const bridge = await f.make(); t.after(() => bridge.close());
+    const old = f.sessionOf(f.base); old.snapshotEvents().push(...userTurn(1, 'before', 'done', T0));
+    await bridge.receive(f.inbound('prime', 'before'));
+    await bridge.receive(f.inbound('new', '/new'));
+    f.marks.set(f.base, 1);
+    old.snapshotEvents().push(...userTurn(2, 'desktop follow-up', 'PRIVATE-DESKTOP', T0));
+    bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+    assert.ok(!f.texts.some(text => text.includes('PRIVATE-DESKTOP')));
+    const result = userTurn(3, 'remote turn', 'REMOTE-RESULT', T0).map(event => event.type === 'user/message'
+      ? { ...event, data: { ...event.data, source: { kind: 'user', rpcId: `${channel}-original-request` } } } : event);
+    old.snapshotEvents().push(...result);
+    bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+    const title = { wechat: '微信', feishu: '飞书', wecom: '企业微信' }[channel];
+    assert.ok(f.texts.some(text => text.startsWith(`[历史${title}会话 ${f.base}]`) && text.includes('REMOTE-RESULT')));
+    old.append('tool/call', { turn: 4, callId: 'historical-call', name: 'bash', arguments: '{}' });
+    const outcome = bridge.approve({ agent: { id: f.base, session: old }, callId: 'historical-call', toolName: 'bash' } as never, () => new Promise(() => {}));
+    await new Promise(resolve => setImmediate(resolve));
+    const prompt = f.texts.at(-1)!;
+    assert.ok(prompt.startsWith(`[历史${title}会话 ${f.base}]`));
+    assert.doesNotMatch(prompt, /停止当前执行：\/cancel/);
+    const token = /允许 ([a-f0-9]{32})/.exec(prompt)![1];
+    await bridge.receive(f.inbound('approve', `/approve ${token}`));
+    assert.equal(await outcome, 'allowed-once');
+    await bridge.receive(f.inbound('follow', '普通回复'));
+    assert.equal(f.prompts.at(-1)?.sessionId, `${f.base}-1`);
+  });
+}
+
+test('Feishu restores owner-admitted chat routes before a new message without reconstructing history', async t => {
+  const f = bridgeFixture({ channel: 'feishu', knownChats: async () => ['rot-owner'] });
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'old', 'done', T0));
+  await (await f.roster).rotate(f.base, 'user', T0);
+  f.sessionOf(`${f.base}-1`);
+  const before = structuredClone([...f.logs]);
+  const bridge = await f.make(); t.after(() => bridge.close());
+  await bridge.resumeBound();
+  assert.deepEqual(bridge.bound(), [`${f.base}-1`]);
+  assert.deepEqual(f.prompts, []);
+  assert.deepEqual([...f.logs], before);
+  assert.equal(await bridge.notify(f.base, 'OLD-TASK-RESULT', 'result'), true);
+  assert.match(f.texts.at(-1)!, /^\[历史飞书会话/);
 });

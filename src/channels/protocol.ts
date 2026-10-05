@@ -47,13 +47,23 @@ export function sameChat(a: string | undefined, b: string | undefined): boolean 
   return !!a && !!b && baseSessionOf(a) === baseSessionOf(b);
 }
 
-export type Command = { kind: 'cancel' | 'status' | 'new' } | { kind: 'approve' | 'deny'; token?: string }
+export type NavigationCommand = { kind: 'sessions' } | { kind: 'models' } | { kind: 'model' } | { kind: 'switch-session'; value: string } | { kind: 'switch-model'; value: string };
+
+export type Command = NavigationCommand | { kind: 'help' | 'cancel' | 'status' | 'new' } | { kind: 'approve' | 'deny'; token?: string }
   | { kind: 'answer'; token?: string; value: string };
 export function parseCommand(text: string): Command | undefined {
   text = text.trim();
+  if (text === '/help') return { kind: 'help' };
   if (text === '/cancel') return { kind: 'cancel' };
   if (text === '状态' || text === '/status') return { kind: 'status' };
-  if (text === '/new' || text === '新会话') return { kind: 'new' };
+  if (text === '/new') return { kind: 'new' };
+  if (text === '/s' || text === '/sessions') return { kind: 'sessions' };
+  if (text === '/ml' || text === '/models') return { kind: 'models' };
+  if (text === '/m' || text === '/model') return { kind: 'model' };
+  // Only explicit slash-prefixed controls enter navigation; Chinese prose remains ordinary chat.
+  const navigation = /^\/(s|session|m|model)(?:[ \t]+([^\r\n]+))?$/.exec(text);
+  if (navigation) return { kind: navigation[1] === 's' || navigation[1] === 'session' ? 'switch-session' : 'switch-model', value: navigation[2]?.trim() ?? '' };
+
   // Chinese replies often omit the space: 回答1, 回答1,2, 回答文本 xx are answers; 回答这个问题 stays a task.
   const answer = /^(?:回答|\/answer)(?:\s+([\s\S]*)|(\d+(?:\s*[,，、]\s*\d+)*|文本\s+[\s\S]*))?$/.exec(text);
   if (answer) {
@@ -78,4 +88,6 @@ export interface ChannelTransport {
   sendText(chatId: string, text: string, deliveryId: string, options?: DeliveryOptions): Promise<void>;
   sendFile(chatId: string, file: OutboundFile, deliveryId: string): Promise<void>;
   retryPending?(): Promise<void>;
+  /** Chats admitted for this configured owner; used to restore routes without replaying messages. */
+  knownChats?(): Promise<readonly string[]>;
 }

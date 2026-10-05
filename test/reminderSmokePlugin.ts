@@ -31,6 +31,7 @@ class FixtureModel extends LlmAdapter {
   async resolveModel(provider: string, id: string): Promise<LlmResolvedModelInfo> {
     return { provider, id, name: 'Local reminder fixture', context: { contextWindow: 128000 }, defaultMaxTokens: 2048 };
   }
+  async listModels(provider: string) { return [await this.resolveModel(provider, 'fixture'), await this.resolveModel(provider, 'fixture-alt')]; }
   private *toolCall(id: string, name: string, args: Record<string, unknown>): Iterable<StreamChunk> {
     const block = { type: 'tool-call' as const, id: ToolCallId(id), name, arguments: JSON.stringify(args) };
     yield { type: 'block-start', index: 0, blockType: 'tool-call' };
@@ -292,6 +293,30 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.ok(fresh.lastDelivery);
     assert.equal((await automation({ action: 'delete', id: daily.id, revision: fresh.revision })).deleted, true);
     assert.ok(!(await ctx.schedule.catalog()).some(task => task.id === daily.id));
+    // Channel navigation uses the native roster and model-selection API, with no history replay.
+    await agent.whenIdle();
+    await next.whenIdle();
+    const nativeCalls = model.calls;
+    const oldLength = agent.session.snapshotEvents().length;
+    const nextLength = next.session.snapshotEvents().length;
+    await bridge.receive(inbound('navigation-list', '/s'));
+    assert.match(texts.at(-1)!, /\n0 /);
+    assert.match(texts.at(-1)!, /\n1 \[当前\]/);
+    await bridge.receive(inbound('navigation-old', '/s 0'));
+    assert.equal(roster.activeFor(sessionId), sessionId);
+    assert.match(texts.at(-1)!, /已切换到会话 0/);
+    assert.equal(agent.session.snapshotEvents().length, oldLength);
+    assert.equal(next.session.snapshotEvents().length, nextLength);
+    await bridge.receive(inbound('navigation-models', '/ml'));
+    assert.match(texts.at(-1)!, /nexus-fixture\/fixture-alt/);
+    await bridge.receive(inbound('navigation-model', '/m nexus-fixture/fixture-alt'));
+    assert.match(texts.at(-1)!, /已切换聊天模型为 nexus-fixture\/fixture-alt/);
+    assert.equal(agent.session.snapshotEvents().findLast(event => event.type === 'model/selection')?.data.model, 'fixture-alt');
+    await bridge.receive(inbound('navigation-current', '/m'));
+    assert.match(texts.at(-1)!, /当前会话下一轮模型：nexus-fixture\/fixture-alt/);
+    assert.equal(model.calls, nativeCalls, 'navigation must not call the model or replay a task');
+    await bridge.receive(inbound('navigation-back', '/s 1'));
+    assert.equal(roster.activeFor(sessionId), nextId);
     // The user archived the active session in the Web UI. DSH's archive gate rejects every step it proposes, so the
     // next message must open a new generation instead of being answered by a session that can no longer run.
     // The monitor still owns the session, so this is the archive the Web UI asks the user to confirm: stop the work, then archive.
@@ -313,7 +338,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(await ctx.sessions.flush(next.session), true);
     assert.deepEqual(failures, []);
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, sessionId, modelCalls: model.calls,
-      checks: ['cross_session_automation_list_update_delete', 'daily_automation_executes_original_prompt', 'stale_update_rejected', 'bound_session_resumed_at_startup', 'assistant_settings_restored', 'reminder_after_restart_held_in_quiet_hours', 'ending_quiet_hours_releases_held_push',
+      checks: ['native_session_switch_preserves_history', 'native_model_selection_in_idle_maintenance', 'navigation_does_not_run_model', 'cross_session_automation_list_update_delete', 'daily_automation_executes_original_prompt', 'stale_update_rejected', 'bound_session_resumed_at_startup', 'assistant_settings_restored', 'reminder_after_restart_held_in_quiet_hours', 'ending_quiet_hours_releases_held_push',
         'new_command_opens_next_generation', 'reminders_carried_to_new_generation', 'carried_reminder_fires_once_from_new_session', 'old_session_digested_to_memory', 'status_reads_new_generation',
         'archived_session_is_left_behind'] }, null, 2));
   }

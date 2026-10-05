@@ -258,3 +258,19 @@ test('Feishu pairing cancellation is scoped to the visible challenge and never s
   assert.equal(ui.dom.window.document.querySelector('[aria-label="飞书配对码"]'), null);
   assert.ok(!calls.some(call => call.method === 'save'));
 });
+
+
+for (const channel of ['feishu', 'wecom'] as const) {
+  test(`${channel} shows durable delivery recovery and retries only that configured connection`, async t => {
+    const view = initial();
+    view.connections = view.connections.map(connection => connection.channel === channel
+      ? { ...connection, enabled: true, configured: true, phase: 'connected', pendingDeliveries: 2, deliveryError: 'delivery_uncertain' } : connection);
+    const calls: { method: string; payload: unknown }[] = [];
+    const ui = await page(t, async (method, payload) => { calls.push({ method, payload }); return structuredClone(view); });
+    assert.match(ui.dom.window.document.body.textContent!, /无法确认平台是否已接收上一分片/);
+    const button = [...ui.dom.window.document.querySelectorAll('button')].find(button => button.textContent === '重试发送（可能重复上一分片）')!;
+    assert.ok(button && !button.disabled);
+    await act(async () => button.click());
+    assert.deepEqual(calls.at(-1), { method: 'retry-delivery', payload: { channel, revision: view.connections.find(connection => connection.channel === channel)!.revision } });
+  });
+}

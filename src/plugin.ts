@@ -1,3 +1,4 @@
+import { withDeliveryRecovery } from './channels/durable.js';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { ResearchWeb } from './coders/research.js';
 import type { Context } from '@deepseek-ai/cordis';
@@ -14,10 +15,9 @@ import { ChannelManager, type ChannelDependencies } from './channels/manager.js'
 import { BridgeRegistry } from './channels/notify.js';
 import { ConnectionStore } from './channels/store.js';
 import { installCoders } from './coders/index.js';
-import { isActive, type TaskRecord } from './coders/types.js';
 import { Connectors, type ConnectorsDeps } from './connectors/index.js';
 import { FileLedger, installFileFind } from './files/index.js';
-import { DEFAULT_ROTATION, SessionRoster } from './sessions/index.js';
+import { SessionRoster } from './sessions/index.js';
 import { CoderInstaller, managedLayout, type NpmRunner } from './coders/install.js';
 import { CodersManager, type ManagerDeps } from './coders/manager.js';
 import { CoderSettingsStore } from './coders/settings.js';
@@ -39,6 +39,7 @@ import { createRequire } from 'node:module';
 import { startLifecycle } from './service/lifecycle.js';
 import { ChannelError, type ChannelId, type ConnectionRecord } from './channels/types.js';
 import { identity, sameChat } from './channels/protocol.js';
+import { isActive, type TaskRecord } from './coders/types.js';
 import { readFeishuConfig } from './feishu/config.js';
 import { LarkTransport } from './feishu/larkTransport.js';
 import { WecomTransport } from './wecom/transport.js';
@@ -63,8 +64,12 @@ export async function installChannels(ctx: Context, workspace: string, legacyFei
   const manager = new ChannelManager(new ConnectionStore(records, legacyFeishu), {
     defaultWorkspace: resolve(workspace),
     transport: fixtures?.transport ?? ((channel, record, state) => {
-      if (channel === 'feishu') return new LarkTransport({ appId: record.accountId, appSecret: record.secret, ownerOpenId: record.ownerId }, report, state);
-      if (channel === 'wecom') return new WecomTransport(record, state, report);
+      if (channel !== 'wechat') {
+        const channelWorkspace = resolve(record.workspaceRoot ?? workspace);
+        return withDeliveryRecovery(channel, record, channelWorkspace, records, state, publish =>
+          channel === 'feishu' ? new LarkTransport({ appId: record.accountId, appSecret: record.secret, ownerOpenId: record.ownerId }, report, publish)
+            : new WecomTransport(record, publish, report));
+      }
       // WeChat hands a delivered file over as a workspace path and re-reads it when it can be sent, so the
       // outbox must name the same directory the session wrote it in.
       const channelWorkspace = resolve(record.workspaceRoot ?? workspace);
@@ -143,14 +148,11 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   // Which files went in and out of each chat, with the request they belonged to; `file_find` searches it for the model.
   const files = await FileLedger.open(ctx.storageDomain, Date.now, timeZone);
   ctx.effect(() => () => { void files.close(); });
-  // Which generation of each chat's session is active; a new day or an oversized context opens the next one.
+  // Explicit new sessions, archives and workspace changes advance the channel generation.
   const sessions = await SessionRoster.open(ctx.storageDomain);
   ctx.effect(() => () => { void sessions.close(); });
-  // The channels mount before the coders do, so the chat's live work is read through a holder filled in below. A rotation
-  // decision is only ever made when a message arrives, and by then this is set.
   let coderTasks: (() => readonly TaskRecord[]) | undefined;
   const channels = await installChannels(ctx, workspace, legacy, undefined, registry, { ledger, timeZone, files, sessions,
-    rotation: () => assistant?.rotation() ?? DEFAULT_ROTATION,
     busy: async base => (coderTasks?.() ?? []).some(task => isActive(task) && sameChat(task.ownerSession, base)),
     memory: { remember: (text, sessionId) => ctx.get('nexusMemoryRuntime')?.summarize(text, sessionId) ?? Promise.resolve(undefined) },
     transcribe: (wav, signal) => assistant ? assistant.transcribe(wav, signal) : Promise.reject(new ChannelError('speech_not_configured')) });

@@ -47,7 +47,7 @@ test('the assistant page saves quiet hours and briefing, shows held pushes, and 
     if (method === 'save') view = { ...view, settings: { ...view.settings, revision: view.settings.revision + 1, timeZone: payload.config.timeZone,
       quietStart: payload.config.quietStart || undefined, quietEnd: payload.config.quietEnd || undefined, briefingTime: payload.config.briefingTime || undefined, persona: payload.config.persona,
       speech: { baseUrl: payload.config.speech.baseUrl, model: payload.config.speech.model, apiKeyConfigured: payload.config.speech.apiKey.length > 0 },
-      rotation: { daily: payload.config.rotation.daily, contextTokens: Number(payload.config.rotation.contextTokens) } },
+      rotation: view.settings.rotation },
       // Built from local wall-clock parts on purpose. `Date.parse('…+08:00')` is an absolute
       // instant, so the page renders it as a different clock time on any machine that is not
       // Asia/Shanghai and the assertion below fails there — which is what a UTC CI runner is.
@@ -60,7 +60,7 @@ test('the assistant page saves quiet hours and briefing, shows held pushes, and 
   };
   const ui = await page(t, api);
   const input = ui.input;
-  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['人设', '时间与安静时段', '每日简报', '会话换新', '语音', '对话页显示', '外部事件入口']);
+  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['人设', '时间与安静时段', '每日简报', '会话连续性', '语音', '对话页显示', '外部事件入口']);
   // A template fills the persona fields; the user then edits one of them before saving everything in one request.
   await ui.enter('assistant-template', 'secretary');
   assert.equal(input('assistant-name').value, '小秘');
@@ -73,13 +73,13 @@ test('the assistant page saves quiet hours and briefing, shows held pushes, and 
   await ui.enter('assistant-speech-url', 'https://api.siliconflow.cn/v1');
   await ui.enter('assistant-speech-model', 'FunAudioLLM/SenseVoiceSmall');
   await ui.enter('assistant-speech-key', 'sk-fixture');
-  await ui.enter('assistant-rotate-tokens', '80000');
   await ui.submit();
   const save = calls.find(call => call.method === 'save')!;
   assert.deepEqual(save.payload, { revision: 0, config: { timeZone: 'Asia/Shanghai', quietStart: '23:00', quietEnd: '07:00', briefingTime: '08:00',
-    persona: { name: '小秘', userName: '老于', tone: 'brisk', initiative: 'high' }, rotation: { daily: true, contextTokens: '80000' },
+    persona: { name: '小秘', userName: '老于', tone: 'brisk', initiative: 'high' },
     speech: { baseUrl: 'https://api.siliconflow.cn/v1', model: 'FunAudioLLM/SenseVoiceSmall', apiKey: 'sk-fixture' } } });
-  assert.equal(input('assistant-rotate-tokens').value, '80000');
+  assert.equal(ui.dom.window.document.getElementById('assistant-rotate-tokens'), null);
+  assert.match(ui.dom.window.document.body.textContent!, /旧版的按天、按 token 数自动换新设置不再生效/);
   assert.equal(input('assistant-name').value, '小秘', 'the saved persona stays in the form');
   assert.equal(input('assistant-speech-key').value, '', 'the key never comes back into the form');
   assert.equal(input('assistant-speech-key').placeholder, '已保存，留空保留当前密钥');

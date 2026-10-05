@@ -30,7 +30,11 @@ export const errors: Record<string, string> = {
   server_unavailable: '微信服务暂时不可用，请稍后重试。',
   wechat_request_failed: '微信拒绝了请求，当前记录不能确定具体原因；请查看接口诊断，勿反复重试。',
   wechat_send_rejected: '微信未接受本轮发送，已暂停自动发送。请用原绑定微信账号发一条新消息，收到后会继续尝试未送达部分。若仍失败，请查看接口诊断。',
-  invalid_delivery_state: '本机的微信投递记录无法读取，请在本机检查数据版本。',
+  invalid_delivery_state: '本机的渠道投递记录无法读取，请在本机检查数据版本。',
+  delivery_storage_failed: '投递进度无法保存，已暂停发送，请检查本机数据存储后重试。',
+  delivery_uncertain: '无法确认平台是否已接收上一分片，已暂停自动发送。请先查看聊天记录；手动重试可能重复上一分片。',
+  delivery_rejected: '平台明确拒绝了发送请求，请检查应用权限或发送限制；达到重试上限后可手动重试。',
+  delivery_file_unavailable: '待发文件已变化、不存在或不在原工作区，已暂停发送。请在本机会话重新交付正确文件。',
   delivery_queue_full: '待发回复已达到上限，请先重试发送；本次结果仍可在本机查看。',
   wechat_context_stale: '微信的回复上下文已超过 19 小时，待发消息会在你下次发消息给助理后送达。',
   wechat_upload_failed: '文件上传到微信失败，稍后会自动重试；也可以点“重试发送”。',
@@ -92,7 +96,7 @@ export const channelApi: ChannelApi = async (method, payload = {}, signal) => {
 
 type Action = (method: string, payload?: unknown) => Promise<boolean>;
 function Status({ connection }: { connection: ConnectionView }) {
-  const label = connection.channel === 'wechat' && connection.phase === 'connected' && connection.deliveryError
+  const label = connection.phase === 'connected' && connection.deliveryError
     ? connection.waitingForReply ? '等待微信回复' : '发送异常' : phases[connection.phase];
   return <span className={`nexus-channel-state ${connection.phase}`}>{label}</span>;
 }
@@ -197,6 +201,14 @@ function CredentialCard({ connection, action, busy, pairing }: { connection: Con
         : <button type="button" disabled={busy || stale} onClick={() => void pair()}>重新生成配对码</button>}
     </div>}
     {feishu && <p className="nexus-channel-hint">应用需启用机器人，使用长连接接收事件，并订阅 im.message.receive_v1（接收消息）；确保应用已发布或在测试范围内，且你有权使用。</p>}
+    {(connection.pendingDeliveries !== undefined || connection.deliveryError) && <div className="nexus-channel-delivery">
+      <p>消息投递恢复：待发 {connection.pendingDeliveries ?? 0} 条。仅补发已生成内容，不重跑任务或补发审批提示。</p>
+      {connection.deliveryError && <p role="alert">{explain(connection.deliveryError)}</p>}
+      {!!connection.pendingDeliveries && <button type="button" disabled={busy || !!pairingActive || !connection.enabled || connection.phase !== 'connected'}
+        onClick={() => void action('retry-delivery', { channel: connection.channel, revision: connection.revision })}>
+        {connection.deliveryError === 'delivery_uncertain' ? '重试发送（可能重复上一分片）' : '重试发送'}
+      </button>}
+    </div>}
     <WorkspaceField connection={connection} action={action} busy={busy || !!pairingActive} />
   </article>;
 }

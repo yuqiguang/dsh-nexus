@@ -4,6 +4,8 @@ Nexus 自有代码采用 [MIT License](LICENSE)。第三方代码、程序和服
 
 0.2.48 升级依赖以清掉已知漏洞：`@larksuiteoapi/node-sdk` 1.66.1 → 1.74.0（该版本要求 axios ^1.16.0，axios 随之 1.13.6 → 1.20.0），并按上游声明范围更新传递依赖 `http-cache-semantics` 4.2.0 → 4.3.0、`ip-address` 10.7.0 → 10.7.3、`fast-uri` 3.1.7 → 3.1.8。新增的传递依赖为 axios 自身的 `https-proxy-agent`、`agent-base`、`debug`、`ms`，以及升级后的 `proxy-from-env` 2.1.0；均为 MIT。以上版本依据 0.2.34 的 `package-lock.json` 及对应已安装包中的许可文件核对，0.2.48 变更项另按该版锁文件核对。完整依赖树由锁文件记录；升级依赖后应重新核对。
 
+0.2.53 未新增或升级第三方依赖，继续使用锁文件中的版本与下列许可说明。
+
 ## 分发范围
 
 Nexus 的 `.tgz` 安装包包含本项目编译后的插件、客户端界面、配置、语言文件和项目说明，不打包 `node_modules`、DSH、React、Codex 或 Claude Agent SDK 的实现。服务端依赖在安装时由包管理器取得；客户端使用宿主提供的 React。源码开发依赖也由 `npm ci` 单独安装。

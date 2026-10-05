@@ -21,12 +21,10 @@ export const assistantApi: AssistantApi = async (method, payload = {}, signal) =
   return message.result.value as AssistantView;
 };
 
-interface Draft { revision: number; timeZone: string; quietStart: string; quietEnd: string; briefingTime: string; persona: PersonaSettings; speechUrl: string; speechModel: string; speechKey: string;
-  rotateDaily: boolean; rotateTokens: string }
+interface Draft { revision: number; timeZone: string; quietStart: string; quietEnd: string; briefingTime: string; persona: PersonaSettings; speechUrl: string; speechModel: string; speechKey: string }
 const fromView = (view: AssistantView): Draft => ({ revision: view.settings.revision, timeZone: view.settings.timeZone,
   quietStart: view.settings.quietStart ?? '', quietEnd: view.settings.quietEnd ?? '', briefingTime: view.settings.briefingTime ?? '', persona: { ...view.settings.persona },
-  speechUrl: view.settings.speech.baseUrl, speechModel: view.settings.speech.model, speechKey: '',
-  rotateDaily: view.settings.rotation.daily, rotateTokens: String(view.settings.rotation.contextTokens) });
+  speechUrl: view.settings.speech.baseUrl, speechModel: view.settings.speech.model, speechKey: '' });
 const when = (at: number) => new Date(at).toLocaleString('zh-CN', { hour12: false });
 
 export function AssistantSettings({ api = assistantApi }: { api?: AssistantApi }) {
@@ -75,7 +73,6 @@ export function AssistantSettings({ api = assistantApi }: { api?: AssistantApi }
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (await action('save', { revision: draft.revision, config: { timeZone: draft.timeZone, quietStart: draft.quietStart, quietEnd: draft.quietEnd, briefingTime: draft.briefingTime, persona: draft.persona,
-      rotation: { daily: draft.rotateDaily, contextTokens: draft.rotateTokens },
       speech: { baseUrl: draft.speechUrl, model: draft.speechModel, apiKey: draft.speechKey } } })) setDirty(false);
   };
   const editPersona = (change: Partial<PersonaSettings>) => edit({ persona: { ...draft.persona, ...change } });
@@ -137,16 +134,9 @@ export function AssistantSettings({ api = assistantApi }: { api?: AssistantApi }
         <footer><button type="button" disabled={busy} onClick={() => void action('briefing/send')}>现在发一份</button></footer>
       </article>
       <article className="nexus-channel-card">
-        <header><h3>会话换新</h3></header>
-        <label htmlFor="assistant-rotate-daily" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <input id="assistant-rotate-daily" type="checkbox" checked={draft.rotateDaily} disabled={busy} style={{ width: 'auto', margin: 0 }}
-            onChange={event => edit({ rotateDaily: event.target.checked })} />
-          每天第一条消息开新会话（凌晨 4 点算一天的开始）
-        </label>
-        <label htmlFor="assistant-rotate-tokens">本段对话比开头多出多少 token 时开新会话（0 关闭）</label>
-        <input id="assistant-rotate-tokens" inputMode="numeric" maxLength={7} value={draft.rotateTokens} disabled={busy} autoComplete="off" placeholder="60000"
-          onChange={event => edit({ rotateTokens: event.target.value })} />
-        <p className="nexus-channel-hint">换新时前一段对话的摘要写入记忆，提醒和监控带到新会话；微信里回复“/new”随时换新。旧会话保留在会话列表里。</p>
+        <header><h3>会话连续性</h3></header>
+        <p className="nexus-channel-hint">日常对话持续使用同一个 DSH 会话，长上下文由 DSH 原生压缩管理，不依赖长期记忆是否开启或确认。旧版的按天、按 token 数自动换新设置不再生效。</p>
+        <p className="nexus-channel-hint">回复“/new”、归档当前会话或更换工作目录会开启独立的新会话，不自动继承旧对话。旧会话保留在会话列表里；发送“/s”和“/s 编号”可返回原会话，原生任务仍绑定原会话。</p>
       </article>
       <article className="nexus-channel-card">
         <header><h3>语音</h3><span className={`nexus-channel-state ${view.settings.speech.baseUrl ? 'connected' : ''}`}>{view.settings.speech.baseUrl ? '已配置' : '未配置'}</span></header>
