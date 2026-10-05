@@ -9,6 +9,8 @@ export interface ExecutionObservation {
   packages: { manager: string; script: string }[];
   manifests: string[];
   gaps: string[];
+  /** null means discovery could not be narrowed to literal targets. */
+  pytest: (string[] | null)[];
 }
 type Word = { value: string; literal: boolean };
 
@@ -45,21 +47,55 @@ function words(source: string, powershell: boolean): { words: Word[]; uncertain:
 const programName = (value: string) => value.replace(/\\/g, '/').split('/').at(-1)!.toLowerCase().replace(/\.(?:exe|cmd|bat)$/, '');
 const separator = (value: string) => /^[;&|()<>]$/.test(value);
 
+function pytestTargets(args: Word[]): string[] | null | undefined {
+  const targets: string[] = [];
+  let operands = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.literal || /[$`*?{}]/.test(arg.value)) return undefined;
+    if (!operands && arg.value === '--') { operands = true; continue; }
+    if (!operands && ['-k', '-m', '--maxfail', '--tb', '--color', '--durations'].includes(arg.value)) {
+      if (!args[++i]?.literal) return undefined;
+      continue;
+    }
+    if (!operands && (/^-[qvxs]+$/.test(arg.value) || ['--disable-warnings', '--collect-only'].includes(arg.value)
+      || /^--(?:maxfail|tb|color|durations)=/.test(arg.value))) continue;
+    if (!operands && arg.value.startsWith('-')) return undefined;
+    const path = arg.value.split('::')[0]!;
+    if (!path || path.startsWith('@')) return undefined;
+    targets.push(path);
+  }
+  return targets.length ? targets : null;
+}
+
 export function executionObservations(command: string, language: 'shell' | 'powershell' = 'shell', depth = 0): ExecutionObservation {
-  const out: ExecutionObservation = { sources: [], inline: [], packages: [], manifests: [], gaps: [] };
+  const out: ExecutionObservation = { sources: [], inline: [], packages: [], manifests: [], gaps: [], pytest: [] };
   if (depth > 4 || command.length > 96 * 1024) { out.gaps.push('嵌套命令或代码超过静态解析上限'); return out; }
   const parsed = words(command, language === 'powershell'), tokens = parsed.words;
   if (parsed.uncertain) out.gaps.push('命令引号或转义未完整解析，须核对原始命令');
+  let directoryChanged = false;
+  const addPytest = (args: Word[]) => {
+    const targets = parsed.uncertain || directoryChanged ? undefined : pytestTargets(args);
+    out.pytest.push(targets ?? null);
+    if (targets === undefined) out.gaps.push('pytest 参数或目标未完整解析，项目扫描不能证明实际测试发现范围完整');
+  };
   const addSource = (word: Word | undefined, language?: SourceLanguage) => {
     if (!word || !word.literal || /[$`*?{}]/.test(word.value)) { out.gaps.push('执行路径包含动态表达式，未静态展开'); return; }
     out.sources.push({ path: word.value, language });
   };
-  const merge = (other: ExecutionObservation) => { for (const key of ['sources', 'inline', 'packages', 'manifests', 'gaps'] as const) (out[key] as unknown[]).push(...other[key]); };
+  const merge = (other: ExecutionObservation) => {
+    if (directoryChanged && other.pytest.length) {
+      other.pytest = [null];
+      other.gaps.push('命令改变工作目录，不能按原目录推断 pytest 的实际目标');
+    }
+    for (const key of ['sources', 'inline', 'packages', 'manifests', 'gaps', 'pytest'] as const) (out[key] as unknown[]).push(...other[key]);
+  };
   for (let i = 0; i < tokens.length; i++) {
     const word = tokens[i]!, name = programName(word.value);
     // Search executable positions and nested wrappers. Strings inside arguments are not recursively treated as commands.
     if (i && !separator(tokens[i - 1]!.value) && !/^(?:&|command|exec|env|sudo)$/.test(tokens[i - 1]!.value)
       && !/^[\w:$]+=.*/.test(tokens[i - 1]!.value)) continue;
+    if (['cd', 'chdir', 'pushd', 'popd', 'set-location', 'sl', 'push-location', 'pop-location'].includes(name)) directoryChanged = true;
     const args: Word[] = [];
     for (let j = i + 1; j < tokens.length && !separator(tokens[j]!.value); j++) args.push(tokens[j]!);
     const python = /^python(?:\d+(?:\.\d+)*)?$/.test(name);
@@ -84,12 +120,23 @@ export function executionObservations(command: string, language: 'shell' | 'powe
         if (js && ['-r', '--require', '--import', '--loader', '--experimental-loader'].includes(lower)) { addSource(args[++a], 'javascript'); continue; }
         if (js && ['--test', 'test'].includes(lower)) out.gaps.push('运行时测试发现和测试配置未完整展开');
         if (ps && ['-encodedcommand', '-enc', '-encodedarguments'].includes(lower)) { out.gaps.push('编码后的 PowerShell 命令未展开'); break; }
-        if (python && ['-m', '-x', '-w'].includes(lower)) { if (lower === '-m') break; a++; continue; }
-        if (ps && ['-executionpolicy', '-inputformat', '-outputformat', '-workingdirectory', '-windowstyle'].includes(lower)) { a++; continue; }
+        if (python && ['-m', '-x', '-w'].includes(lower)) {
+          if (lower === '-m') {
+            if (args[a + 1]?.value === 'pytest') addPytest(args.slice(a + 2));
+            break;
+          }
+          a++; continue;
+        }
+        if (ps && ['-executionpolicy', '-inputformat', '-outputformat', '-workingdirectory', '-windowstyle'].includes(lower)) {
+          if (lower === '-workingdirectory') directoryChanged = true;
+          a++; continue;
+        }
         if (ps && ['-file', '-f'].includes(lower)) { addSource(args[a + 1], sourceLanguage); break; }
         if (arg.startsWith('-') || js && ['run', 'test'].includes(lower)) continue;
         addSource(args[a], sourceLanguage); break;
       }
+    } else if (name === 'pytest') {
+      addPytest(args);
     } else if (name === 'using' && args[0]?.value.toLowerCase() === 'module') {
       addSource(args[1], 'powershell');
     } else if (['source', '.', 'import-module'].includes(name)) {

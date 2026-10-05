@@ -7,6 +7,7 @@ import { taskPermissions } from '../src/coders/permissions.js';
 import { reviewEnvelope, reviewFingerprint } from '../src/coders/review.js';
 import { codexCommandRequest } from '../src/coders/normalize.js';
 import { pythonImports } from '../src/coders/python-evidence.js';
+import { commandEvidence } from '../src/coders/review-evidence.js';
 import type { TaskRecord } from '../src/coders/types.js';
 
 async function fixture(t: { after(fn: () => Promise<unknown>): void }) {
@@ -35,6 +36,53 @@ test('Python pytest review includes local imports, initializers, conftest and co
   assert.equal(first.evidenceComplete, true);
   await f.write('app/db.py', '# DATABASE_CHANGED\n');
   assert.notEqual(reviewFingerprint(first), reviewFingerprint(await f.inspect('.venv/Scripts/python.exe -m pytest -q tests/test_api.py::test_chat')));
+});
+
+test('targeted pytest preserves dependency budget and parent fixtures through PowerShell wrappers', async t => {
+  const f = await fixture(t);
+  await f.write('tests/test_selected.py', 'from app.db import check\n# SELECTED_TEST');
+  await f.write('tests/conftest.py', '# PARENT_FIXTURE');
+  await f.write('app/db.py', '# REQUIRED_DATABASE');
+  await f.write('pytest.ini', '[pytest]\ntestpaths = tests');
+  for (let i = 0; i < 12; i++) await f.write(`tests/test_unrelated${i}.py`, '# UNRELATED\n' + '# padding\n'.repeat(3000));
+  const command = 'powershell.exe -NoProfile -Command "python -X utf8 -m pytest -q tests/test_selected.py::test_check -k selected"';
+  const result = await f.inspect(command);
+  assert.equal(result.evidenceComplete, true);
+  const evidence = result.evidence.join('\n');
+  for (const marker of ['SELECTED_TEST', 'PARENT_FIXTURE', 'REQUIRED_DATABASE']) assert.ok(evidence.includes(marker), marker);
+  assert.doesNotMatch(evidence, /UNRELATED|未读取完整内容/);
+  await f.write('app/db.py', '# REQUIRED_DATABASE_CHANGED');
+  assert.notEqual(reviewFingerprint(result), reviewFingerprint(await f.inspect(command)));
+});
+
+test('pytest collects every explicit target and falls back for default or unknown discovery arguments', async t => {
+  const f = await fixture(t);
+  await f.write('tests/test_one.py', '# FIRST_TARGET');
+  await f.write('other/test_two.py', '# SECOND_TARGET');
+  await f.write('other/conftest.py', '# OTHER_FIXTURE');
+  const selected = await f.inspect('pytest tests/test_one.py; python -m pytest other');
+  for (const marker of ['FIRST_TARGET', 'SECOND_TARGET', 'OTHER_FIXTURE']) assert.ok(selected.evidence.join('\n').includes(marker));
+  for (const command of ['pytest', 'python -m pytest -c custom.ini tests/test_one.py', 'pytest "$TARGET"', 'cd other; pytest tests/test_one.py', 'pwsh -WorkingDirectory other -Command "pytest tests/test_one.py"']) {
+    const result = await f.inspect(command);
+    assert.match(result.evidence.join('\n'), /SECOND_TARGET/);
+    if (command !== 'pytest') assert.equal(result.evidenceComplete, false);
+  }
+  await f.write('pytest.ini', '[pytest]\naddopts = other');
+  assert.match((await f.inspect('pytest tests/test_one.py')).evidence.join('\n'), /SECOND_TARGET/);
+  await f.write('tests/pytest.ini', '[pytest]\npythonpath = elsewhere');
+  assert.equal((await f.inspect('pytest tests/test_one.py')).evidenceComplete, false);
+});
+
+test('pytest unknown environment options and linked targets cannot produce reusable complete evidence', async t => {
+  const f = await fixture(t);
+  await f.write('tests/test_one.py', '# FIRST_TARGET');
+  await f.write('other/test_two.py', '# SECOND_TARGET');
+  const result = await commandEvidence('pytest tests/test_one.py', f.cwd, async path => path, { PYTEST_ADDOPTS: 'private-option-value' });
+  assert.equal(result.complete, false);
+  assert.match(result.evidence.join('\n'), /SECOND_TARGET/);
+  assert.doesNotMatch(result.evidence.join('\n'), /private-option-value/);
+  await symlink(join(f.cwd, 'tests/test_one.py'), join(f.cwd, 'linked.py'));
+  assert.equal((await f.inspect('pytest linked.py')).evidenceComplete, false);
 });
 
 test('python -m resolves package entry points and relative imports without launching the application', async t => {

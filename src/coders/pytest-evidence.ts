@@ -1,4 +1,4 @@
-import { opendir } from 'node:fs/promises';
+import { opendir, lstat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { redact } from './normalize.js';
 
@@ -21,12 +21,26 @@ export function customPytestDiscovery(source: string): boolean {
 }
 
 /** Bounded static discovery of default pytest candidates, without importing tests or following directory links. */
-export async function pytestSources(cwd: string, within: (path: string) => Promise<string>): Promise<{ paths: string[]; evidence: string[]; complete: boolean }> {
+export async function pytestSources(cwd: string, within: (path: string) => Promise<string>, targets?: string[]): Promise<{ paths: string[]; evidence: string[]; complete: boolean }> {
   const paths: string[] = [], evidence: string[] = [];
   let complete = true, entries = 0;
   // Breadth-first: project tests normally sit near the top level, so a bounded scan reaches them before a deep generated
   // tree can spend the whole budget. Entries this scan is going to skip are skipped before they are counted (ct-4c671559).
-  const queue: { path: string; depth: number }[] = [{ path: cwd, depth: 0 }];
+  const queue: { path: string; depth: number }[] = [];
+  for (const target of targets ?? [cwd]) {
+    const path = resolve(cwd, target);
+    try {
+      await within(path);
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) throw new Error('linked target');
+      if (info.isDirectory()) queue.push({ path, depth: 0 });
+      else if (info.isFile() && path.endsWith('.py')) paths.push(path);
+      else throw new Error('unsupported target');
+    } catch {
+      complete = false;
+      evidence.push(`${redact(path)}: 指定测试目标不可核验，不能推断其内容或执行范围`);
+    }
+  }
   for (let head = 0; head < queue.length; head++) {
     const { path, depth } = queue[head]!;
     if (depth > MAX_DEPTH) { complete = false; continue; }

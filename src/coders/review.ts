@@ -119,7 +119,7 @@ export async function prepareReview(task: TaskRecord, request: CoderRequest, hos
       if (/\bpip(?:3)?\s+install\b/i.test(request.command) && !pipEvidence) return unavailable('Python 依赖安装目标尚未核验，需要你确认');
       evidence.push(...pipEvidence ?? []);
       evidence.push(...await commandRuntimeEvidence(request.command, cwd, hostEnv));
-      const sources = await commandEvidence(request.command, cwd, within);
+      const sources = await commandEvidence(request.command, cwd, within, hostEnv);
       evidence.push(...sources.evidence);
       evidenceComplete = sources.complete;
       scope = `仅本次命令，工作目录 ${cwd}；允许联网。${task.coder === 'claude' || request.raw.additionalPermissions || request.raw.sandboxPermissions === 'require_escalated' || request.raw.reason ? '可能以当前用户权限在沙箱外执行，可访问该用户有权访问的文件及网络。' : '保留 Codex 工作目录写入沙箱。'}不得据命令名称假定只读或不存在副作用；不授予后续命令或整个会话权限。`;
@@ -201,7 +201,7 @@ const POLICY = `你是 DSH 的安全授权审核器。用户授权你自动批�
 解释器、Node vm 和浏览器具有执行能力，本身不是恶意行为的证据；结合已提供的完整代码判断实际访问和副作用。不得把理论上能做的所有危险操作都当成本次命令会执行。
 新建文件可能触发自动执行或改变项目配置，也必须评估。域名授权允许双向通信：如不能排除敏感数据上传、认证账户操作或未知用途，必须返回不安全。
 只对影响本次操作安全判断的具体风险或关键证据缺口返回 safe=false，例如无法确定实际执行入口、写入或删除目标、凭据访问、外发内容或注入行为。理由须指出具体操作或目标，以及风险或缺失的关键信息；不能只说“存在理论风险”“解析器不支持”或“依赖没有全部展开”。解析器覆盖不足、数据正文省略或无关依赖未知，本身不构成人工确认理由；但确实未见的执行代码及其副作用也不能凭任务名称、用户意图或文件扩展名假定安全。不要自行扩大授权。
-仅当全部执行代码和输入已有充分证据、操作只读或为无持久副作用的本地测试、不依赖未观察的目录外文件/环境/动态代码/网络结果时，可附 repeatable=true。它允许同一任务在证据不变的 60 秒内复用安全结论；有写入、联网、未知依赖或其他不确定情况时必须为 false。人工审批不会缓存。
+仅当全部执行代码和输入已有充分证据、操作只读或为无持久副作用的本地测试、不依赖未观察的目录外文件/环境/动态代码/网络结果时，可附 repeatable=true。它允许同一任务在证据不变的 5 分钟内复用安全结论；有写入、联网、未知依赖或其他不确定情况时必须为 false。人工审批不会缓存。
 只输出 JSON：{"safe":true或false,"reason":"简短中文理由","repeatable":true或false}。`;
 
 export const REVIEW_FAILURES = ['empty', 'truncated', 'invalid', 'incomplete', 'error', 'timeout', 'cancelled', 'too-long'] as const;
@@ -318,7 +318,9 @@ export function nativeSafetyReviewer(ctx: Context, audit: ReviewAuditSink): Safe
         ...(finishReason ? { finishReason } : {}), ...(usage ? { usage } : {}), ...(failure ? { failure } : {}), ...(errorCode ? { errorCode } : {}) });
       if (result) return result;
       if (!retry) return { safe: false, reason };
-      if (failure === 'error') await delay(500, undefined, { signal: active });
+      // Give a transient provider outage time to recover; a tight immediate retry
+      // repeatedly escalated SERVER failures in ct-335e4aa7 and ct-6da19110.
+      if (failure === 'error') await delay(2_000, undefined, { signal: active });
     }
     return { safe: false, reason: '自动审核未得到有效结论，交给你确认' };
   };
@@ -331,12 +333,23 @@ export class ReviewCache {
   private entries = new Map<string, { at: number; result: ReviewResult }>();
   constructor(private now = Date.now) {}
   private key(task: TaskRecord, input: ReviewInput): string {
-    return createHash('sha256').update(JSON.stringify([task.id, task.ownerSession, task.permissions, input])).digest('hex');
+    let operation = input.operation;
+    try {
+      const value = JSON.parse(operation);
+      if (value?.tool === 'codex.command' && value.request && typeof value.request === 'object' && !Array.isArray(value.request)) {
+        // Correlation fields change on every native command, even when the
+        // operation is identical. Keep thread/environment identity, cwd and
+        // every permission-bearing or unknown field. The review/audit is intact.
+        for (const key of ['turnId', 'itemId', 'startedAtMs']) delete value.request[key];
+        operation = JSON.stringify(value);
+      }
+    } catch { /* Non-JSON operations retain exact matching. */ }
+    return createHash('sha256').update(JSON.stringify([task.id, task.ownerSession, task.permissions, { ...input, operation }])).digest('hex');
   }
   get(task: TaskRecord, input: ReviewInput): ReviewResult | undefined {
     if (!input.evidenceComplete) return;
     const key = this.key(task, input), entry = this.entries.get(key);
-    if (entry && this.now() - entry.at < 60_000) return { ...entry.result };
+    if (entry && this.now() - entry.at < 5 * 60_000) return { ...entry.result };
     this.entries.delete(key);
   }
   set(task: TaskRecord, input: ReviewInput, result: ReviewResult): void {

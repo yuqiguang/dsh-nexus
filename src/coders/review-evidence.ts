@@ -44,7 +44,7 @@ function references(text: string): string[] {
 }
 
 /** A bounded, complete read per source, recursively including literal local inputs such as HTML and imported scripts. */
-export async function commandEvidence(command: string, cwd: string, within: (path: string) => Promise<string>): Promise<{ evidence: string[]; complete: boolean }> {
+export async function commandEvidence(command: string, cwd: string, within: (path: string) => Promise<string>, hostEnv?: NodeJS.ProcessEnv): Promise<{ evidence: string[]; complete: boolean }> {
   const evidence: string[] = [];
   const seen = new Set<string>();
   // `optional` marks a path the command was not seen to name — one guessed from source text or probed because the run needs
@@ -60,6 +60,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   const missingProbes: string[] = [];
   let bytes = 0, complete = true;
   let pytest = false;
+  const pytestScans = new Set<string>();
   const gaps = new Set<string>();
   const gap = (message: string) => { gaps.add(message); complete = false; };
   let moduleProbes = 0;
@@ -143,26 +144,32 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       }
     }
   };
-  const discoverPytest = async () => {
-    if (pytest) return;
+  const discoverPytest = async (targets?: string[]) => {
+    if (hostEnv && Object.entries(hostEnv).some(([key, value]) => /^PYTEST_(?:ADDOPTS|PLUGINS)$/i.test(key) && value)) {
+      targets = undefined;
+      gap('pytest 环境包含额外参数或插件，须核验其实际加载范围；不输出环境变量值');
+    }
+    const key = targets ? JSON.stringify(targets) : '*';
+    if (pytestScans.has(key) || pytestScans.has('*')) return;
+    pytestScans.add(key);
     pytest = true;
-    // Include a bounded superset of the default project tests even for `pytest -q` or `pytest tests`.
-    const discovered = await pytestSources(cwd, within);
+    const discovered = await pytestSources(cwd, within, targets);
     for (const path of discovered.paths) enqueue({ path, role: 'execute', language: 'python' });
     evidence.push(...discovered.evidence);
     complete &&= discovered.complete;
-    const targets = [...queue.values()].filter(item => /\.py$/i.test(item.path));
+    const sources = [...queue.values()].filter(item => /\.py$/i.test(item.path));
     // Only a scan that reached the end of the tree can report that the project has no tests; a truncated scan already said why.
     if (!discovered.paths.length && discovered.complete) { evidence.push('pytest 未找到默认命名的测试文件，不能确认测试发现范围。'); complete = false; }
     for (const file of ['conftest.py', 'pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini']) enqueue({ path: resolve(cwd, file), optional: true, probe: true, role: 'config' });
-    for (const target of targets) {
+    for (const target of sources) {
       for (let parent = dirname(target.path); inProject(parent); parent = dirname(parent)) {
         enqueue({ path: resolve(parent, 'conftest.py'), optional: true, probe: true, role: 'execute', language: 'python' });
         enqueue({ path: resolve(parent, '__init__.py'), optional: true, probe: true, role: 'execute', language: 'python' });
+        for (const file of ['pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini']) enqueue({ path: resolve(parent, file), optional: true, probe: true, role: 'config' });
         if (parent === cwd) break;
       }
     }
-    evidence.push('pytest 可能加载第三方插件或配置中的动态测试路径；本次仅展开可静态定位的项目源码，不把测试命令视为自动授权。');
+    evidence.push('pytest 按实际指定目标展开测试、父级 conftest 与本地依赖；未指定目标或参数不明确时扫描项目。第三方插件尚未逐个核验，应结合实际配置和导入行为判断，不仅凭理论上的插件加载能力要求人工确认。');
   };
   const scanPython = async (source: string, base: string) => {
     const parsed = pythonImports(source);
@@ -173,6 +180,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   const scanCommand = async (source: string, base: string, language: 'shell' | 'powershell' = 'shell') => {
     add(source, base);
     const observed = executionObservations(source, language);
+    for (const targets of observed.pytest) await discoverPytest(targets?.map(path => resolve(base, commandPath(path))));
     for (const message of observed.gaps) gap(message);
     for (const item of observed.sources) enqueue({ path: resolve(base, commandPath(item.path)), role: 'execute', language: item.language });
     for (const item of observed.inline) {
@@ -189,10 +197,10 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       await expandPackage(path);
     }
     for (const module of pythonModuleCommands(source)) {
-      if (module === 'pytest') await discoverPytest();
+      if (module === 'pytest') { if (!observed.pytest.length) await discoverPytest(); }
       else await addModule({ module, names: [] }, base, true);
     }
-    if (/(?:^|[\s/\\])pytest(?:\.exe)?(?:\s|$)/i.test(source)) await discoverPytest();
+    if (!observed.pytest.length && /(?:^|[\s/\\])pytest(?:\.exe)?(?:\s|$)/i.test(source)) await discoverPytest();
   };
   await scanCommand(command, cwd);
   let files = 0;
@@ -270,6 +278,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     if (language === 'javascript') await addJavascript(source, dirname(real));
     if (language === 'shell' || language === 'powershell') await scanCommand(source, cwd, language);
     if (pytest && /\.(?:toml|ini|cfg)$/i.test(real) && customPytestDiscovery(source)) gap(`${redact(real)}: 存在自定义测试发现或模块路径配置，默认命名扫描不能证明执行范围完整`);
+    if (pytest && /\.(?:toml|ini|cfg)$/i.test(real) && /\baddopts\s*=/.test(source)) await discoverPytest();
     // Documentation/data cannot introduce executable dependency edges just by mentioning a filename.
     if (candidate.role !== 'data' && language !== 'shell' && language !== 'powershell') add(language === 'javascript' ? javascriptDataReferences(source) : source, dirname(real), true);
   }

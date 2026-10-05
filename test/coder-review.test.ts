@@ -164,8 +164,21 @@ test('review reuse is task-local, expires, and requires explicit repeatability a
  cache.set(t,input,yes); assert.deepEqual(cache.get(t,input),yes);
  for(const other of [{...t,id:'another-task'},{...t,ownerSession:'someone-else'}]) assert.equal(cache.get(other,input),undefined);
  for(const other of [{...input,scope:'extra permissions'},{...input,evidence:['source: hash-b']},{...input,operation:'node other.js'}]) assert.equal(cache.get(t,other),undefined);
- now=60_000; assert.equal(cache.get(t,input),undefined);
+ now=60_000; assert.deepEqual(cache.get(t,input),yes);
+ now=5*60_000; assert.equal(cache.get(t,input),undefined);
  cache.set(t,input,yes); cache.clear(); assert.equal(cache.get(t,input),undefined);
+});
+
+test('Codex review reuse ignores only per-command correlation fields, preserving runtime and permission scope', () => {
+ const cache = new ReviewCache(), t = task('/tmp/review');
+ const request = { threadId: 'thread', turnId: 'turn1', itemId: 'item1', startedAtMs: 1, environmentId: 'env1', cwd: '/tmp/review' };
+ const input = { task: 'check', scope: 'workspace', operation: JSON.stringify({ tool: 'codex.command', command: 'node check.js', request }), evidence: ['hash-a'], evidenceComplete: true };
+ const yes = { safe: true, repeatable: true, reason: 'local check' };
+ cache.set(t, input, yes);
+ const next = (patch: Record<string, unknown>) => ({ ...input, operation: JSON.stringify({ tool: 'codex.command', command: 'node check.js', request: { ...request, ...patch } }) });
+ assert.deepEqual(cache.get(t, next({ turnId: 'turn2', itemId: 'item2', startedAtMs: 500 })), yes);
+ for (const patch of [{ threadId: 'other' }, { environmentId: 'env2' }, { cwd: '/outside' }, { additionalPermissions: {} }, { unknownGrant: true }]) assert.equal(cache.get(t, next(patch)), undefined);
+ assert.equal(JSON.parse(input.operation).request.itemId, 'item1', 'original audit operation is not mutated');
 });
 
 test('automatic review is bounded to concrete read commands and scoped requests, not scripts or root grants', async()=>{
