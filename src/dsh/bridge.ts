@@ -1,3 +1,4 @@
+import type { ChannelWork } from '../channels/work.js';
 import { firstAvailable, isNativeMirror, nativeApproval, nativeQuestion } from './interaction.js';
 import { desktopApprovalReceipt, desktopQuestionReceipt } from './receipts.js';
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
@@ -39,6 +40,7 @@ export { describeToolCall, heartbeatText } from './describe.js';
 
 /** Optional collaborators: the delivery ledger for catch-up after a restart, the user's time zone for notices, and speech-to-text for voice clips. */
 export interface BridgeExtras {
+  channelWork?: ChannelWork;
   ledger?: DeliveryMarks;
   timeZone?: () => string;
   /** WAV in, text out; rejects with `speech_not_configured` when the user set no service. */
@@ -130,6 +132,7 @@ export class DshChannelBridge {
 
   private deliverableTurn(sessionId: string, events: readonly SessionEvent[], turn: number): boolean {
     if (!this.historicalChannel(sessionId)) return true;
+    if (this.extras.channelWork) return this.extras.channelWork.remoteTurn(sessionId, events, turn);
     const start = events.findLastIndex(event => event.type === 'turn/start' && event.data.turn === turn);
     if (start < 0) return false;
     const typed = events.slice(start).filter(event => event.type === 'user/message');
@@ -684,6 +687,12 @@ export class DshChannelBridge {
   async ask(request: AskUserQuestionRequest, next: (signal?: AbortSignal) => Promise<AskUserQuestionAnswer>): Promise<AskUserQuestionAnswer> {
     const chatId = request.agent && this.chatOf(request.agent.id);
     if (!chatId || this.stopped) return next();
+    if (this.historicalChannel(request.agent!.id)) {
+      const work = this.extras.channelWork;
+      const remote = work?.questionOrigin(request.questions, request.agent!.id)
+        ?? work?.remoteCall(request.agent!.id, request.agent!.session.snapshotEvents(), request.wait?.callId);
+      if (!remote) return next();
+    }
     const prompts = request.questions.map((question, index) => this.historicalText(request.agent!.id, questionPrompt(question, index, request.questions.length)));
     if (prompts.some(prompt => prompt.length > 2500)) {
       const local = new AbortController();
@@ -767,6 +776,7 @@ export class DshChannelBridge {
   async approve(request: ApprovalRequest, next: (signal?: AbortSignal) => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> {
     const chatId = this.chatOf(request.agent.id);
     if (!chatId || this.stopped) return next();
+    if (this.historicalChannel(request.agent.id) && !this.extras.channelWork?.remoteCall(request.agent.id, request.agent.session.snapshotEvents(), request.callId)) return next();
     const call = request.agent.session.snapshotEvents().findLast(event =>
       event.type === 'tool/call' && event.data.callId === request.callId);
     const args = call?.type === 'tool/call' ? call.data.arguments : undefined;

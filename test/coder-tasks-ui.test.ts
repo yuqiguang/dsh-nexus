@@ -314,3 +314,22 @@ test('pending task cards and the detail panel show the actual automatic-review f
  assert.ok(doc.querySelector('.nexus-coder-dock')!.textContent!.includes(reason));
  assert.ok(doc.querySelector('.nexus-coder-panel')!.textContent!.includes(reason));
 });
+
+test('only this session owns the main dock; verified channel history is collapsed and unmarked foreign tasks stay hidden', async t => {
+  const own = { ...summary(), id: 'ct-11111111', ownerSession: 'owner', active: true };
+  const history = { ...own, id: 'ct-22222222', ownerSession: 'nexus-wechat-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-3', historical: true, description: 'Remote history' };
+  const local = { ...history, id: 'ct-33333333', historical: undefined, description: 'Private desktop work' };
+  const tasks = [own, history, local];
+  const api: TaskFeedApi = async <T,>() => tasks as T;
+  const doc = await render(t, coderTaskDock(() => {}, taskFeeds(api, 10)) as ComponentType<never>, { sessionId: 'owner' });
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)); });
+  assert.ok(doc.querySelector('[data-task-id="ct-11111111"]'));
+  assert.equal(doc.querySelector('[data-task-id="ct-22222222"]'), null);
+  assert.doesNotMatch(doc.body.textContent!, /Private desktop work/);
+  const button = [...doc.querySelectorAll('button')].find(button => button.textContent === '历史任务（1）')!;
+  assert.equal(button.getAttribute('aria-expanded'), 'false');
+  await act(async () => button.click());
+  assert.ok(doc.querySelector('[data-task-id="ct-22222222"]'));
+  assert.match(doc.body.textContent!, /来自历史会话 3/);
+  assert.equal(doc.querySelector('[data-task-id="ct-33333333"]'), null);
+});

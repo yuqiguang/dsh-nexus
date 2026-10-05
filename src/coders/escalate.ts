@@ -6,7 +6,7 @@ import { CODER_NAMES, type CoderDecision, type CoderRequest, type DecisionRecord
 /** The two native services an escalation needs; narrowed so tests can fake them. */
 export interface EscalationHost {
   resolveAgent(sessionId: SessionId): Promise<{ readonly agent: Agent } | { readonly error: unknown }>;
-  ask(request: { questions: AskUserQuestionItem[]; agent?: Agent; signal?: AbortSignal }): Promise<AskUserQuestionAnswer>;
+  ask(request: { questions: AskUserQuestionItem[]; agent?: Agent; signal?: AbortSignal }, taskId?: string): Promise<AskUserQuestionAnswer>;
 }
 
 export interface EscalationOutcome {
@@ -55,7 +55,7 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
   let answer: AskUserQuestionAnswer;
   try {
     signal.throwIfAborted();
-    answer = await host.ask({ questions, agent: found.agent, signal });
+    answer = await host.ask({ questions, agent: found.agent, signal }, task.id);
   }
   catch (error) {
     const aborted = signal.aborted;

@@ -22,18 +22,27 @@ export function coderTaskDock(open: OpenTask, feeds: TaskFeeds) {
   function Dock({ sessionId }: { sessionId: string }) {
     const feed = feeds(sessionId), snapshot = useTaskFeed(feed);
     const [expanded, setExpanded] = useState(false);
-    const tasks = snapshot.tasks.filter(task => feed.inDock(task));
+    const tasks = snapshot.tasks.filter(task => task.ownerSession === sessionId && feed.inDock(task));
+    const history = snapshot.tasks.filter(task => task.ownerSession !== sessionId && task.historical && task.active);
+    const [historyExpanded, setHistoryExpanded] = useState(false);
     // Waiting for an answer stays prominent; other active work precedes finished fallbacks.
     tasks.sort((a, b) => Number(!!b.pending) - Number(!!a.pending) || Number(b.active) - Number(a.active) || b.updatedAt - a.updatedAt);
-    if (!tasks.length && !snapshot.problem) return null;
+    if (!tasks.length && !history.length && !snapshot.problem) return null;
     const active = tasks.filter(task => task.active).length;
     return <section className="nexus-coder-dock" aria-label="编码任务">
-      <div className="nexus-coder-dock-head"><strong>{active ? `${active} 个任务进行中` : '任务结果'}</strong>
+      {tasks.length > 0 && <div className="nexus-coder-dock-head"><strong>{active ? `${active} 个任务进行中` : '任务结果'}</strong>
         {tasks.length > 1 && <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? '收起列表' : `查看全部 ${tasks.length} 个任务`}</button>}
-      </div>
+      </div>}
       {snapshot.problem && <p role="status" className="nexus-channel-hint">{snapshot.problem}</p>}
-      <div className="nexus-coder-dock-list">{(expanded ? tasks : tasks.slice(0, 1)).map(task =>
-        <TaskCard key={task.id} task={task} open={open} dismiss={task.active ? undefined : () => feed.dismiss(task.id)} />)}</div>
+      {tasks.length > 0 && <div className="nexus-coder-dock-list">{(expanded ? tasks : tasks.slice(0, 1)).map(task =>
+        <TaskCard key={task.id} task={task} open={open} dismiss={task.active ? undefined : () => feed.dismiss(task.id)} />)}</div>}
+      {history.length > 0 && <div className="nexus-coder-history">
+        <button type="button" aria-expanded={historyExpanded} onClick={() => setHistoryExpanded(value => !value)}>{historyExpanded ? '收起历史任务' : `历史任务（${history.length}）`}</button>
+        {historyExpanded && <div className="nexus-coder-dock-list">{history.map(task => <div key={task.id}>
+          <p className="nexus-channel-hint" title={task.ownerSession}>来自历史会话 {/-([0-9]+)$/.exec(task.ownerSession)?.[1] ?? '0'} · 查看过程后可回到所属会话。</p>
+          <TaskCard task={task} open={open} />
+        </div>)}</div>}
+      </div>}
     </section>;
   }
   return function SessionDock(props: { sessionId: string }) { return <Dock key={props.sessionId} {...props} />; };

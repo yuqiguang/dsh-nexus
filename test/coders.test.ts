@@ -1,3 +1,4 @@
+import { channelWorkFixture } from './channel-work-fixture.js';
 import { CODEX_RESULT_SCHEMA, parseTurnResult } from '../src/coders/turn-result.js';
 import assert from 'node:assert/strict';
 import type { RetryNotice } from '../src/coders/retry.js';
@@ -823,7 +824,7 @@ function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: st
       return `job-${jobs.length}`;
     } },
   } as unknown as Context;
-  const run = (name: string, args: unknown, owner = task().ownerSession) => tools.get(name)!.execute(args, { agent: { id: owner, session } });
+  const run = (name: string, args: unknown, owner = task().ownerSession) => tools.get(name)!.execute(args, { agent: { id: owner, session }, callId: 'harness-call', rootCallId: 'harness-call' });
   return { ctx, run, jobs, panels, asked, session, tasks: tables.tasks as Map<string, TaskRecord>, rules: tables.rules as Map<string, HabitRule> };
 }
 
@@ -893,7 +894,7 @@ test('a chat\'s tasks stay readable and continuable after the chat rotates to a 
   assert.equal((await harness.run('coder_status', {}, `${other}-6`)).text, '还没有编码任务。');
 });
 
-test('the task panel lists the chat\'s running work across generations, but places a finished result only in its own conversation', async t => {
+test('the task panel keeps unverified tasks in their exact owner conversation', async t => {
   const workspace = await mkdtemp(join(tmpdir(), 'nexus-rotation-panel-'));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const harness = coderHarness(undefined, workspace);
@@ -909,7 +910,8 @@ test('the task panel lists the chat\'s running work across generations, but plac
   const ids = async (owner: string) => (await rpc.get('nexus-coder-tasks:list')!({ ownerSession: owner }) as { id: string }[]).map(task => task.id);
   const started = await harness.run('coder_task', { description: 'long job' }, `${chat}-6`);
   await until(() => !!finish, 'coder starts');
-  assert.ok((await ids(`${chat}-7`)).includes(started.task_id!), 'a rotation must not empty the panel of running work');
+  assert.ok(!(await ids(`${chat}-7`)).includes(started.task_id!), 'same chat alone cannot publish a task into another conversation');
+  assert.ok((await ids(`${chat}-6`)).includes(started.task_id!));
   finish();
   await Promise.all(harness.jobs.map(job => job.done));
   assert.ok(!(await ids(`${chat}-7`)).includes(started.task_id!), 'a finished result belongs to the conversation that reported it');
@@ -2905,4 +2907,35 @@ test('overlapping native questions keep the next pending request visible and sto
   assert.equal(harness.tasks.get(id!)!.status, 'completed');
   assert.match(result.result!, /耗时分项/);
   assert.equal(harness.tasks.get(id!)!.timing?.phase, undefined);
+});
+
+test('task RPC exposes only verified channel history in the current workspace, while desktop dispatch stays in its owner', async t => {
+  const workspace = await mkdtemp(join(tmpdir(), 'nexus-origin-panel-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, workspace);
+  const owner = `nexus-wechat-${'c'.repeat(32)}`, viewer = `${owner}-1`;
+  const { work } = channelWorkFixture({ activeFor: () => viewer });
+  let remote = true;
+  Object.assign(harness.session, { id: owner, snapshotEvents: () => [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { source: { kind: 'user', ...(remote ? { rpcId: 'wechat-admitted' } : {}) }, content: [] } },
+    { type: 'tool/call', data: { turn: 1, callId: 'harness-call' } },
+  ] });
+  let viewWorkspace = workspace;
+  Object.assign(harness.ctx, { sessionPersistence: { async stat() { return { header: { cwd: viewWorkspace } }; } } });
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const query = scriptedQuery(async function* () { await gate; yield { type: 'result', subtype: 'success', result: 'done' }; });
+  let rpc!: (method: string, payload: unknown) => Promise<unknown>;
+  await installCoders(harness.ctx, { roots: [workspace], channelWork: work, query, defaultCoder: 'claude', registerRpc(_family, _methods, handler) { rpc = handler; } });
+  const channelTask = await harness.run('coder_task', { description: 'channel job' }, owner);
+  remote = false;
+  const desktopTask = await harness.run('coder_task', { description: 'desktop job' }, owner);
+  const rows = await rpc('list', { ownerSession: viewer }) as import('../src/coders/presentation.js').TaskSummary[];
+  assert.deepEqual(rows.map(row => row.id), [channelTask.task_id]); assert.equal(rows[0]!.historical, true);
+  const ownRows = await rpc('list', { ownerSession: owner }) as import('../src/coders/presentation.js').TaskSummary[];
+  assert.ok(ownRows.some(row => row.id === desktopTask.task_id)); assert.ok(ownRows.every(row => !row.historical));
+  viewWorkspace = tmpdir();
+  assert.deepEqual(await rpc('list', { ownerSession: viewer }), []);
+  finish(); await Promise.all(harness.jobs.map(job => job.done));
 });

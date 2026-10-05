@@ -1,3 +1,4 @@
+import { ChannelWork } from './channels/work.js';
 import { withDeliveryRecovery } from './channels/durable.js';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { ResearchWeb } from './coders/research.js';
@@ -151,8 +152,12 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   // Explicit new sessions, archives and workspace changes advance the channel generation.
   const sessions = await SessionRoster.open(ctx.storageDomain);
   ctx.effect(() => () => { void sessions.close(); });
+  const channelWork = await ChannelWork.open(ctx.storageDomain, sessions);
+  ctx.effect(() => () => { void channelWork.close(); });
+  ctx.on('tools/pre-execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
+  ctx.on('tools/execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
   let coderTasks: (() => readonly TaskRecord[]) | undefined;
-  const channels = await installChannels(ctx, workspace, legacy, undefined, registry, { ledger, timeZone, files, sessions,
+  const channels = await installChannels(ctx, workspace, legacy, undefined, registry, { ledger, timeZone, files, sessions, channelWork,
     busy: async base => (coderTasks?.() ?? []).some(task => isActive(task) && sameChat(task.ownerSession, base)),
     memory: { remember: (text, sessionId) => ctx.get('nexusMemoryRuntime')?.summarize(text, sessionId) ?? Promise.resolve(undefined) },
     transcribe: (wav, signal) => assistant ? assistant.transcribe(wav, signal) : Promise.reject(new ChannelError('speech_not_configured')) });
@@ -174,7 +179,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     };
     return { search: (request, signal) => run(() => ctx.web.search(request, signal)), fetch: (request, signal) => run(() => ctx.web.fetch(request, signal)) };
   };
-  const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, restrictRoots: !!config.coderRoots?.length, notifier: registry, manager,
+  const coders = await installCoders(ctx, { web: webForOwner, roots: profileRoots, restrictRoots: !!config.coderRoots?.length, notifier: registry, manager, channelWork,
     registerRpc: (family, methods, handle) => registerRpc(ctx, family, methods, handle) });
   coderTasks = () => coders.list();
   const connectors = await installConnectors(ctx, registry, { notifier: assistant.notifier(), timeZone });

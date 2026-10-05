@@ -1,3 +1,4 @@
+import { ChannelWork } from '../src/channels/work.js';
 import type { TaskSummary } from '../src/coders/presentation.js';
 import { localCheck } from '../src/coders/local-check.js';
 import { nativeSafetyReviewer, reviewEnvelope } from '../src/coders/review.js';
@@ -126,7 +127,10 @@ class FixtureModel extends LlmAdapter {
   }
 }
 
-export function apply(ctx: Context, config: { phase: number; workspace: string; triggerFile: string; reportFile: string }): void {
+export async function apply(ctx: Context, config: { phase: number; workspace: string; triggerFile: string; reportFile: string }): Promise<void> {
+  const channelWork = await ChannelWork.open(ctx.storageDomain);
+  ctx.effect(() => () => channelWork.close());
+  let nativeTaskQuestions = 0;
   const model = new FixtureModel();
   ctx.effect(() => ctx.llm.registerAdapter(['nexus-fixture'], model));
   const texts: string[] = [];
@@ -135,7 +139,13 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
   claude.gate = new Promise<void>(resolve => { claude.releaseGate = resolve; });
   const transport: ChannelTransport = { async start() {}, stop() {}, async sendFile() {},
     async sendText(_chatId, text) { texts.push(text); } };
-  const bridge = installBridge(ctx, transport, owner, config.workspace, code => failures.push(code));
+  const bridge = installBridge(ctx, transport, owner, config.workspace, code => failures.push(code), undefined, { channelWork });
+  ctx.on('user-questions/request', (request, next) => {
+    if (request.agent && channelWork.questionOrigin(request.questions, request.agent.id)) nativeTaskQuestions++;
+    return next();
+  }, { prepend: true });
+  ctx.on('tools/pre-execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
+  ctx.on('tools/execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
   // The fake Claude only asks after the dispatching turn has ended, so escalation must find the idle agent on its own.
   const query: ClaudeQuery = ({ prompt, options }) => (async function* (): AsyncIterable<ClaudeStreamMessage> {
     claude.started++;
@@ -197,7 +207,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     ctx.web.registerSearchProvider({ id: 'nexus-research-fixture', available: () => true, async search() { return { sources: [{ url: 'https://example.com', title: 'fixture source' }], truncated: false }; } });
     ctx.web.registerFetchProvider({ id: 'nexus-research-fixture', available: () => true, async fetch({ url }) { return { url, statusCode: 200, body: { kind: 'text', content: 'fixture page' }, truncated: false }; } });
     let readTask: ((method: string, payload: unknown) => Promise<unknown>) | undefined;
-    const store = await installCoders(ctx, { roots: [join(config.workspace, 'channel-default')], query, web: () => ctx.web,
+    const store = await installCoders(ctx, { roots: [join(config.workspace, 'channel-default')], query, web: () => ctx.web, channelWork,
       registerRpc: (family, _methods, handle) => { if (family === 'nexus-coder-tasks') readTask = handle; } });
     await bridge.receive(inbound('dispatch', '帮我看看这个目录里有什么。'));
     const agent = ctx.agents.get(sessionId)!;
@@ -210,6 +220,8 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     const [task] = store.list();
     assert.ok(task);
     assert.equal(task.status, 'running');
+    assert.equal(channelWork.isRemote(task.id, sessionId), true, 'native dispatch records channel provenance');
+    assert.equal(channelWork.get(task.id)?.jobId, task.jobId);
     assert.equal(task.coderSessionId, 'claude-smoke-session');
     await bridge.receive(inbound('status-running', '状态'));
     assert.match(texts.at(-1)!, /已完成/);
@@ -305,7 +317,12 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     try { assert.equal((await persisted.read()).events.length, events.length); }
     finally { await persisted.close(); }
     assert.deepEqual(failures, []);
+    assert.ok(nativeTaskQuestions > 0, 'native userQuestions.ask preserves the scoped delivery association');
+    assert.ok(nativeNotice.type === 'user/message' && channelWork.remoteMessage(sessionId, nativeNotice.data), 'native completion label resolves the original task');
     await bridge.close();
+    await channelWork.close();
+    const restoredWork = await ChannelWork.open(ctx.storageDomain);
+    try { assert.equal(restoredWork.isRemote(task.id, sessionId), true); } finally { await restoredWork.close(); }
     await writeFile(join(model.coderCwd, 'local-check.cjs'), `const http=require('http'); const s=http.createServer((q,r)=>r.end('native-local')); s.listen(0,'127.0.0.1',async()=>{ const value=await fetch('http://127.0.0.1:'+s.address().port).then(r=>r.text()); if(value!=='native-local')process.exit(1);console.log(value);s.closeAllConnections();s.close(); });`);
     assert.match(await localCheck(ctx, model.coderCwd, sessionId, 'node local-check.cjs', undefined, new AbortController().signal), /native-local/);
     await store.close();
@@ -316,7 +333,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
       assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

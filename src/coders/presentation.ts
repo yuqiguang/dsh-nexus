@@ -6,6 +6,8 @@ import { CODER_NAMES, isActive, type TaskRecord } from './types.js';
 import { taskStatusLabel } from './status.js';
 
 export interface TaskSummary {
+  /** Verified channel work owned by another session; render only in collapsed history. */
+  historical?: boolean;
   id: string;
   ownerSession: string;
   coderName: string;

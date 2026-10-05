@@ -199,7 +199,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
           const state = criterionEvidence(brief, records(), args.criterion);
           if (!state.settled) throw new Error('该验收项尚未关联任务或任务仍在执行，请先完成工作。');
           const note = (args.note ?? '').slice(0, 1000);
-          const answer = await (askUser ?? (request => ctx.userQuestions.ask(request)))({ agent: exec.agent, signal: exec.signal, questions: [{ id: 'accept', question: `请确认业务验收：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
+          const answer = await (askUser ?? (request => ctx.userQuestions.ask(request)))({ agent: exec.agent, signal: exec.signal, wait: { callId: exec.callId }, questions: [{ id: 'accept', question: `请确认业务验收：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
             detail: `${state.checked ? '关联任务的独立检查已通过。' : '关联任务尚未全部通过独立检查。'}${note}\n任务：${state.tasks.map(task => task.id).join('、')}`, options: [{ label: '已满足' }, { label: '未满足' }] }] });
           if (criterionEvidence(brief, records(), args.criterion).evidence !== state.evidence) throw new Error('验收期间任务证据已变化，请重新核对。');
           const selected = answer.answers.find(item => item.id === 'accept');

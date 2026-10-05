@@ -1,3 +1,4 @@
+import { channelWorkFixture } from './channel-work-fixture.js';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { test } from 'node:test';
@@ -141,6 +142,7 @@ function bridgeFixture(options: { channel?: 'wechat' | 'feishu' | 'wecom'; known
   let clock = T0;
   const owner = { channel: options.channel ?? 'wechat', accountId: 'rot-bot', ownerId: 'rot-owner' };
   const base = sessionIdFor(owner.accountId, owner.ownerId, owner.ownerId, owner.channel);
+  const workFixture = channelWorkFixture();
   const logs = new Map<string, any[]>();
   const created: string[] = [];
   // Every session this process resumed: resuming one starts its native reminder runtime.
@@ -235,13 +237,13 @@ function bridgeFixture(options: { channel?: 'wechat' | 'feishu' | 'wecom'; known
   const make = async () => {
     const roster = await rosterPromise;
     const bridge = new DshChannelBridge(ctx, transport, owner, dir, code => codes.push(code), { firstMs: options.heartbeatMs ?? 60_000, everyMs: 300_000 }, () => clock, {
-      ledger, timeZone: () => ZONE, ...(options.roster === false ? {} : { sessions: roster }), rotation: () => options.rotation ?? DEFAULT_ROTATION,
+      ledger, channelWork: workFixture.work, timeZone: () => ZONE, ...(options.roster === false ? {} : { sessions: roster }), rotation: () => options.rotation ?? DEFAULT_ROTATION,
       ...(options.busy ? { busy: options.busy } : {}),
       memory: { async remember(text, sessionId) { remembered.push({ text, sessionId }); } }, ...(options.formerBases ? { formerBases: options.formerBases } : {}) });
     return bridge;
   };
   const inbound = (messageId: string, text: string): InboundMessage => ({ messageId, text, chatId: owner.ownerId, senderId: owner.ownerId, chatType: 'p2p' });
-  return { make, owner, base, logs, sessionOf, created, resolved, cancelled, roster: rosterPromise, prompts, texts, remembered, codes, marks, inbound, advance: (ms: number) => { clock += ms; }, now: () => clock,
+  return { make, channelWork: workFixture.work, owner, base, logs, sessionOf, created, resolved, cancelled, roster: rosterPromise, prompts, texts, remembered, codes, marks, inbound, advance: (ms: number) => { clock += ms; }, now: () => clock,
     workspace, attached, dir, elsewhere, cwds, tasks, schedule, running, selections, catalog,
     archive: (sessionId: string) => { archivedSessionIds.push(sessionId); } };
 }
@@ -692,6 +694,8 @@ test('historical approval stays bound to its request without changing the curren
   const old = f.sessionOf(f.base);
   old.snapshotEvents().push(...userTurn(1, 'before', 'before', T0));
   await bridge.receive(f.inbound('new', '/new'));
+  old.append('turn/start', { turn: 2 });
+  old.append('user/message', { source: { kind: 'user', rpcId: 'wechat-admitted' }, content: [] });
   old.append('tool/call', { turn: 2, callId: 'old-call', name: 'bash', arguments: '{"command":"echo fixture"}' });
   const outcome = bridge.approve({ agent: { id: f.base, session: old }, callId: 'old-call', toolName: 'bash' } as never,
     () => new Promise(() => {}));
@@ -922,6 +926,8 @@ for (const channel of ['wechat', 'feishu', 'wecom'] as const) {
     bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
     const title = { wechat: '微信', feishu: '飞书', wecom: '企业微信' }[channel];
     assert.ok(f.texts.some(text => text.startsWith(`[历史${title}会话 ${f.base}]`) && text.includes('REMOTE-RESULT')));
+    old.append('turn/start', { turn: 4 });
+    old.append('user/message', { source: { kind: 'user', rpcId: `${channel}-admitted` }, content: [] });
     old.append('tool/call', { turn: 4, callId: 'historical-call', name: 'bash', arguments: '{}' });
     const outcome = bridge.approve({ agent: { id: f.base, session: old }, callId: 'historical-call', toolName: 'bash' } as never, () => new Promise(() => {}));
     await new Promise(resolve => setImmediate(resolve));
@@ -950,3 +956,67 @@ test('Feishu restores owner-admitted chat routes before a new message without re
   assert.equal(await bridge.notify(f.base, 'OLD-TASK-RESULT', 'result'), true);
   assert.match(f.texts.at(-1)!, /^\[历史飞书会话/);
 });
+
+for (const channel of ['wechat', 'feishu', 'wecom'] as const) {
+  test(`${channel}: desktop work after /new keeps its approvals, questions, receipts and completion local`, async t => {
+    const f = bridgeFixture({ channel }); const bridge = await f.make(); t.after(() => bridge.close());
+    const old = f.sessionOf(f.base);
+    old.snapshotEvents().push(...userTurn(1, 'before', 'done', T0));
+    await bridge.receive(f.inbound('prime', 'before'));
+    await bridge.receive(f.inbound('new', '/new'));
+    old.append('turn/start', { turn: 2 });
+    old.append('user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'desktop task' }] });
+    old.append('tool/call', { turn: 2, callId: 'desktop-task', name: 'coder_task', arguments: '{}' });
+    await f.channelWork.record('ct-11111111', old as never, 'desktop-task', f.dir);
+    await f.channelWork.bindJob('ct-11111111', 'coder-1');
+    const before = f.texts.length;
+    const agent = { id: f.base, session: old };
+    let desktopApprovals = 0, desktopQuestions = 0;
+    assert.equal(await bridge.approve({ agent, callId: 'desktop-task', toolName: 'bash' } as never, async () => { desktopApprovals++; return 'allowed-once'; }), 'allowed-once');
+    const questions = [{ id: 'q', question: 'Local question', options: [{ label: 'OK' }] }];
+    const answer = { answers: [{ id: 'q', selected: ['OK'] }] };
+    assert.deepEqual(await f.channelWork.withQuestions('ct-11111111', questions, () => bridge.ask({ agent, questions } as never, async () => { desktopQuestions++; return answer; })), answer);
+    assert.equal(desktopApprovals, 1); assert.equal(desktopQuestions, 1);
+    assert.deepEqual(await bridge.ask({ agent, questions, wait: { callId: 'desktop-task' } } as never, async () => answer), answer);
+    const result = pushedTurn(3, 'background job coder-1 (coder: Codex [ct-11111111]: build) completed', 'LOCAL-JOB-RESULT', T0);
+    for (const event of result) if (event.type === 'user/message') event.data.source = { kind: 'tool-jobs', form: 'notice' };
+    old.snapshotEvents().push(...result); f.marks.set(f.base, 2);
+    bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+    assert.equal(f.texts.length, before, 'no remote prompt, receipt, or result for the desktop job');
+    await bridge.catchUp(); await bridge.drain();
+    assert.ok(!f.texts.some(text => text.includes('LOCAL-JOB-RESULT')));
+  });
+
+  test(`${channel}: original channel task still asks and reports after later desktop activity`, async t => {
+    const f = bridgeFixture({ channel }); const bridge = await f.make(); t.after(() => bridge.close());
+    const old = f.sessionOf(f.base);
+    old.append('turn/start', { turn: 1 });
+    old.append('user/message', { source: { kind: 'user', rpcId: `${channel}-admitted` }, content: [] });
+    old.append('tool/call', { turn: 1, callId: 'remote-task', name: 'coder_task', arguments: '{}' });
+    await f.channelWork.record('ct-22222222', old as never, 'remote-task', f.dir);
+    await f.channelWork.bindJob('ct-22222222', 'coder-2');
+    old.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    await bridge.receive(f.inbound('prime', 'before'));
+    await bridge.receive(f.inbound('new', '/new'));
+    old.snapshotEvents().push(...userTurn(2, 'desktop followup', 'local', T0));
+    const questions = [{ id: 'q', question: 'Original task approval', options: [{ label: 'OK' }] }];
+    const pending = f.channelWork.withQuestions('ct-22222222', questions, () => bridge.ask({ agent: { id: f.base, session: old }, questions } as never, () => new Promise(() => {})));
+    await new Promise(resolve => setImmediate(resolve));
+    const prompt = f.texts.at(-1)!; assert.match(prompt, /历史.*会话/);
+    const token = /回答 ([a-f0-9]{32}) 内容/.exec(prompt)![1];
+    await bridge.receive(f.inbound('answer', `/answer ${token} 1`));
+    assert.deepEqual((await pending).answers[0]!.selected, ['OK']);
+    const acceptance = bridge.ask({ agent: { id: f.base, session: old }, questions, wait: { callId: 'remote-task' } } as never, () => new Promise(() => {}));
+    await new Promise(resolve => setImmediate(resolve));
+    const acceptanceToken = /回答 ([a-f0-9]{32}) 内容/.exec(f.texts.at(-1)!)![1];
+    await bridge.receive(f.inbound('acceptance', `/answer ${acceptanceToken} 1`));
+    assert.deepEqual((await acceptance).answers[0]!.selected, ['OK']);
+    const result = pushedTurn(3, 'background job coder-2 (coder: Codex [ct-22222222]: build) completed', 'ORIGINAL-REMOTE-JOB', T0);
+    for (const event of result) if (event.type === 'user/message') event.data.source = { kind: 'tool-jobs', form: 'notice' };
+    old.snapshotEvents().push(...result); f.marks.set(f.base, 2);
+    bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+    assert.ok(f.texts.some(text => text.includes('ORIGINAL-REMOTE-JOB')));
+    await bridge.receive(f.inbound('followup', 'ordinary'));
+    assert.equal(f.prompts.at(-1)?.sessionId, `${f.base}-1`);
+  });
+}

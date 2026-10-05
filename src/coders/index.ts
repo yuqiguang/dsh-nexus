@@ -1,3 +1,4 @@
+import type { ChannelWork } from '../channels/work.js';
 import { projectPipEvidence } from './python-install.js';
 import { readonlyReview } from './readonly-review.js';
 import { UserWaits } from './user-waits.js';
@@ -62,6 +63,7 @@ declare module '@deepseek-ai/dsh-jobs' {
 }
 
 export interface CodersConfig {
+  channelWork?: ChannelWork;
   /** Used by embedded profiles without a settings manager. */
   securityMode?: CoderSecurityMode;
   reviewPolicy?: CoderReviewPolicy;
@@ -308,7 +310,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   if (interrupted.length) console.error(`[nexus-coders] interrupted tasks after restart: ${interrupted.join(', ')}`);
   for (const id of interrupted) {
     const task = before.get(id);
-    if (!task || !config.notifier) continue;
+    if (!task || !config.notifier || config.channelWork && !config.channelWork.isRemote(task.id, task.ownerSession)) continue;
     // Best effort and off the startup path: the transport may still be connecting, and WeChat holds the text until it can send.
     void config.notifier.notify(task.ownerSession, interruptedNotice(task), identity('coder-interrupted', task.id))
       .then(routed => { if (!routed) console.error(`[nexus-coders] no channel route for interrupted task ${task.id}`); })
@@ -316,7 +318,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   }
   const host = {
     resolveAgent: (sessionId: SessionId) => ctx.sessionController.resolveAgent(sessionId),
-    ask: (request: Parameters<typeof ctx.userQuestions.ask>[0]) => ctx.userQuestions.ask(request),
+    ask: (request: Parameters<typeof ctx.userQuestions.ask>[0], taskId?: string) => config.channelWork && taskId
+      ? config.channelWork.withQuestions(taskId, request.questions, () => ctx.userQuestions.ask(request)) : ctx.userQuestions.ask(request),
   };
   /** Project-file rules read when each task was dispatched; a coder cannot grant itself rules mid-task. */
   const projectRulesOf = new Map<string, HabitRule[]>();
@@ -963,6 +966,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           ...(previous ? { ...(previous.coderSessionId ? { coderSessionId: previous.coderSessionId, resumedFrom: previous.id } : {}), ...(args.retry_task_id ? { replaces: previous.id } : {}) } : {}), escalations: 0, decisions: [] };
         projectRulesOf.set(task.id, await projectRules(cwd, roots));
         rootsOf.set(task.id, permissions.writableRoots);
+        await config.channelWork?.record(task.id, exec.agent.session, exec.rootCallId ?? exec.callId, await canonical(exec.agent.session.header.cwd ?? cwd));
         await store.put(task);
         let jobId: string;
         try {
@@ -975,6 +979,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           await store.update(task.id, () => ({ status: 'failed', result: { summary: '', changedFiles: [], outsideRoots: [], detail: (error as Error).message } }));
           throw error;
         }
+        // The native job already exists; a delivery-metadata failure must not turn its receipt into a retryable dispatch failure.
+        await config.channelWork?.bindJob(task.id, jobId).catch(() => { console.error('[nexus-coders] channel job binding unavailable'); });
         const running = await store.update(task.id, () => ({ jobId }));
         return { task_id: task.id, job_id: jobId, status: taskStatusLabel(running), cwd };
       } finally { if (!store.get(taskId)) reviewEnvs.delete(taskId); admitting.delete(taskId); if (resumeKey) resuming.delete(resumeKey); if (planKey) planning.delete(planKey); }
@@ -1110,16 +1116,21 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const task = store.list().find(task => task.ownerSession === ownerSession && task.completionNotice?.seq === seq);
         return task ? taskSummary(task, currentActivity(task)) : null;
       }
-      // The task panel belongs to the chat, not to one of its generations: live work stays listed across a rotation, because
-      // asking about it from the new generation must not find an empty panel (ct-4c671559). A finished result is placed by
-      // the conversation that reported it, so only the caller's own generation contributes those; the chat's whole backlog
-      // would otherwise reappear as a wall of dismissible cards. A cancelled task never gets such a notice, so it is left
-      // out entirely rather than leaving a card nothing can place.
-      const tasks = store.list().filter(task => isActive(task) ? sameChat(task.ownerSession, ownerSession)
-        : task.ownerSession === ownerSession && awaitsNotice(task));
+      // Other conversations are an explicit, source-scoped history view, never this conversation's work.
+      let viewerWorkspace = '';
+      if (config.channelWork) {
+        try {
+          const cwd = (await ctx.sessionPersistence.stat(ownerSession as SessionId, { signal: shutdown.signal }))?.header.cwd;
+          if (cwd) viewerWorkspace = await canonical(cwd);
+        }
+        catch { /* A missing or inaccessible viewer cannot borrow historical tasks. */ }
+      }
+      const tasks = store.list().filter(task => task.ownerSession === ownerSession ? isActive(task) || awaitsNotice(task)
+        : isActive(task) && !!viewerWorkspace && config.channelWork?.visibleHistory(task.id, ownerSession, viewerWorkspace));
       const active = tasks.filter(isActive);
       const recent = tasks.filter(task => !isActive(task)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
       return [...active, ...recent].map(task => ({ ...taskSummary(task, currentActivity(task)),
+        ...(task.ownerSession !== ownerSession ? { historical: true } : {}),
         ...(task.status === 'waiting-user' ? { channelWarning: config.notifier?.interactionWarning?.(task.ownerSession) } : {}) }));
     }
     const { id, brief } = (payload && typeof payload === 'object' ? payload : {}) as { id?: unknown; brief?: unknown };

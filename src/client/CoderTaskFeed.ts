@@ -66,8 +66,7 @@ export class TaskFeed {
           if (signal.aborted) return;
           notices.set(seq, task?.ownerSession === this.owner && task.completionNotice?.seq === seq ? task : null);
         }
-        // The server scopes the list to the chat's live work plus this conversation's own results, so the dock is rendered as
-        // returned: a rotation must not empty the panel of work the user is still waiting on (ct-4c671559).
+        // The server marks eligible channel history explicitly; the dock keeps it separate from this session.
         this.publish({ tasks, notices, problem: undefined });
       }
     } catch { if (!signal.aborted) this.publish({ problem: '任务状态暂时无法更新，正在重试。' }); }
