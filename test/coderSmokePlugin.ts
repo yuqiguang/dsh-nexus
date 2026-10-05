@@ -296,7 +296,7 @@ export function apply(ctx: Context, config: { phase: number; workspace: string; 
     assert.equal(audits[5]!.usage?.reasoningTokens, 2048);
     assert.equal(audits[6]!.attempt, 2);
     assert.equal(audits[6]!.input, audits[4]!.input, 'retry uses identical evidence without dispatching work');
-    assert.equal(audits[4]!.input, JSON.stringify(input));
+    assert.deepEqual(JSON.parse(audits[4]!.input!), input);
     assert.match(audits[1]!.output!, /"safe":true/);
     assert.equal(agent.session.snapshotEvents().length, events.length, 'auxiliary review does not change the conversation log');
     assert.equal(model.calls, 7, 'the tool-less reviewer does not create another agent turn');
