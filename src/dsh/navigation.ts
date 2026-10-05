@@ -16,7 +16,7 @@ export class ChannelNavigation {
   private readonly modelMenus = new Map<string, { at: number; choices: ModelSelection[] }>();
   constructor(private readonly ctx: Context, private readonly workspace: string, private readonly roster: SessionRosterView | undefined,
     private readonly signal: AbortSignal, private readonly now: () => number,
-    private readonly waiting: (chatId: string, base: string) => Promise<boolean>,
+    private readonly waiting: (chatId: string, sessions: readonly string[]) => Promise<boolean>,
     private readonly selected: (base: string, chatId: string) => void) {}
 
   private async eligible(base: string): Promise<SessionSummary[]> {
@@ -58,13 +58,13 @@ export class ChannelNavigation {
       const row = rows.find(item => item.sessionId === target);
       if (!row) return '该会话不可切换：仅允许当前聊天、当前目录下未归档且仍存在的会话。';
       if (target === current) return `当前已经是会话 ${command.value}。`;
-      if (await this.waiting(chatId, base) || !await this.idle((await this.ctx.sessionController.list({}, this.signal)).items.find(item => item.sessionId === current)) || !await this.idle(row)) return BUSY;
+      if (await this.waiting(chatId, [current, target]) || !await this.idle((await this.ctx.sessionController.list({}, this.signal)).items.find(item => item.sessionId === current)) || !await this.idle(row)) return BUSY;
       // Revalidate after asynchronous inspection, before making the durable routing change.
       const checked = await this.eligible(base);
-      if (!checked.some(item => item.sessionId === target) || checked.some(item => (item.sessionId === target || item.sessionId === current) && item.running) || await this.waiting(chatId, base)) return BUSY;
+      if (!checked.some(item => item.sessionId === target) || checked.some(item => (item.sessionId === target || item.sessionId === current) && item.running) || await this.waiting(chatId, [current, target])) return BUSY;
       this.signal.throwIfAborted();
       // Hold attached agents idle through the routing commit; never resolve a cold target just to switch it.
-      const commit = async () => { await this.roster!.select(base, target); this.selected(base, chatId); };
+      const commit = async () => { if (await this.waiting(chatId, [current, target])) throw new Error('navigation_busy'); await this.roster!.select(base, target); this.selected(base, chatId); };
       const targetAgent = this.ctx.agents?.get(target);
       const currentAgent = this.ctx.agents?.get(current);
       const holdTarget = () => targetAgent ? targetAgent.runMaintenance(commit) : commit();
@@ -94,7 +94,7 @@ export class ChannelNavigation {
       selection = menu.choices[Number(command.value) - 1];
     } else selection = choices.find(model => `${model.provider}/${model.model}` === command.value);
     if (!selection || !choices.some(model => model.provider === selection!.provider && model.model === selection!.model)) return '该模型当前不可用，请发送“/ml”重新选择。';
-    if (await this.waiting(chatId, base) || !await this.idle(row)) return BUSY;
+    if (await this.waiting(chatId, [current]) || !await this.idle(row)) return BUSY;
     // Never adopt an excluded (moved/archived) session while selecting a model.
     if (!row) {
       const all = (await this.ctx.sessionController.list({}, this.signal)).items;
@@ -106,7 +106,7 @@ export class ChannelNavigation {
     const selected = await resolved.agent.runMaintenance(async signal => {
       signal.throwIfAborted();
       this.signal.throwIfAborted();
-      if (await this.waiting(chatId, base)) throw new Error('navigation_busy');
+      if (await this.waiting(chatId, [current])) throw new Error('navigation_busy');
       if (resolved.agent.inbox.nextTurn.length || resolved.agent.inbox.nextStep.length) throw new Error('navigation_busy');
       const result = await this.ctx.sessionController.selectModel({ sessionId: current, ...selection! });
       if (!await this.ctx.sessions.flush(resolved.agent.session)) throw new Error('model_selection_flush_failed');

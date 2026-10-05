@@ -159,7 +159,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
   ctx.effect(() => () => { void store.close(); });
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_brief',
-    description: '记录和查看编码需求的目标、共同约束与验收项。复杂需求先保存说明单，普通修复无需创建；默认一个完整任务，确需独立验收或阶段依赖时才 plan 拆分，每步声明验收项、前置步骤、验证和 outputs。先核实运行环境，项目初始化不能用改写测试掩盖服务启动失败。续接保留计划、约束和验收；目标变更先 impact 再 amend，失败用 recover，交付用 delivery 并按需 review。它不启动任务，也不创建、完成或恢复原生 goal；查询时汇总当前版本的任务和验证证据，不能把子任务完成当作整个目标完成。',
+    description: '记录和查看编码需求的目标、共同约束与验收项。复杂需求先保存说明单，局部小改动或普通修复无需创建；需要派发时以完整工作为单位，确需独立验收或阶段依赖时才 plan 拆分，每步声明验收项、前置步骤、验证和 outputs。先核实运行环境，项目初始化不能用改写测试掩盖服务启动失败。已有说明单的续接保留计划、约束和验收；目标变更先 impact 再 amend，失败用 recover，交付用 delivery 并按需 review。它不启动任务，也不创建、完成或恢复原生 goal；查询时汇总当前版本的任务和验证证据，不能把子任务完成当作整个目标完成。',
     parameters: {
       action: { type: 'string', enum: ['save', 'plan', 'get', 'list', 'delivery', 'review', 'recover', 'impact', 'amend'], required: true, description: 'save 新建或修改（清除旧步骤计划）；plan 保存完整步骤计划并检查覆盖、引用和循环依赖；get 查询覆盖；list 列表；delivery 交付汇总；review 用户验收；recover 恢复清单；impact 预览变更；amend 停止旧版活动任务后应用新版本。' },
       brief_id: { type: 'string', description: 'get 或修改时必填。' },

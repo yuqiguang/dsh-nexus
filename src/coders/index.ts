@@ -23,6 +23,7 @@ import { changeSummary } from './change-summary.js';
 import { DependencyError, dependencyIds, waitForDependencies } from './dependencies.js';
 import { taskStatusLabel } from './status.js';
 import { CoderQueue } from './queue.js';
+import { installWorkspaceAccess } from './workspace-access.js';
 import { createResearchBridge, type ResearchBridge, type ResearchWeb } from './research.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -258,6 +259,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   if (config.maxUserWaitMs !== undefined && (!Number.isSafeInteger(config.maxUserWaitMs) || config.maxUserWaitMs <= 0)) throw new Error('Invalid user wait timeout');
   if (!Number.isSafeInteger(maxQueued) || maxQueued < 0) throw new Error('Invalid coder queue limit');
   const queue = new CoderQueue(maxConcurrent);
+  const workspaceAccess = installWorkspaceAccess(ctx);
   if (config.manager) ctx.effect(() => config.manager!.onConcurrencyChange(limit => {
     maxConcurrent = limit;
     queue.setConcurrency(limit);
@@ -419,19 +421,32 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(taskId, current => ({ reviewDepth: (current.reviewDepth ?? 0) + 1 }));
       let release: (() => void) | undefined;
       let recorded = false;
-      let reviewSignal: AbortSignal | undefined;
+      let reviewSignal = AbortSignal.any([signal, shutdown.signal]);
       try {
-        step('DSH 审核排队中；等待不占用本次审核时限，可取消任务。');
-        const slot = await acquireReviewSlot(reviewQueue, AbortSignal.any([signal, shutdown.signal]));
-        release = slot.release;
-        reviewSignal = slot.signal;
         for (let attempt = 0; attempt < 2; attempt++) {
-          const preparation = await prepareReview(task, request, reviewEnvs.get(taskId));
-          const envelope = preparation.input;
+          let preparation = await prepareReview(task, request, reviewEnvs.get(taskId));
+          let envelope = preparation.input;
           if (!envelope) { escalationReason = preparation.reason; break; }
-          const cached = reviewCache.get(task, envelope);
+          let cached = reviewCache.get(task, envelope);
+          let deterministic = await readonlyReview(task, request, reviewEnvs.get(taskId));
+          if (!deterministic && !cached && !release) {
+            step('DSH 审核排队中；等待不占用本次审核时限，可取消任务。');
+            const slot = await acquireReviewSlot(reviewQueue, reviewSignal);
+            release = slot.release; reviewSignal = slot.signal;
+            // Admission may have taken minutes. Never send stale evidence or bypass a newly added owner rule.
+            const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)));
+            if (latest.layer === 'hard' || latest.layer === 'habit' && latest.verdict.decision === 'deny') return decide(taskId, request, signal);
+            if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
+            const queuedTask = store.get(taskId);
+            if (config.manager?.current()?.autoApproveSafe === false || !queuedTask || !isActive(queuedTask) || queuedTask.stopReason) { escalationReason = '审核期间任务状态或自动审核设置已变化'; break; }
+            preparation = await prepareReview(task, request, reviewEnvs.get(taskId));
+            envelope = preparation.input;
+            if (!envelope) { escalationReason = preparation.reason; break; }
+            cached = reviewCache.get(task, envelope);
+            deterministic = await readonlyReview(task, request, reviewEnvs.get(taskId));
+          }
+          reviewSignal.throwIfAborted();
           step(`${cached ? 'DSH 正在核验已有安全结论' : 'DSH 正在审核'}：${oneLine(request.summary, 100)}`);
-          const deterministic = await readonlyReview(task, request, reviewEnvs.get(taskId));
           const result = deterministic ?? cached ?? await reviewUntilAborted(safetyReviewer(task, envelope, reviewSignal), reviewSignal);
           reviewSignal.throwIfAborted();
           const rechecked = await prepareReview(task, request, reviewEnvs.get(taskId));
@@ -799,15 +814,18 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     job.updateProgress(task.dependsOn?.length ? `等待前置任务验证通过：${task.dependsOn.join('、')}` : '排队中，尚未启动编码工具');
     const done = (async (): Promise<JobOutcome> => {
       let release: (() => void) | undefined;
+      let releaseWorkspace: (() => void) | undefined;
       try {
         if (task.dependsOn?.length) await waitForDependencies(task, id => store.get(id), id => completions.get(id), signal);
         job.updateProgress('排队中，尚未启动编码工具');
         let scope = await workspaceScope(task.cwd, signal);
         while (true) {
           release = await queue.acquire(signal, scope);
+          releaseWorkspace = await workspaceAccess.acquire(scope, signal);
           // A repository may have been initialized or moved while this job waited.
           const currentScope = await workspaceScope(task.cwd, signal);
           if (currentScope === scope) break;
+          releaseWorkspace(); releaseWorkspace = undefined;
           release(); release = undefined; scope = currentScope;
         }
         signal.throwIfAborted();
@@ -830,6 +848,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         return { status: status === 'cancelled' ? 'killed' : 'failed', detail, result: detail };
       } finally {
         projectRulesOf.delete(task.id); rootsOf.delete(task.id); reviewEnvs.delete(task.id); baselineOf.delete(task.id);
+        releaseWorkspace?.();
         release?.();
         completions.delete(task.id);
       }
@@ -840,7 +859,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_task',
-    description: '把完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行。派发后立即报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖必须执行成功且独立验证通过。短暂网络或限流在工具自身重试后最多自动续接原会话两次；额度或认证失败、等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。任务停止或完成后通过 resume_task_id 继续，失败恢复用 retry_task_id，仅复验用 verification_only。',
+    description: '将需深入调查、跨模块协调或持续执行的完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行；用户指定编码工具、后台跟进或宿主独立验收时也使用。范围明确、低风险且当前会话工具可短步骤完成并验证的局部改动直接处理，遵循当前会话权限与审批；相关已有任务优先插话或续接，不与活动任务同时修改同一工作树。派发后报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖须成功且独立验证通过。工具自身重试后，短暂网络或限流最多自动续接原会话两次；额度、认证失败或等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。结束后用 resume_task_id 续接，失败恢复用 retry_task_id，仅复验用 verification_only。',
     parameters: {
       coder: { type: 'string', enum: ['codex', 'claude'], description: '执行任务的工具：codex 或 claude（Claude Code）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
       description: { type: 'string', description: '无计划的新任务必填完整说明。有 plan_step 时省略，系统采用已保存的步骤说明；续接补充内容用 continuation，不重复抄写或修改计划。' },
@@ -989,8 +1008,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_status',
-    description: '查看编码任务的状态、当前动作、最近几步、升级次数、最近的决定和结果。不带 task_id 时列出最近的任务。',
-    parameters: { task_id: { type: 'string', description: '任务 ID；省略时返回最近 5 个任务。' } },
+    description: '查看编码任务的状态、当前动作、最近几步、升级次数、最近的决定和结果。不带 task_id 时只列当前会话最近的任务；include_history 可显式查同一渠道身份的历史任务。',
+    parameters: { task_id: { type: 'string', description: '任务 ID；省略时返回当前会话最近 5 个任务。' }, include_history: { type: 'boolean', description: '显式包含同一渠道身份的历史任务，并注明来源会话；默认不包含。' } },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: { text: { type: 'string', required: true } } },
       render: (_args, value) => [{ type: 'text', text: value.text }],
@@ -1001,6 +1020,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const task = store.get(args.task_id);
         if (!task || !sameChat(task.ownerSession, exec.agent.id)) throw new Error(`没有编码任务 ${args.task_id}。`);
         const lines = [`编码任务 ${task.id}：${taskStatusLabel(task)}（${CODER_NAMES[task.coder]}）`,
+          `来源会话：${task.ownerSession}（${task.ownerSession === exec.agent.id ? '当前会话' : '历史会话'}）`,
           ...(isActive(task) ? [runningFor(task)] : []),
           ...(currentActivity(task) ? [`当前：${currentActivity(task)}`] : []),
           ...(task.retry ? [retryText(task.retry), ...(task.retry.retryAt && task.retry.phase === 'waiting' ? [`预计重试时间：${clock(task.retry.retryAt)}`] : [])] : []),
@@ -1017,8 +1037,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
             `改动文件 ${task.result.changedFiles.length} 个${task.result.verification === 'not-run' || task.result.verifyOk === undefined ? '，尚未独立验证' : task.result.verifyOk ? '，验证通过' : '，验证失败'}`] : [])];
         return { text: lines.join('\n') };
       }
-      const tasks = store.list().filter(task => sameChat(task.ownerSession, exec.agent!.id)).slice(0, 5);
-      return { text: tasks.length ? tasks.map(task => `${task.id} ${taskStatusLabel(task)} [${CODER_NAMES[task.coder]}] — ${clip(task.description, 80)}${task.status === 'waiting-user' && task.pending ? `\n  等待用户回答：${task.pending.summary}` : ''}${currentActivity(task) ? `\n  当前：${currentActivity(task)}` : ''}`).join('\n') : '还没有编码任务。' };
+      const tasks = store.list().filter(task => task.ownerSession === exec.agent!.id || args.include_history === true && sameChat(task.ownerSession, exec.agent!.id)).slice(0, 5);
+      return { text: tasks.length ? tasks.map(task => `${task.id} ${taskStatusLabel(task)} [${CODER_NAMES[task.coder]}] [${task.ownerSession === exec.agent!.id ? '当前会话' : '历史会话'}：${task.ownerSession}] — ${clip(task.description, 80)}${task.status === 'waiting-user' && task.pending ? `\n  等待用户回答：${task.pending.summary}` : ''}${currentActivity(task) ? `\n  当前：${currentActivity(task)}` : ''}`).join('\n') : '还没有编码任务。' };
     },
   })));
 
@@ -1027,7 +1047,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     description: '在 Codex 任务运行中补充执行细节，不改变已保存目标、约束和验收；关联说明单的实质变更必须先 coder_brief impact/amend，不能用本工具绕过版本。转交补充时不停下任务：默认并入当前这一回合，Codex 下一步就会看到；interrupt 为 true 时先打断正在做的事（包括正在跑的命令），再以这段话开始下一回合，上下文都保留。先区分执行细节与目标变更。Claude Code 任务不支持，改用 job_kill 停下再用 coder_task 带 resume_task_id 续接。',
     parameters: {
       message: { type: 'string', required: true, description: '转给编码工具的话，写清楚要改什么，按用户原意，不要扩大。' },
-      task_id: { type: 'string', description: '任务 ID；省略时用正在运行的那个任务。' },
+      task_id: { type: 'string', description: '任务 ID；省略时仅在当前会话恰有一个可插话的 Codex 任务时自动选择；历史任务须明确指定 ID。' },
       interrupt: { type: 'boolean', description: '是否先打断正在做的事。用户说“停一下”“马上改”，或者它正在做的事本身就要作废时为 true；只是补充要求时省略。' },
     },
     output: {
@@ -1039,7 +1059,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       if (ctx.sandboxPolicy?.resolve({ session: exec.agent.session }).mode === 'read-only') throw new Error('只读会话不能调整编码任务。');
       const message = args.message.trim();
       if (!message) throw new Error('message 不能为空。');
-      const task = args.task_id ? store.get(args.task_id) : store.active().find(task => sameChat(task.ownerSession, exec.agent!.id) && task.status !== 'queued');
+      const candidates = args.task_id ? [] : store.active().filter(task => task.ownerSession === exec.agent!.id && task.coder === 'codex' && task.status !== 'queued' && task.status !== 'verifying' && !!liveOf.get(task.id)?.steer);
+      if (candidates.length > 1) throw new Error(`当前会话有多个可插话的任务，请指定 task_id：${candidates.map(task => task.id).join('、')}。`);
+      const task = args.task_id ? store.get(args.task_id) : candidates[0];
       if (!task || !sameChat(task.ownerSession, exec.agent.id)) throw new Error(args.task_id ? `没有编码任务 ${args.task_id}。` : '现在没有运行中的编码任务。');
       if (task.status === 'queued') throw new Error('任务仍在排队；要修改任务说明，请先用 job_kill 取消，再重新派发。');
       if (task.coder === 'claude') throw new Error('Claude Code 任务不支持运行中插话。用 job_kill 停下，再用 coder_task 带 resume_task_id 续接，Claude Code 会接着原来的会话。');

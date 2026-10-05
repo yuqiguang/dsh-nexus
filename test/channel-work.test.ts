@@ -52,3 +52,36 @@ for (const channel of ['wechat', 'feishu', 'wecom']) test(`${channel}: persisten
     assert.equal(restarted.remoteCall(owner, [...events, ...late], 'followup'), expected, 'tasks dispatched after a late reply inherit that scope');
   }
 });
+
+test('native job notices persist by message identity across job counter reuse, concurrent calls and restart', async () => {
+  const owner = `nexus-wechat-${'c'.repeat(32)}`;
+  const fixture = channelWorkFixture(), work = fixture.work;
+  const events = [...workEvents('wechat', true, 'remote'), ...workEvents('wechat', false, 'desktop', 2)];
+  const session = { id: owner, snapshotEvents: () => events };
+  const exec = (id: string) => ({ agent: { id: owner, session }, callId: id, rootCallId: id }) as never;
+  const registered = (id: string) => ({ type: 'registered', job: { id, owner } }) as never;
+  const notice = (id: string, job = 'bash-1') => ({ id, source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job} (bash: local check) finished completed.` }] }) as unknown as UserMessage;
+  let release!: () => void;
+  const remote = work.withCall(exec('remote'), async () => {
+    await new Promise<void>(resolve => { release = resolve; });
+    work.jobEvent(registered('bash-1'));
+  });
+  await work.withCall(exec('desktop'), async () => { work.jobEvent(registered('bash-2')); });
+  release(); await remote;
+  const original = notice('original'), desktop = notice('desktop', 'bash-2');
+  work.noticeMessage(owner, original); work.noticeMessage(owner, desktop);
+  assert.equal(work.remoteMessage(owner, original), true);
+  assert.equal(work.remoteMessage(owner, desktop), false);
+  assert.equal(work.remoteMessage(owner, notice('unknown')), false, 'job prose alone cannot establish notice identity');
+  await work.close();
+  const restored = fixture.reopen();
+  assert.equal(restored.remoteMessage(owner, original), true);
+  await restored.withCall(exec('desktop'), async () => restored.jobEvent(registered('bash-1')));
+  const reused = notice('reused'); restored.noticeMessage(owner, reused);
+  assert.equal(restored.remoteMessage(owner, reused), false, 'counter reuse does not inherit a previous remote grant');
+  assert.equal(restored.remoteMessage(owner, original), true, 'counter reuse does not rewrite an old queued notice');
+  const forged = { ...original, source: { kind: 'user' } } as UserMessage;
+  assert.equal(restored.remoteMessage(owner, forged), false);
+  assert.equal(restored.remoteMessage(`${owner}-1`, original), false);
+  await restored.close();
+});

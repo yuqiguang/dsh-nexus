@@ -39,7 +39,7 @@ import { UPDATE_IDLE_MS } from './updates/package.js';
 import { createRequire } from 'node:module';
 import { startLifecycle } from './service/lifecycle.js';
 import { ChannelError, type ChannelId, type ConnectionRecord } from './channels/types.js';
-import { identity, sameChat } from './channels/protocol.js';
+import { identity } from './channels/protocol.js';
 import { isActive, type TaskRecord } from './coders/types.js';
 import { readFeishuConfig } from './feishu/config.js';
 import { LarkTransport } from './feishu/larkTransport.js';
@@ -154,11 +154,13 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
   ctx.effect(() => () => { void sessions.close(); });
   const channelWork = await ChannelWork.open(ctx.storageDomain, sessions);
   ctx.effect(() => () => { void channelWork.close(); });
+  ctx.effect(() => ctx.jobs.events.subscribe({ owners: 'scope' }, event => channelWork.jobEvent(event)));
+  ctx.on('agent/inbox/inserted', ({ agent, message }) => channelWork.noticeMessage(agent.id, message, report));
   ctx.on('tools/pre-execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
   ctx.on('tools/execute', (exec, next) => channelWork.withCall(exec, next), { prepend: true });
   let coderTasks: (() => readonly TaskRecord[]) | undefined;
   const channels = await installChannels(ctx, workspace, legacy, undefined, registry, { ledger, timeZone, files, sessions, channelWork,
-    busy: async base => (coderTasks?.() ?? []).some(task => isActive(task) && sameChat(task.ownerSession, base)),
+    busy: async sessionIds => (coderTasks?.() ?? []).some(task => isActive(task) && sessionIds.includes(task.ownerSession)),
     memory: { remember: (text, sessionId) => ctx.get('nexusMemoryRuntime')?.summarize(text, sessionId) ?? Promise.resolve(undefined) },
     transcribe: (wav, signal) => assistant ? assistant.transcribe(wav, signal) : Promise.reject(new ChannelError('speech_not_configured')) });
   installUntrustedResults(ctx);

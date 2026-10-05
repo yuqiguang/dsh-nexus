@@ -879,7 +879,8 @@ test('a chat\'s tasks stay readable and continuable after the chat rotates to a 
   await harness.jobs.at(-1)!.done;
   assert.equal(harness.tasks.get(first.task_id!)!.ownerSession, `${chat}-6`, 'the task stays with the session that ran it');
   assert.match((await harness.run('coder_status', { task_id: first.task_id }, `${chat}-7`)).text!, new RegExp(first.task_id!));
-  assert.match((await harness.run('coder_status', {}, `${chat}-7`)).text!, new RegExp(first.task_id!));
+  assert.equal((await harness.run('coder_status', {}, `${chat}-7`)).text, '还没有编码任务。');
+  assert.match((await harness.run('coder_status', { include_history: true }, `${chat}-7`)).text!, new RegExp(`历史会话：${chat}-6`));
   // "换成 claude 接着做" said in the newer generation continues the older generation's task instead of dispatching a duplicate.
   const resumed = await harness.run('coder_task', { description: 'add the env loader', resume_task_id: first.task_id }, `${chat}-7`);
   await harness.jobs.at(-1)!.done;
@@ -1096,7 +1097,83 @@ test('cancelling a task releases a reviewer that ignores its signal and cannot a
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('coder_status shows what a running task is doing and its last steps; routine writes are allowed without asking; a stopped task has no current step', async () => {
+test('deterministic and cached approvals finish while another model review still holds the slot', { skip: process.platform !== 'linux' }, async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-review-fast-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, 'fast.cjs'), 'console.log("fast fixture")');
+  await writeFile(join(cwd, 'slow.cjs'), 'console.log("slow fixture")');
+  await writeFile(join(cwd, 'read.txt'), 'read fixture');
+  let send!: (id: string, command: string) => void, finish!: () => void, reviewing = false;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const reviewed: string[] = [];
+  const fake = fakeCodex(io => {
+    send = (id, command) => io.push({ jsonrpc: '2.0', id, method: 'item/commandExecution/requestApproval', params: { command, cwd } });
+    io.onWrite(message => {
+      if (message.method === 'initialize') io.reply(message.id, {});
+      if (message.method === 'thread/start') io.reply(message.id, { thread: { id: 'fast-path' } });
+      if (message.method === 'turn/start') io.reply(message.id, { turn: { id: 'turn', status: 'inProgress' } });
+    });
+  });
+  const harness = coderHarness(undefined, cwd);
+  t.after(async () => { finish(); for (const job of harness.jobs) job.cancel('fixture cleanup'); await Promise.all(harness.jobs.map(job => job.done)); });
+  await installCoders(harness.ctx, { roots: [cwd], defaultCoder: 'codex', securityMode: 'standard', spawnCodex: () => fake.process, safetyReviewer: async (_task, input) => {
+    reviewed.push(input.operation);
+    if (input.operation.includes('slow.cjs')) { reviewing = true; await gate; }
+    return { safe: true, repeatable: true, reason: 'fixture evidence verified' };
+  } });
+  await harness.run('coder_task', { description: 'local checks' });
+  await until(() => fake.sent.some(message => message.method === 'turn/start'), 'Codex started');
+  const accepted = (id: string) => fake.sent.some(message => message.id === id && (message.result as { decision?: string })?.decision === 'accept');
+  send('prime', 'node fast.cjs'); await until(() => accepted('prime'), 'prime cache');
+  send('slow', 'node slow.cjs'); await until(() => reviewing, 'slow model holds slot');
+  send('read', '/usr/bin/cat read.txt'); send('cached', 'node fast.cjs');
+  await until(() => accepted('read') && accepted('cached'), 'fast paths bypass held model slot');
+  assert.equal(accepted('slow'), false);
+  assert.equal(reviewed.length, 2, 'only priming and the slow request invoke the reviewer');
+  finish(); await until(() => accepted('slow'), 'model completes');
+});
+
+test('model queue admission refreshes evidence and obeys newly added deny rules before calling the reviewer', async t => {
+  for (const mode of ['changed', 'deny', 'cancel'] as const) await t.test(mode, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'nexus-review-admit-'));
+    let release!: () => void, slowStarted = false, queued = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const harness = coderHarness(undefined, cwd);
+    const reviewed: string[] = [];
+    const cancel = new AbortController();
+    try {
+      await writeFile(join(cwd, 'slow.cjs'), 'console.log("slow")');
+      await writeFile(join(cwd, 'check.cjs'), 'console.log("before-fixture")');
+      const query = scriptedQuery(async function* (options) {
+        const slow = options.canUseTool('Bash', { command: 'node slow.cjs' }, { signal: options.abortController.signal });
+        await until(() => slowStarted, 'slow reviewing');
+        const next = options.canUseTool('Bash', { command: 'node check.cjs' }, { signal: cancel.signal });
+        queued = true;
+        const decision = await next;
+        assert.equal(decision.behavior, mode === 'changed' ? 'allow' : 'deny');
+        await slow;
+        yield { type: 'result', subtype: 'success', result: 'fixture complete' };
+      });
+      await installCoders(harness.ctx, { roots: [cwd], defaultCoder: 'claude', query, safetyReviewer: async (_task, input) => {
+        reviewed.push(input.operation);
+        if (input.operation.includes('slow.cjs')) { slowStarted = true; await gate; }
+        else assert.match(JSON.stringify(input.evidence), /after-fixture/);
+        return { safe: true, reason: 'fixture check' };
+      } });
+      const id = (await harness.run('coder_task', { description: 'check fixture' })).task_id!;
+      await until(() => queued && harness.tasks.get(id)?.reviewDepth === 2, 'two concurrent approval requests');
+      if (mode === 'changed') await writeFile(join(cwd, 'check.cjs'), 'console.log("after-fixture")');
+      else if (mode === 'deny') harness.rules.set('late-deny', { id: 'late-deny', kind: 'command', pattern: 'node check.cjs', decision: 'deny', source: 'user', createdAt: Date.now() });
+      else cancel.abort();
+      release(); await harness.jobs[0]!.done;
+      assert.equal(harness.tasks.get(id)!.status, 'completed', harness.tasks.get(id)!.result?.detail);
+      assert.equal(reviewed.length, mode === 'changed' ? 2 : 1);
+      assert.equal(harness.asked.length, 0);
+    } finally { release(); for (const job of harness.jobs) job.cancel('fixture cleanup'); await Promise.all(harness.jobs.map(job => job.done)); await rm(cwd, { recursive: true, force: true }); }
+  });
+});
+
+test('coder_status shows what a running task is doing and its last steps; routine writes are allowed without asking; a stopped task has no current step', async t => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-activity-'));
   let finishTurn: () => void = () => {};
   const fake = fakeCodex(io => {
@@ -1116,6 +1193,7 @@ test('coder_status shows what a running task is doing and its last steps; routin
     });
   });
   const harness = coderHarness();
+  t.after(async () => { for (const job of harness.jobs) job.cancel('fixture cleanup'); await Promise.all(harness.jobs.map(job => job.done)); });
   await installCoders(harness.ctx, { securityMode: 'strict', roots: [workdir], defaultCoder: 'codex', spawnCodex: () => fake.process });
   const dispatched = await harness.run('coder_task', { description: '修一下 a.ts', cwd: workdir });
   const id = dispatched.task_id!;
@@ -1140,7 +1218,7 @@ test('coder_status shows what a running task is doing and its last steps; routin
   assert.match(text, /当前：改文件：src\/a\.ts/);
   assert.match(text, /最近几步：\n- \S+ 执行：OPENAI_API_KEY=\*\*\* npm test\n- \S+ 改文件：src\/a\.ts/);
   assert.match(text, /常规操作自动放行 1 次/);
-  assert.match((await harness.run('coder_status', {})).text!, new RegExp(`${id} 运行中 \\[Codex\\] — 修一下 a\\.ts\\n  当前：改文件：src/a\\.ts`));
+  assert.match((await harness.run('coder_status', {})).text!, new RegExp(`${id} 运行中 \\[Codex\\] \\[当前会话：[^\\]]+\\] — 修一下 a\\.ts\\n  当前：改文件：src/a\\.ts`));
 
   finishTurn();
   const outcome = await harness.jobs[0]!.done;
@@ -1342,6 +1420,9 @@ test('coder_steer reaches the running Codex task, records what the user added, a
   const chat = `nexus-wechat-${'a'.repeat(32)}`;
   harness.tasks.set(id, { ...original, ownerSession: `${chat}-1` });
   Object.assign(harness.session, { header: { cwd: workdir } });
+  const beforeImplicit = fake.sent.filter(message => message.method === 'turn/steer').length;
+  await assert.rejects(harness.run('coder_steer', { message: '未指定旧任务' }, `${chat}-2`), /没有运行中/);
+  assert.equal(fake.sent.filter(message => message.method === 'turn/steer').length, beforeImplicit);
   assert.match((await harness.run('coder_steer', { task_id: id, message: '同一项目继续' }, `${chat}-2`)).text!, /已转给/);
   const otherWorkspace = join(workdir, 'other-project');
   await mkdir(otherWorkspace);
@@ -1363,6 +1444,33 @@ test('coder_steer reaches the running Codex task, records what the user added, a
   await assert.rejects(harness.run('coder_steer', { message: '再改', task_id: id }), /编码工具已经停下。要接着改，用 coder_task 带 resume_task_id 续接/);
   harness.tasks.set('ct-claude', task({ id: 'ct-claude', cwd: workdir, status: 'running' }));
   await assert.rejects(harness.run('coder_steer', { message: '改', task_id: 'ct-claude' }), /Claude Code 任务不支持运行中插话/);
+});
+
+test('implicit steering refuses two live Codex candidates and explicit selection reaches only the chosen task', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-steer-choice-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const name of ['a', 'b']) await mkdir(join(root, name));
+  const fakes: ReturnType<typeof fakeCodex>[] = [];
+  const harness = coderHarness(undefined, root);
+  t.after(async () => { for (const job of harness.jobs) job.cancel('fixture cleanup'); await Promise.all(harness.jobs.map(job => job.done)); });
+  await installCoders(harness.ctx, { roots: [root], maxConcurrent: 2, defaultCoder: 'codex', spawnCodex: () => {
+    const fake = fakeCodex(io => io.onWrite(message => {
+      if (message.method === 'initialize') io.reply(message.id, {});
+      if (message.method === 'thread/start') io.reply(message.id, { thread: { id: `thread-${fakes.length}` } });
+      if (message.method === 'turn/start') io.reply(message.id, { turn: { id: 'turn', status: 'inProgress' } });
+      if (message.method === 'turn/steer') io.reply(message.id, { turnId: 'turn' });
+    }));
+    fakes.push(fake); return fake.process;
+  } });
+  const a = await harness.run('coder_task', { description: 'A', cwd: join(root, 'a') });
+  const b = await harness.run('coder_task', { description: 'B', cwd: join(root, 'b') });
+  await until(() => fakes.length === 2 && fakes.every(fake => fake.sent.some(message => message.method === 'turn/start')), 'two Codex turns');
+  await assert.rejects(harness.run('coder_steer', { message: 'ambiguous' }), error => {
+    assert.match(String(error), /多个可插话/); assert.ok(String(error).includes(a.task_id!) && String(error).includes(b.task_id!)); return true;
+  });
+  assert.equal(fakes.flatMap(fake => fake.sent).filter(message => message.method === 'turn/steer').length, 0);
+  assert.match((await harness.run('coder_steer', { task_id: a.task_id, message: 'only A' })).text!, /已转给/);
+  assert.equal(fakes.flatMap(fake => fake.sent).filter(message => message.method === 'turn/steer').length, 1);
 });
 
 test('coder_task refuses a verify command that needs a shell; coder_status says when the coder has done nothing visible yet', async () => {

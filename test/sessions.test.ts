@@ -137,7 +137,7 @@ test('assistant settings keep rotation with validation and expose it in the view
 
 /** A bridge over fake sessions whose logs the test controls, with a roster and a memory sink. */
 function bridgeFixture(options: { channel?: 'wechat' | 'feishu' | 'wecom'; knownChats?: () => Promise<readonly string[]>; rotation?: { daily: boolean; contextTokens: number }; roster?: boolean; failCreate?: (sessionId: string) => boolean; failFlush?: (sessionId: string) => boolean; failAttach?: (sessionId: string) => boolean; failList?: boolean; sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
-  heartbeatMs?: number; busy?: (base: string) => Promise<boolean>;
+  heartbeatMs?: number; busy?: (sessions: readonly string[]) => Promise<boolean>;
   formerBases?: () => Promise<string[]>; onResolve?: (id: string, session: { append(type: string, data: unknown): unknown }) => void } = {}) {
   let clock = T0;
   const owner = { channel: options.channel ?? 'wechat', accountId: 'rot-bot', ownerId: 'rot-owner' };
@@ -858,6 +858,28 @@ test('active background work blocks both selectors, while a first model selectio
   assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
 });
 
+test('selectors check only current and target task owners, not an unrelated historical session', async t => {
+  const active = new Set<string>();
+  const f = bridgeFixture({ busy: async sessions => sessions.some(id => active.has(id)) });
+  const bridge = await f.make(); t.after(() => bridge.close());
+  f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'first', 'done', T0));
+  await bridge.receive(f.inbound('new-one', '/new'));
+  f.sessionOf(`${f.base}-1`).snapshotEvents().push(...userTurn(1, 'second', 'done', T0));
+  await bridge.receive(f.inbound('new-two', '/new'));
+  active.add(f.base);
+  await bridge.receive(f.inbound('switch-idle', '/s 1'));
+  assert.equal((await f.roster).activeFor(f.base), `${f.base}-1`);
+  await bridge.receive(f.inbound('model-idle', '/m first/chat'));
+  assert.equal(f.selections.length, 1);
+  await bridge.receive(f.inbound('target-busy', '/s 0'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  active.add(`${f.base}-1`);
+  await bridge.receive(f.inbound('current-busy', '/s 2'));
+  assert.match(f.texts.at(-1)!, /仍在执行/);
+  await bridge.receive(f.inbound('model-busy', '/m second/chat'));
+  assert.equal(f.selections.length, 1);
+});
+
 test('failed routing persistence keeps the old active session; an execution starting during model resolution prevents selection', async t => {
   const f = bridgeFixture(); const bridge = await f.make(); t.after(() => bridge.close());
   f.sessionOf(f.base).snapshotEvents().push(...userTurn(1, 'first', 'done', T0));
@@ -958,6 +980,40 @@ test('Feishu restores owner-admitted chat routes before a new message without re
 });
 
 for (const channel of ['wechat', 'feishu', 'wecom'] as const) {
+  test(`${channel}: native bash completion follows its original source after /new`, async t => {
+    const f = bridgeFixture({ channel }); const bridge = await f.make(); t.after(() => bridge.close());
+    const old = f.sessionOf(f.base), agent = { id: f.base, session: old };
+    old.append('turn/start', { turn: 1 });
+    old.append('user/message', { source: { kind: 'user', rpcId: `${channel}-admitted` }, content: [] });
+    old.append('tool/call', { turn: 1, callId: 'remote-bash', name: 'bash', arguments: '{}' });
+    await f.channelWork.withCall({ agent, callId: 'remote-bash', rootCallId: 'remote-bash' } as never, async () => {
+      f.channelWork.jobEvent({ type: 'registered', job: { id: 'bash-1', owner: f.base } } as never);
+    });
+    old.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    await bridge.receive(f.inbound('prime-bash', 'before'));
+    await bridge.receive(f.inbound('new-bash', '/new'));
+    old.append('turn/start', { turn: 2 });
+    old.append('user/message', { source: { kind: 'user' }, content: [] });
+    old.append('tool/call', { turn: 2, callId: 'desktop-bash', name: 'bash', arguments: '{}' });
+    await f.channelWork.withCall({ agent, callId: 'desktop-bash', rootCallId: 'desktop-bash' } as never, async () => {
+      f.channelWork.jobEvent({ type: 'registered', job: { id: 'bash-2', owner: f.base } } as never);
+    });
+    old.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    for (const [turn, jobId, marker] of [[3, 'bash-1', 'REMOTE-BASH-RESULT'], [4, 'bash-2', 'DESKTOP-BASH-RESULT']] as const) {
+      const result = pushedTurn(turn, `background job ${jobId} (bash: fixture) finished completed`, marker, T0);
+      for (const event of result) if (event.type === 'user/message') {
+        event.data = { ...event.data, id: `notice-${jobId}`, source: { kind: 'tool-jobs', form: 'notice' } };
+        f.channelWork.noticeMessage(f.base, event.data);
+      }
+      old.snapshotEvents().push(...result); f.marks.set(f.base, turn - 1);
+      bridge.onEvent(old as never, old.snapshotEvents().at(-1)); await bridge.drain();
+    }
+    assert.ok(f.texts.some(text => text.includes('REMOTE-BASH-RESULT')));
+    assert.ok(!f.texts.some(text => text.includes('DESKTOP-BASH-RESULT')));
+    await bridge.receive(f.inbound('after-bash', 'ordinary reply'));
+    assert.equal(f.prompts.at(-1)?.sessionId, `${f.base}-1`);
+  });
+
   test(`${channel}: desktop work after /new keeps its approvals, questions, receipts and completion local`, async t => {
     const f = bridgeFixture({ channel }); const bridge = await f.make(); t.after(() => bridge.close());
     const old = f.sessionOf(f.base);

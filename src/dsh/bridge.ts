@@ -52,7 +52,7 @@ export interface BridgeExtras {
   /** @deprecated Retained for integration compatibility; automatic empty-session rotation is disabled. */
   rotation?: () => RotationSettings;
   /** Whether background coding work is active; explicit navigation waits for it. */
-  busy?: (baseSessionId: string) => Promise<boolean>;
+  busy?: (sessionIds: readonly string[]) => Promise<boolean>;
   /** Where the digest of a session that was just replaced goes (long-term memory). */
   memory?: { remember(text: string, sessionId: string): Promise<unknown> };
   /** The chat's base sessions under earlier bindings of the same person (WeChat: earlier bot accounts); their reminders are carried over once. */
@@ -96,7 +96,7 @@ export class DshChannelBridge {
     private readonly extras: BridgeExtras = {},
   ) {
     this.navigation = new ChannelNavigation(ctx, workspace, extras.sessions, this.lifetime.signal, now,
-      async (chatId, base) => this.replies.hasPending(chatId) || this.questions.hasPending(chatId) || await (extras.busy?.(base) ?? Promise.resolve(false)),
+      async (chatId, sessions) => this.replies.hasPending(chatId) || this.questions.hasPending(chatId) || await (extras.busy?.(sessions) ?? Promise.resolve(false)),
       (base, chatId) => { this.route(SessionId(base), chatId); });
     // WeChat and WeCom private chats are addressed by the owner's own id, so their session is routable before any message arrives.
     // Feishu chat ids are only learned from an inbound message.

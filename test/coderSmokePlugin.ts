@@ -56,6 +56,7 @@ class FixtureModel extends LlmAdapter {
     yield { type: 'finish', reason: { kind: 'stop' } };
   }
   emptyReviewNext = false;
+  nativeJobReplies = false;
   errors: string[] = [];
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     try { yield* this.script(options); }
@@ -81,6 +82,7 @@ class FixtureModel extends LlmAdapter {
     const prompt = [options.system ?? '', ...options.messages.flatMap(message => message.content.flatMap(block =>
       block.type === 'text' ? [block.text] : []))].join('\n');
     assert.match(prompt, /用 coder_task[^\n]*本机编码工具/, 'system prompt must describe coder_task');
+    if (this.nativeJobReplies) { yield* this.text('原生后台命令已结束。'); return; }
     const step = this.calls++;
     if (step === 0) {
       yield* this.toolCall('brief', 'coder_brief', { action: 'save', objective: '检查目录并准备后续工作', constraints: '不修改已有文件', acceptance: ['目录检查通过', '后续业务验收'] });
@@ -129,6 +131,8 @@ class FixtureModel extends LlmAdapter {
 
 export async function apply(ctx: Context, config: { phase: number; workspace: string; triggerFile: string; reportFile: string }): Promise<void> {
   const channelWork = await ChannelWork.open(ctx.storageDomain);
+  ctx.effect(() => ctx.jobs.events.subscribe({ owners: 'scope' }, event => channelWork.jobEvent(event)));
+  ctx.on('agent/inbox/inserted', ({ agent, message }) => channelWork.noticeMessage(agent.id, message));
   ctx.effect(() => () => channelWork.close());
   let nativeTaskQuestions = 0;
   const model = new FixtureModel();
@@ -219,6 +223,13 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(claude.started, 1);
     const [task] = store.list();
     assert.ok(task);
+    const blocked = await ctx.tools.execute({ name: 'write', arguments: { file_path: join(task.cwd, 'blocked-direct.txt'), content: 'must not be written' },
+      agent, callId: ToolCallId('smoke-conflicting-write'), signal: new AbortController().signal });
+    assert.equal(blocked.isError, true);
+    assert.match(JSON.stringify(blocked.content), /工作区正在执行/);
+    const readable = await ctx.tools.execute({ name: 'read', arguments: { file_path: join(task.cwd, 'README.md') },
+      agent, callId: ToolCallId('smoke-read-during-coder'), signal: new AbortController().signal });
+    assert.equal(readable.isError, false, 'native reads remain usable during coder work');
     assert.equal(task.status, 'running');
     assert.equal(channelWork.isRemote(task.id, sessionId), true, 'native dispatch records channel provenance');
     assert.equal(channelWork.get(task.id)?.jobId, task.jobId);
@@ -319,10 +330,27 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.deepEqual(failures, []);
     assert.ok(nativeTaskQuestions > 0, 'native userQuestions.ask preserves the scoped delivery association');
     assert.ok(nativeNotice.type === 'user/message' && channelWork.remoteMessage(sessionId, nativeNotice.data), 'native completion label resolves the original task');
+    model.nativeJobReplies = true;
+    await writeFile(join(task.cwd, 'background-fixture.cjs'), 'const fs=require("node:fs"); const timer=setInterval(()=>{if(fs.existsSync("background-release")){clearInterval(timer);process.exit(0);}},20);setTimeout(()=>process.exit(1),10000);');
+    const background = await ctx.tools.execute({ name: 'bash', arguments: { command: 'node background-fixture.cjs', description: 'Local background lifecycle fixture', run_in_background: true },
+      agent, callId: ToolCallId('smoke-native-background'), rootCallId: ToolCallId(channelWork.get(task.id)!.rootCallId), signal: new AbortController().signal });
+    assert.equal(background.isError, false, JSON.stringify(background.content));
+    const locked = await ctx.tools.execute({ name: 'write', arguments: { file_path: join(task.cwd, 'blocked-background.txt'), content: 'must not be written' },
+      agent, callId: ToolCallId('smoke-background-write'), signal: new AbortController().signal });
+    assert.equal(locked.isError, true);
+    assert.match(JSON.stringify(locked.content), /工作区正在执行/);
+    await writeFile(join(task.cwd, 'background-release'), 'release');
+    await until(() => agent.session.snapshotEvents().some(event => event.type === 'user/message' && (event.data.source as { kind: string }).kind === 'tool-jobs' && JSON.stringify(event.data.content).includes('background job bash-')), 'native bash completion notice', 10_000);
+    await agent.whenIdle(); await bridge.drain();
+    const bashNotice = agent.session.snapshotEvents().findLast(event => event.type === 'user/message' && (event.data.source as { kind: string }).kind === 'tool-jobs' && JSON.stringify(event.data.content).includes('background job bash-'))!;
+    assert.ok(bashNotice.type === 'user/message' && channelWork.remoteMessage(sessionId, bashNotice.data), 'generic native jobs inherit their exact remote execution origin');
     await bridge.close();
     await channelWork.close();
     const restoredWork = await ChannelWork.open(ctx.storageDomain);
-    try { assert.equal(restoredWork.isRemote(task.id, sessionId), true); } finally { await restoredWork.close(); }
+    try {
+      assert.equal(restoredWork.isRemote(task.id, sessionId), true);
+      assert.ok(bashNotice.type === 'user/message' && restoredWork.remoteMessage(sessionId, bashNotice.data), 'generic native notice identity persists through reopen');
+    } finally { await restoredWork.close(); }
     await writeFile(join(model.coderCwd, 'local-check.cjs'), `const http=require('http'); const s=http.createServer((q,r)=>r.end('native-local')); s.listen(0,'127.0.0.1',async()=>{ const value=await fetch('http://127.0.0.1:'+s.address().port).then(r=>r.text()); if(value!=='native-local')process.exit(1);console.log(value);s.closeAllConnections();s.close(); });`);
     assert.match(await localCheck(ctx, model.coderCwd, sessionId, 'node local-check.cjs', undefined, new AbortController().signal), /native-local/);
     await store.close();
@@ -333,7 +361,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['native_direct_write_conflict_rejected_before_approval', 'native_read_available_during_coder', 'native_bash_job_keeps_workspace_lease', 'native_bash_notice_origin_persists_by_message_id', 'native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }
