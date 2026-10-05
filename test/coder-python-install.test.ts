@@ -16,7 +16,7 @@ test('explicit project virtualenv pip reaches review, not automatic permission; 
     await writeFile(join(venv, 'bin', 'python'), 'fixture executable, never executed');
     await writeFile(join(venv, 'Scripts', 'python.exe'), 'fixture executable, never executed');
     await writeFile(join(venv, 'pyvenv.cfg'), 'home = /usr/bin\ninclude-system-site-packages = false\n');
-    for (const command of ['.venv/bin/python -m pip install pypdf', '".venv/Scripts/python.exe" -m pip install pypdf']) {
+    for (const command of ['.venv/bin/python -m pip install pypdf', '".venv/Scripts/python.exe" -m pip install pypdf', '.venv//Scripts//python.exe -m pip install pypdf']) {
       const evidence = await projectPipEvidence(command, cwd);
       assert.ok(evidence);
       const req = codexCommandRequest({ command, cwd }, cwd);
@@ -26,7 +26,7 @@ test('explicit project virtualenv pip reaches review, not automatic permission; 
       assert.equal(hardRule(req, [cwd], false, true, cwd)?.manualOnly, true);
     }
     const command = '.venv/bin/python -m pip install pypdf';
-    for (const other of ['python -m pip install pypdf', 'pip install pypdf', command + ' --target /tmp/shared', command + ' --user', command + ' -t /tmp/shared', command + ' --prefix=/usr', command + '; pip install other', 'PIP_TARGET=/tmp/shared ' + command]) assert.equal(await projectPipEvidence(other, cwd), undefined, other);
+    for (const other of ['python -m pip install pypdf', 'pip install pypdf', command + ' --target /tmp/shared', command + ' --user', command + ' -t /tmp/shared', command + ' -t/tmp/shared', command + ' --prefix=/usr', command + '; pip install other', 'PIP_TARGET=/tmp/shared ' + command]) assert.equal(await projectPipEvidence(other, cwd), undefined, other);
     assert.equal(await projectPipEvidence(command, cwd, { PIP_CONFIG_FILE: '/tmp/settings' }), undefined);
     const initial = await projectPipEvidence(command, cwd);
     await writeFile(join(venv, 'pyvenv.cfg'), 'home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.12\n');

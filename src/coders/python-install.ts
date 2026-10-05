@@ -7,12 +7,12 @@ import { isInside, isProtectedPath } from './rules.js';
  * The reviewer still sees the entire shell expression, requested permissions and startup effects. */
 export async function projectPipEvidence(command: string, cwd: string, env?: NodeJS.ProcessEnv): Promise<string[] | undefined> {
   if ((command.match(/\bpip(?:3)?\s+install\b/gi) ?? []).length !== 1
-    || /(?:^|\s)-t(?:\s|=)|--(?:target|prefix|root|user|python|break-system-packages)\b|\bPIP_[A-Z_]+\b/i.test(command)
+    || /(?:^|\s)-t(?:\s|=|[^\s])|--(?:target|prefix|root|user|python|break-system-packages)\b|\bPIP_[A-Z_]+\b/i.test(command)
     || Object.entries(env ?? {}).some(([key, value]) => value && /^(?:PIP_(?:TARGET|PREFIX|ROOT|USER|PYTHON|CONFIG_FILE)|PYTHONHOME|PYTHONPATH)$/i.test(key))) return;
   // Only explicit interpreter paths qualify; activation/PATH aliases and bare pip stay manual.
   const match = /(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"';|&]+))\s+-m\s+pip\s+install\b/i.exec(command);
   const word = match && (match[1] ?? match[2] ?? match[3]);
-  if (!word || !/[\\/](?:bin[\\/]python(?:3(?:\.\d+)?)?|Scripts[\\/]python\.exe)$/i.test(word)) return;
+  if (!word || !/[\\/]+(?:bin[\\/]+python(?:3(?:\.\d+)?)?|Scripts[\\/]+python\.exe)$/i.test(word)) return;
   try {
     const executable = resolve(cwd, word);
     const venv = dirname(dirname(executable));
