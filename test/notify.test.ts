@@ -95,7 +95,7 @@ function coderContext(seed: TaskRecord[]) {
   const registered: string[] = [];
   const ctx = {
     effect(run: () => unknown) { run(); },
-    on(name: string) { assert.ok(['tools/pre-execute', 'session/event'].includes(name)); return () => {}; },
+    on(name: string) { assert.ok(['tools/pre-execute', 'tools/execute', 'session/event'].includes(name)); return () => {}; },
     storageDomain: { async open() { return domain; } },
     tools: { register(tool: { name: string }) { registered.push(tool.name); return () => {}; } },
     systemPrompt: { section() { return () => {}; }, getSectionOrder() { return 10; } },
