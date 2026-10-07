@@ -19,7 +19,7 @@ export interface WechatState {
   ownerId: string;
   cursor: string;
   contextToken?: string;
-  /** When the current context token arrived; iLink silently drops sends whose token is too old. */
+  /** When the current context token arrived; retained for diagnostics, not an inferred expiry limit. */
   contextAt?: number;
   contextRevision?: number;
   contextMessageId?: string;

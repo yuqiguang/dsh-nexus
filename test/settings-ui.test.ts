@@ -138,11 +138,11 @@ test('authenticated WeChat with refused sends shows reply recovery and numeric d
   assert.equal([...card.querySelectorAll('button')].find(button => button.textContent === '重试发送')!.disabled, true);
 });
 
-test('pending delivery cannot retry before authentication or with an expired reply window', async t => {
+test('pending delivery cannot retry before authentication or without reply context', async t => {
   for (const state of [
     { phase: 'reconnecting' as const, error: 'connection_failed', deliveryError: 'server_unavailable', expected: /等待连接通过认证/ },
     { phase: 'error' as const, error: 'authentication_failed', deliveryError: 'server_unavailable', expected: /原绑定账号重新扫码/ },
-    { phase: 'connected' as const, error: undefined, deliveryError: 'wechat_context_stale', expected: /原绑定微信账号发送一条新消息/ },
+    { phase: 'connected' as const, error: undefined, deliveryError: 'wechat_reply_context_missing', expected: /原绑定微信账号发送一条新消息/ },
   ]) {
     await t.test(`${state.phase}: ${state.deliveryError}`, async t => {
     const view = initial();
@@ -158,6 +158,21 @@ test('pending delivery cannot retry before authentication or with an expired rep
     assert.deepEqual(calls, ['list']);
     });
   }
+});
+
+test('a legacy context-age error explains the retired guard and permits retry', async t => {
+  const view = initial();
+  view.connections[0] = { ...view.connections[0]!, revision: 7, enabled: true, configured: true, secretConfigured: true,
+    phase: 'connected', pendingDeliveries: 1, deliveryError: 'wechat_context_stale' };
+  const calls: { method: string; payload: any }[] = [];
+  const ui = await page(t, async (method, payload) => { calls.push({ method, payload }); return structuredClone(view); });
+  const card = ui.dom.window.document.querySelector('article')!;
+  assert.match(card.textContent!, /旧版本曾因回复上下文年龄暂停发送/);
+  assert.doesNotMatch(card.textContent!, /19 小时|发送一条新消息/);
+  const retry = [...card.querySelectorAll('button')].find(button => button.textContent === '重试发送')!;
+  assert.equal(retry.disabled, false);
+  await act(async () => retry.click());
+  assert.deepEqual(calls.find(call => call.method === 'retry-delivery')?.payload, { channel: 'wechat', revision: 7 });
 });
 
 test('a channel workspace is edited in its own form, with the directory in effect as the current value', async t => {

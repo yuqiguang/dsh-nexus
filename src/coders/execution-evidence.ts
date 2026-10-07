@@ -4,7 +4,7 @@ import { builtinModules } from 'node:module';
 /** Observations for the evidence collector, never a shell evaluator or an authorization parser. */
 export type SourceLanguage = 'python' | 'javascript' | 'shell' | 'powershell';
 export interface ExecutionObservation {
-  sources: { path: string; language?: SourceLanguage }[];
+  sources: { path: string; language?: SourceLanguage; args?: string[] }[];
   inline: { code: string; language: SourceLanguage }[];
   packages: { manager: string; script: string }[];
   manifests: string[];
@@ -79,9 +79,10 @@ export function executionObservations(command: string, language: 'shell' | 'powe
     out.pytest.push(targets ?? null);
     if (targets === undefined) out.gaps.push('pytest 参数或目标未完整解析，项目扫描不能证明实际测试发现范围完整');
   };
-  const addSource = (word: Word | undefined, language?: SourceLanguage) => {
+  const addSource = (word: Word | undefined, language?: SourceLanguage, args?: Word[]) => {
     if (!word || !word.literal || /[$`*?{}]/.test(word.value)) { out.gaps.push('执行路径包含动态表达式，未静态展开'); return; }
-    out.sources.push({ path: word.value, language });
+    const literalArgs = !parsed.uncertain && !directoryChanged && args?.every(arg => arg.literal && !/[$`*?{}]/.test(arg.value));
+    out.sources.push({ path: word.value, language, ...(literalArgs ? { args: args!.map(arg => arg.value) } : {}) });
   };
   const merge = (other: ExecutionObservation) => {
     if (directoryChanged && other.pytest.length) {
@@ -131,9 +132,9 @@ export function executionObservations(command: string, language: 'shell' | 'powe
           if (lower === '-workingdirectory') directoryChanged = true;
           a++; continue;
         }
-        if (ps && ['-file', '-f'].includes(lower)) { addSource(args[a + 1], sourceLanguage); break; }
+        if (ps && ['-file', '-f'].includes(lower)) { addSource(args[a + 1], sourceLanguage, args.slice(a + 2)); break; }
         if (arg.startsWith('-') || js && ['run', 'test'].includes(lower)) continue;
-        addSource(args[a], sourceLanguage); break;
+        addSource(args[a], sourceLanguage, args.slice(a + 1)); break;
       }
     } else if (name === 'pytest') {
       addPytest(args);

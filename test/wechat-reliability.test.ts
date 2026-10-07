@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { WechatClient } from '../src/wechat/client.js';
 import { WechatRequestError } from '../src/wechat/errors.js';
-import { DEFAULT_CONTEXT_MAX_AGE_MS, WechatTransport, type WechatTransportOptions } from '../src/wechat/transport.js';
+import { WechatTransport, type WechatTransportOptions } from '../src/wechat/transport.js';
 import { MAX_DELIVERY_ATTEMPTS, WechatStateStore, type PendingText } from '../src/wechat/state.js';
 import { backoff, type Wait } from '../src/wechat/retry.js';
 import { ChannelError, type ConnectionRecord, type ConnectionState } from '../src/channels/types.js';
@@ -321,7 +321,7 @@ test('delivery records isolate owners and accounts and never silently discard an
   }
 });
 
-test('a reply context older than the verified age holds proactive sends until the next inbound message', async t => {
+test('scheduled output and live prompts use a saved context older than 19 hours without waiting for another message', async t => {
   let clock = 1_000_000;
   const records = new MemoryRecords();
   const first = fixture(records, grant, immediate, { now: () => clock });
@@ -330,22 +330,58 @@ test('a reply context older than the verified age holds proactive sends until th
   await first.transport.start(async () => {});
   await until(() => first.requests.length >= 2, 'poll did not run');
   assert.equal((await first.store.read()).contextAt, clock);
-  clock += DEFAULT_CONTEXT_MAX_AGE_MS + 60_000;
-  await first.transport.sendText(grant.ownerId, '重启后的汇报', 'notice-1', { durable: true });
-  await until(() => first.states.some(state => state.deliveryError === 'wechat_context_stale'), 'stale context not reported');
-  assert.equal(first.sent().length, 0, 'a stale token must not be used');
-  assert.equal((await first.store.read()).pending.length, 1);
-  await assert.rejects(first.transport.sendText(grant.ownerId, '交互提示', 'prompt-1'), /wechat_context_stale/);
-  // The owner writes again: the fresh token releases the held text with its original id.
-  first.feed(Response.json({ msgs: [message('m2', grant.ownerId, 'token-2')], get_updates_buf: 'c2' }));
-  await until(() => first.sent().length === 1, 'held delivery did not flush after a fresh token');
-  assert.equal(first.sent()[0].context_token, 'token-2');
-  assert.match(first.sent()[0].client_id, /^nexus:/);
+  const contextAt = clock;
+  clock += 24 * 60 * 60_000;
+  const news = '今日 AI 资讯\n' + '本地测试资讯。'.repeat(250);
+  await first.transport.sendText(grant.ownerId, news, 'daily-news', { durable: true });
   await until(async () => (await first.store.read()).pending.length === 0, 'delivery not recorded');
+  assert.equal(first.sent().length, 3);
+  assert.equal(first.sent().map(part => part.item_list[0].text_item.text).join(''), news);
+  await first.transport.sendText(grant.ownerId, '交互提示', 'prompt-1');
+  assert.equal(first.sent().length, 4);
+  assert.ok(first.sent().every(part => part.context_token === 'token-1'));
+  assert.equal((await first.store.read()).contextAt, contextAt, 'sending must not pretend a new owner message arrived');
+  assert.ok(first.states.every(state => !state.waitingForReply && state.deliveryError !== 'wechat_context_stale'));
   assert.equal(first.states.at(-1)?.deliveryError, undefined);
 });
 
-test('a reply context recorded before ages were kept is still used, and a fresh one within the limit is used at once', async t => {
+test('restart drains output held by the former age guard with the original parts and no new task', async t => {
+  const first = fixture();
+  await first.store.rememberContext('saved-context', 1_000_000, 'previous-message');
+  await first.store.enqueue('saved-news', '资讯内容。'.repeat(350));
+  const before = (await first.store.read()).pending[0] as PendingText;
+  await first.transport.stop();
+  const restored = fixture(first.records, grant, immediate, { now: () => 1_000_000 + 7 * 24 * 60 * 60_000 });
+  t.after(() => restored.transport.stop());
+  await restored.transport.start(async () => assert.fail('delivery recovery must not run a task'));
+  await until(async () => (await restored.store.read()).pending.length === 0, 'saved output was held by token age');
+  assert.deepEqual(restored.sent().map(part => ({ id: part.client_id, text: part.item_list[0].text_item.text })),
+    before.parts.map(part => ({ id: `nexus:${part.id}`, text: part.text })));
+  assert.ok(restored.sent().every(part => part.context_token === 'saved-context'));
+  assert.equal((await restored.store.read()).contextAt, 1_000_000);
+  assert.deepEqual((await restored.store.read()).delivered, ['saved-news']);
+});
+
+test('missing reply context keeps output pending and reports recovery until an owner message arrives', async t => {
+  const f = fixture(); t.after(() => f.transport.stop());
+  await f.transport.sendText(grant.ownerId, '待发资讯', 'no-context-news', { durable: true });
+  await f.transport.start(async () => {});
+  await until(() => f.states.at(-1)?.phase === 'connected', 'receive connection was not verified');
+  assert.equal(f.states.at(-1)?.deliveryError, 'wechat_reply_context_missing');
+  assert.equal(f.sent().length, 0);
+  await assert.rejects(f.transport.sendText(grant.ownerId, '交互提示', 'missing-context-prompt'), /wechat_reply_context_missing/);
+  f.feed(Response.json({ msgs: [message('foreign-context', 'stranger')], get_updates_buf: 'foreign' }));
+  await until(async () => (await f.store.read()).cursor === 'foreign', 'foreign update was not processed');
+  assert.equal(f.sent().length, 0);
+  assert.equal((await f.store.read()).pending.length, 1);
+  f.feed(Response.json({ msgs: [message('first-owner-message')], get_updates_buf: 'owner' }));
+  await until(async () => (await f.store.read()).pending.length === 0, 'owner message did not release pending output');
+  assert.equal(f.sent().length, 1);
+  assert.equal(f.sent()[0].item_list[0].text_item.text, '待发资讯');
+  assert.equal(f.states.at(-1)?.deliveryError, undefined);
+});
+
+test('a reply context recorded before ages were kept is still used', async t => {
   const records = new MemoryRecords();
   await fixture(records).store.rememberContext('legacy');
   const legacyKey = [...records.values.keys()][0]!;
@@ -380,9 +416,11 @@ test('WeChat rejection preserves only numeric diagnostics and distinguishes send
   }
 });
 
-test('send refusal pauses the whole outbox across restart and a new owner message with the same token restores only unsent parts', async t => {
-  const f = fixture(); t.after(() => f.transport.stop());
-  await f.store.rememberContext('same-token', Date.now(), 'old');
+test('refusal with an old context pauses the outbox across restart and an owner reply restores only unsent parts', async t => {
+  const contextAt = 1_000_000;
+  const options = { now: () => contextAt + 24 * 60 * 60_000 };
+  const f = fixture(undefined, undefined, immediate, options); t.after(() => f.transport.stop());
+  await f.store.rememberContext('same-token', contextAt, 'old');
   f.setSend(() => f.sent().length === 1 ? Response.json({ ret: 0 }) : Response.json({ ret: -54321 }));
   await f.transport.start(async () => assert.fail('no task should run'));
   await f.transport.sendText(grant.ownerId, '文'.repeat(1700), 'long-result', { durable: true });
@@ -395,11 +433,12 @@ test('send refusal pauses the whole outbox across restart and a new owner messag
   await assert.rejects(f.transport.retryPending(), /wechat_send_rejected/);
   assert.equal(f.sent().length, 2, 'no later item or approval should spend another API request');
   await f.transport.stop();
-  const restored = fixture(f.records); t.after(() => restored.transport.stop());
+  const restored = fixture(f.records, grant, immediate, options); t.after(() => restored.transport.stop());
   const admitted: string[] = [];
   await restored.transport.start(async incoming => { admitted.push(incoming.messageId); });
   await until(() => restored.requests.filter(r => r.path.endsWith('getupdates')).length >= 2, 'restored polling');
   assert.equal(restored.sent().length, 0, 'authentication and process restart must not reset the hold');
+  await assert.rejects(restored.transport.retryPending(), /wechat_send_rejected/);
   restored.feed(Response.json({ msgs: [message('foreign', 'stranger', 'same-token')], get_updates_buf: 'foreign' }));
   await until(async () => (await restored.store.read()).cursor === 'foreign', 'foreign update');
   assert.equal(restored.sent().length, 0);
@@ -408,6 +447,8 @@ test('send refusal pauses the whole outbox across restart and a new owner messag
   assert.deepEqual(admitted, ['new-owner-message']);
   assert.equal(restored.sent().length, 3);
   assert.equal(restored.sent()[0].client_id, f.sent()[1].client_id, 'resume the failed wire part with its original client id');
+  assert.deepEqual(restored.sent().slice(0, 2).map(part => ({ id: part.client_id, text: part.item_list[0].text_item.text })),
+    (before.pending[0] as PendingText).parts.slice(1).map(part => ({ id: `nexus:${part.id}`, text: part.text })));
   assert.ok(restored.sent().every(sent => sent.client_id !== f.sent()[0].client_id));
   assert.ok(restored.sent().every(sent => !sent.item_list[0].text_item.text.includes('interactive approval')));
   assert.equal((await restored.store.read()).replyWait, undefined);

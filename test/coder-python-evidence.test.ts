@@ -129,6 +129,24 @@ test('self-check subprocess module entry is included without running the applica
   for (const marker of ['SUBPROCESS_INIT', 'SUBPROCESS_ENTRY', 'SUBPROCESS_SOURCE']) assert.match(result.evidence.join('\n'), new RegExp(marker));
 });
 
+test('wrapper child scripts keep evidence budget ahead of transitive branches', async t => {
+  const f = await fixture(t);
+  await f.write('scripts/checks.py', 'import subprocess, sys\nCOMMANDS = {"tests": ["tests/test_other.py"], "inspect": ["scripts/e2e.py"]}\nsubprocess.run([sys.executable, *COMMANDS[sys.argv[1]]])\n');
+  await f.write('tests/test_other.py', 'from app import first, second, third\n# OTHER_BRANCH\n');
+  for (const name of ['first', 'second', 'third']) await f.write(`app/${name}.py`, '# TRANSITIVE_' + name + '\n' + '# filler\n'.repeat(7200));
+  await f.write('scripts/e2e.py', 'from app import runtime\nopen("must-not-run", "w").write("executed")\n# REQUIRED_CHILD\n' + '# child\n'.repeat(1400));
+  await f.write('app/runtime.py', '# REQUIRED_RUNTIME\n' + '# runtime\n'.repeat(3000));
+  const command = 'powershell.exe -NoProfile -Command "python scripts/checks.py inspect"';
+  const result = await f.inspect(command);
+  assert.ok(result.evidence.some(line => line.startsWith(join(f.cwd, 'scripts/e2e.py') + ':') && line.includes('完整内容') && line.includes('REQUIRED_CHILD')));
+  assert.ok(result.evidence.some(line => line.startsWith(join(f.cwd, 'app/runtime.py') + ':') && line.includes('REQUIRED_RUNTIME')));
+  assert.equal(result.evidenceComplete, false, 'unread transitive code must still prevent cache reuse');
+  assert.match(result.evidence.join('\n'), /未读取完整内容/);
+  await assert.rejects(access(join(f.cwd, 'must-not-run')));
+  await f.write('scripts/e2e.py', '# CHANGED_CHILD\n');
+  assert.notEqual(reviewFingerprint(result), reviewFingerprint(await f.inspect(command)));
+});
+
 test('pytest discovery does not follow links and stops at a bounded number of directory entries', async t => {
   const f = await fixture(t);
   await mkdir(join(f.cwd, 'tests'));

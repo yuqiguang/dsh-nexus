@@ -36,7 +36,8 @@ export const errors: Record<string, string> = {
   delivery_rejected: '平台明确拒绝了发送请求，请检查应用权限或发送限制；达到重试上限后可手动重试。',
   delivery_file_unavailable: '待发文件已变化、不存在或不在原工作区，已暂停发送。请在本机会话重新交付正确文件。',
   delivery_queue_full: '待发回复已达到上限，请先重试发送；本次结果仍可在本机查看。',
-  wechat_context_stale: '微信的回复上下文已超过 19 小时，待发消息会在你下次发消息给助理后送达。',
+  wechat_context_stale: '旧版本曾因回复上下文年龄暂停发送。请确认插件已更新，再点击“重试发送”。',
+  wechat_reply_context_missing: '尚未取得微信回复上下文。请用原绑定微信账号发一条消息，收到后会尝试发送待发内容。',
   wechat_upload_failed: '文件上传到微信失败，稍后会自动重试；也可以点“重试发送”。',
   wechat_download_failed: '从微信下载附件失败，请让用户重发。',
   wechat_media_too_large: '附件超过 20 MB 的接收上限。',
@@ -232,7 +233,7 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
         : !connection.enabled ? '请先连接原绑定账号，再查看待发状态。'
         : connection.phase === 'error' ? '请先处理连接错误并重新连接，再查看待发状态。'
         : connection.phase !== 'connected' ? '正在等待连接通过认证，恢复连接后再查看待发状态。'
-        : connection.waitingForReply || connection.deliveryError === 'wechat_context_stale' ? '收消息连接已认证，发送已暂停。请用原绑定微信账号发送一条新消息后再尝试。电脑端可以继续审批；旧审批提示不会补发。'
+        : connection.waitingForReply || connection.deliveryError === 'wechat_reply_context_missing' ? '收消息连接已认证，发送已暂停。请用原绑定微信账号发送一条新消息后再尝试。电脑端可以继续审批；旧审批提示不会补发。'
         : connection.deliveryError ? '收消息连接已认证，但仍有消息发送失败。请先查看下方原因。'
         : '收消息连接已认证，待发结果尚未全部送达，可点击“重试发送”重新尝试补发。'}</p>
     </section>}
@@ -249,7 +250,7 @@ function WechatCard({ connection, qr, action, busy }: { connection: ConnectionVi
         <button disabled={busy || waiting} onClick={() => void action('connect', { channel: 'wechat', revision: connection.revision })}>重新连接</button>}
       {connection.configured && <button disabled={busy} onClick={() => void action(connection.enabled ? 'disconnect' : 'connect', { channel: 'wechat', revision: connection.revision })}>
         {connection.enabled ? '断开' : '连接'}</button>}
-      {!!connection.pendingDeliveries && <button disabled={busy || waiting || !connection.enabled || connection.phase !== 'connected' || connection.waitingForReply || connection.deliveryError === 'wechat_context_stale'}
+      {!!connection.pendingDeliveries && <button disabled={busy || waiting || !connection.enabled || connection.phase !== 'connected' || connection.waitingForReply || connection.deliveryError === 'wechat_reply_context_missing'}
         onClick={() => void action('retry-delivery', { channel: 'wechat', revision: connection.revision })}>重试发送</button>}
     </footer>
     <WorkspaceField connection={connection} action={action} busy={busy} />

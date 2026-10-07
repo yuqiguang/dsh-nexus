@@ -23,12 +23,7 @@ export function normalizeWechat(message: WechatMessage): WechatInbound | undefin
     ...(dropped.length ? { dropped } : {}), ...(transcribed ? { transcribed: true } : {}) };
 }
 
-/** iLink delivered pushes with a token about 19 hours old on 2026-09-18; older tokens are unverified and are held instead. */
-export const DEFAULT_CONTEXT_MAX_AGE_MS = 19 * 60 * 60_000;
-
 export interface WechatTransportOptions {
-  /** Sends whose context token is older than this wait for the next inbound message instead of being silently dropped. */
-  contextMaxAgeMs?: number;
   now?: () => number;
   /** Channel workspace; presented files are queued as paths under it and re-read when their turn comes. */
   workspace?: string;
@@ -46,7 +41,6 @@ export class WechatTransport implements ChannelTransport {
   private status: ConnectionState = { phase: 'connecting' };
   private readonly client: WechatClient;
 
-  private readonly contextMaxAgeMs: number;
   private readonly now: () => number;
   private readonly workspace?: string;
 
@@ -54,14 +48,8 @@ export class WechatTransport implements ChannelTransport {
     private readonly store: WechatStateStore, fetchImpl: typeof fetch = fetch, private readonly sleep: Wait = wait,
     options: WechatTransportOptions = {}) {
     this.client = new WechatClient(config.baseUrl, config.secret, fetchImpl, sleep, options.cdnBaseUrl);
-    this.contextMaxAgeMs = options.contextMaxAgeMs ?? DEFAULT_CONTEXT_MAX_AGE_MS;
     this.now = options.now ?? Date.now;
     this.workspace = options.workspace;
-  }
-
-  /** A token of unknown age (recorded before ages were kept) is treated as usable. */
-  private stale(snapshot: { contextToken?: string; contextAt?: number }): boolean {
-    return snapshot.contextAt !== undefined && this.now() - snapshot.contextAt > this.contextMaxAgeMs;
   }
 
   async start(receive: (message: InboundMessage) => Promise<void>): Promise<void> {
@@ -102,7 +90,8 @@ export class WechatTransport implements ChannelTransport {
       const snapshot = await this.store.read();
       if (!snapshot.contextToken) throw new ChannelError('wechat_reply_context_missing');
       if (snapshot.replyWait) throw new WechatRequestError('wechat_send_rejected', snapshot.replyWait.diagnostic);
-      if (this.stale(snapshot)) throw new ChannelError('wechat_context_stale');
+      // The oldest verified token is not an expiry limit. Try the saved context;
+      // an explicit API refusal below pauses further sends until a new owner message.
       try { await send(snapshot.contextToken, signal, snapshot.contextRevision ?? 0); }
       catch (error) {
         const code = this.code(error), diagnostic = error instanceof WechatRequestError ? error.diagnostic : undefined;
@@ -192,7 +181,7 @@ export class WechatTransport implements ChannelTransport {
   private async health(): Promise<void> {
     const snapshot = await this.store.read();
     const { pending } = snapshot;
-    const held = pending.length > 0 && this.stale(snapshot) ? 'wechat_context_stale' : undefined;
+    const held = pending.length > 0 && !snapshot.contextToken ? 'wechat_reply_context_missing' : undefined;
     const failed = pending.find(item => item.error);
     this.publish({ pendingDeliveries: pending.length, waitingForReply: !!snapshot.replyWait,
       deliveryError: snapshot.replyWait ? 'wechat_send_rejected' : held ?? failed?.error,
@@ -219,8 +208,6 @@ export class WechatTransport implements ChannelTransport {
       const snapshot = await this.store.read();
       const candidate = snapshot.pending.find(item => item.attempts < MAX_DELIVERY_ATTEMPTS);
       if (!candidate || !snapshot.contextToken || snapshot.replyWait) return;
-      // Held, not failed: the next inbound message refreshes the token and the poll loop flushes again.
-      if (this.stale(snapshot)) { await this.health(); return; }
       const item = await this.store.seal(candidate.id);
       if (!item) continue;
       const part = isFileDelivery(item) ? { id: item.id, text: '' } : item.parts[item.nextPart]!;

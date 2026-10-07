@@ -15,7 +15,7 @@ const MAX_TOTAL = 192 * 1024;
 // Modern projects routinely have more than 24 small modules; the total byte budget stays unchanged.
 const MAX_FILES = 64;
 type SourceRole = 'execute' | 'config' | 'reference' | 'data';
-type Candidate = { path: string; optional?: boolean; probe?: boolean; role: SourceRole; language?: SourceLanguage };
+type Candidate = { path: string; optional?: boolean; probe?: boolean; role: SourceRole; language?: SourceLanguage; depth: number; focus: boolean; args?: string[] };
 const priority: Record<SourceRole, number> = { execute: 0, config: 1, reference: 2, data: 3 };
 /**
  * Module candidates tried against the filesystem before the scan gives up. Each absolute import is tried against three bases
@@ -51,10 +51,14 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   // it. A missing optional path is not evidence, and listing every one of them buries the files that are (ct-4c671559);
   // the probes are summarized in one line instead.
   const queue = new Map<string, Candidate>();
-  const enqueue = (item: Candidate) => {
+  let nextDepth = 0, nextFocus = true;
+  const enqueue = (item: Omit<Candidate, 'depth' | 'focus'> & { focus?: boolean }) => {
     const old = queue.get(item.path);
     queue.set(item.path, old ? { ...old, optional: !!old.optional && !!item.optional, probe: old.probe || item.probe,
-      role: priority[old.role] < priority[item.role] ? old.role : item.role, language: item.language ?? old.language } : item);
+      role: priority[old.role] < priority[item.role] ? old.role : item.role, language: item.language ?? old.language,
+      depth: Math.min(old.depth, nextDepth), focus: old.focus || (item.focus ?? nextFocus),
+      args: [...new Set([...(old.args ?? []), ...(item.args ?? [])])] }
+      : { ...item, depth: nextDepth, focus: item.focus ?? nextFocus });
   };
   enqueue({ path: resolve(cwd, 'package.json'), optional: true, probe: true, role: 'config' });
   const missingProbes: string[] = [];
@@ -109,8 +113,8 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       // any other, but its absence is not missing evidence. A test fixture name — `("程序.py", b"hello", 400)` in kb-service
       // (ct-4c671559) — otherwise made the whole review "incomplete" and turned every approval into an owner prompt.
       const role: SourceRole = /\.(?:md|txt|csv|json)$/i.test(path) ? 'data' : 'reference';
-      enqueue({ path: resolve(base, path), role, ...(fromSource ? { optional: true } : {}) });
-      if (base !== cwd && !isAbsolute(path)) enqueue({ path: resolve(cwd, path), optional: true, role });
+      enqueue({ path: resolve(base, path), role, focus: false, ...(fromSource ? { optional: true } : {}) });
+      if (base !== cwd && !isAbsolute(path)) enqueue({ path: resolve(cwd, path), optional: true, role, focus: false });
     }
   };
   const addJavascript = async (source: string, base: string) => {
@@ -182,7 +186,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     const observed = executionObservations(source, language);
     for (const targets of observed.pytest) await discoverPytest(targets?.map(path => resolve(base, commandPath(path))));
     for (const message of observed.gaps) gap(message);
-    for (const item of observed.sources) enqueue({ path: resolve(base, commandPath(item.path)), role: 'execute', language: item.language });
+    for (const item of observed.sources) enqueue({ path: resolve(base, commandPath(item.path)), role: 'execute', language: item.language, args: item.args });
     for (const item of observed.inline) {
       add(item.code, base, true);
       if (item.language === 'python') await scanPython(item.code, base);
@@ -210,9 +214,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   const analyzed = new Set<string>();
   const visited = new Set<string>();
   while (queue.size) {
-    const candidate = [...queue.values()].sort((a, b) => priority[a.role] - priority[b.role])[0]!;
+    // Cover direct code references before following one branch's transitive imports. A wrapper can name several checks;
+    // reading the first check's entire dependency tree must not starve another child script. Data still comes last.
+    // This changes collection order only: unexpanded branches remain gaps, never an assumption about which branch runs.
+    const candidate = [...queue.values()].sort((a, b) => Number(a.role === 'data') - Number(b.role === 'data')
+      || Number(b.focus) - Number(a.focus) || a.depth - b.depth || priority[a.role] - priority[b.role])[0]!;
     queue.delete(candidate.path);
-    const key = JSON.stringify([candidate.path, candidate.role, candidate.language, !!candidate.optional]);
+    const key = JSON.stringify([candidate.path, candidate.role, candidate.language, !!candidate.optional, candidate.focus, candidate.args]);
     if (seen.has(key)) continue;
     seen.add(key);
     // Count unique paths, not duplicate import edges or repeated optional config probes.
@@ -243,7 +251,9 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       complete = false; continue;
     }
     if (!info.isFile() || info.size > MAX_FILE || bytes + info.size > MAX_TOTAL) {
-      evidence.push(`${redact(real)}: 未读取完整内容（文件类型或大小超出审核上限），不能推断行为`); complete = false; continue;
+      const reason = !info.isFile() ? '不是普通文件' : info.size > MAX_FILE ? '单文件超出审核上限（96 KiB）'
+        : `总内容预算不足：剩余 ${MAX_TOTAL - bytes} 字节，文件需要 ${info.size} 字节`;
+      evidence.push(`${redact(real)}: 未读取完整内容（${reason}），不能推断行为`); complete = false; continue;
     }
     const file = await open(real, 'r');
     try {
@@ -268,10 +278,23 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     } finally { await file.close(); }
   }
   async function scanSource(source: string, real: string, candidate: Candidate) {
+    nextDepth = candidate.depth + 1;
+    nextFocus = candidate.focus;
+    // A literal argument matching a flat string-keyed list is only a scheduling hint (Python/JS dispatch tables).
+    // Do not evaluate code, assume the lookup runs, prune other branches or mark their missing evidence complete.
+    if (candidate.focus && candidate.args?.length) {
+      for (const match of source.matchAll(/(["'])([^"'\\\r\n]{1,80})\1\s*:\s*\[([^\[\]]{0,4096})\]/g)) {
+        if (!candidate.args.includes(match[2]!)) continue;
+        for (const name of references(match[3]!)) {
+          if (/^(?:https?:|data:|node:)/i.test(name) || !/\.(?:py|[cm]?[jt]sx?|sh|ps1|psm1)$/i.test(name)) continue;
+          for (const base of new Set([dirname(real), cwd])) enqueue({ path: resolve(base, commandPath(name)), role: 'reference', optional: true, focus: true });
+        }
+      }
+    }
     if (real.endsWith(`${sep}package.json`)) { manifests.set(real, source); await expandPackage(real); return; }
     const language = candidate.language ?? (/\.py$/i.test(real) ? 'python' : /\.[cm]?[jt]sx?$/i.test(real) ? 'javascript'
       : /\.sh$/i.test(real) ? 'shell' : /\.ps(?:1|m1)$/i.test(real) ? 'powershell' : undefined);
-    const analysisKey = JSON.stringify([real, language, candidate.role === 'data']);
+    const analysisKey = JSON.stringify([real, language, candidate.role === 'data', candidate.focus]);
     if (analyzed.has(analysisKey)) return;
     analyzed.add(analysisKey);
     if (language === 'python') await scanPython(source, dirname(real));

@@ -218,7 +218,7 @@ export async function apply(ctx: Context, config: { workspaceRoot?: string; conf
     if (recovery && !['completed', 'rolled-back', 'cancelled'].includes(recovery.phase)) return '数据恢复尚未结束，请先在数据设置中完成或取消恢复。';
     for (const item of (await channels.view()).connections) {
       const channel = { wechat: '微信', feishu: '飞书', wecom: '企业微信' }[item.channel];
-      if (item.pendingDeliveries) return `${channel}还有 ${item.pendingDeliveries} 条消息等待投递。${item.channel === 'wechat' && (item.waitingForReply || item.deliveryError === 'wechat_context_stale')
+      if (item.pendingDeliveries) return `${channel}还有 ${item.pendingDeliveries} 条消息等待投递。${item.channel === 'wechat' && (item.waitingForReply || item.deliveryError === 'wechat_reply_context_missing')
         ? '请先用绑定微信账号发送一条新消息，恢复发送后再更新。' : '请在渠道连接中查看并处理发送状态。'}`;
       if (item.phase === 'connecting') return `${channel}正在连接，等待连接结束后更新。`;
     }
