@@ -62,7 +62,7 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
   const blocked = dependencies.filter(id => { const prior = own.find(record => record.id === id); return !prior || !dependencyPassed(prior); });
   if (blocked.length) view.blockers.push(`前置任务尚未通过或不可用：${blocked.join('、')}。先修复前置步骤，再核对最新任务依赖。`);
   view.nextStep = view.blockers.length ? '先在所属会话处理以下阻塞，再查看恢复清单。'
-    : task.stopCause === 'user-wait-timeout' ? '等待用户明确要求继续；先解释未解决的具体审批原因，不自动重复派发，不将超时表述为用户拒绝。新请求仍需本次授权。'
+    : task.stopCause === 'user-wait-timeout' ? '等待用户明确要求继续；先解释未解决的具体审批原因，不自动重复派发，不改用主会话终端、文件修改或其他工具继续待确认操作，不将超时表述为用户拒绝。新请求仍需本次授权；从原任务续接并保留验收记录。'
     : task.result?.execution === 'completed' ? '编码已完成，先核对验证条件；仅复验时使用 verification_only=true，沿用计划中的 verify，无需再次启动编码工具。'
     : '回到所属会话说明继续要求，先核对停止原因、已有改动和验证结果，只恢复需要处理的步骤。';
   return view;

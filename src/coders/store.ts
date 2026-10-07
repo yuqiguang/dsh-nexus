@@ -52,6 +52,7 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   verificationSkipped: z.object({ at: z.number(), command: z.string() }).optional(),
   stopReason: z.string().optional(),
   stopCause: z.literal('user-wait-timeout').optional(),
+  userWaitTimeout: z.object({ startedAt: z.number(), endedAt: z.number(), summary: z.string(), reason: z.string().optional() }).optional(),
   retry: z.object({ source: z.enum(['tool', 'nexus']), phase: z.enum(['waiting', 'resuming', 'recovered', 'stopped']), reason: z.string(),
     attempt: z.number().int().nonnegative().optional(), maxAttempts: z.number().int().nonnegative().optional(), retryAt: z.number().optional() }).optional(),
   permissions: z.object({ version: z.literal(1), mode: z.literal('unattended'), securityMode: z.enum(['standard', 'strict', 'full']).optional(), writableRoots: z.array(z.string()), network: z.enum(['ask', 'unrestricted']), webResearch: z.boolean().optional(), autoApproveSafe: z.boolean().optional(), reviewPolicy: z.object({ commands: z.enum(['auto', 'ask']), files: z.enum(['auto', 'ask']), network: z.enum(['auto', 'ask']), instructions: z.string().max(4000) }).strict().optional(), reviewRoots: z.array(z.string()).optional(), allowedNetworkDomains: z.array(z.string()).default([]),

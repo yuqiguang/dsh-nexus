@@ -39,3 +39,11 @@ export function timingSummary(task: TaskRecord, now = Date.now()): string {
   const labels: Record<TimingPhase, string> = { queue: '排队', execution: '执行（含工具）', review: '自动审核（含审核排队）', user: '等待用户（含提问排队）', verification: '验证/收集改动', retry: '重试等待' };
   return `耗时分项：${TIMING_PHASES.map(key => `${labels[key]} ${(timing.ms[key] / 1000).toFixed(1)} 秒`).join('；')}。审核请求 ${timing.reviews} 次，观察到重试 ${timing.retries} 次。各项为互斥阶段耗时，不代表纯模型推理时间。`;
 }
+
+export function timeoutSummary(task: TaskRecord): string[] {
+  if (task.stopCause !== 'user-wait-timeout') return [];
+  const wait = task.userWaitTimeout;
+  return [wait ? `最后一次等待用户：${((wait.endedAt - wait.startedAt) / 1000).toFixed(1)} 秒（${new Date(wait.startedAt).toISOString()} 至 ${new Date(wait.endedAt).toISOString()}）；不是任务总耗时。待确认操作：${wait.summary}${wait.reason ? `；原因：${wait.reason}` : ''}`
+    : '最后一次等待用户：历史记录未保存单次时长；不能用任务总耗时或累计等待时间代替。',
+  '恢复要求：仅汇报已有产物和未验证事项，等待用户明确续接；不能改用主会话终端执行待确认操作。恢复后按原权限与审批链验收，主会话检查不能改写原任务状态。'];
+}

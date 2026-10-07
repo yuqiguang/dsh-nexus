@@ -11,6 +11,8 @@ export interface ExecutionObservation {
   gaps: string[];
   /** null means discovery could not be narrowed to literal targets. */
   pytest: (string[] | null)[];
+  /** Observed WSL executable position, including a literal shell wrapper. Not a mount guarantee. */
+  wsl?: boolean;
 }
 type Word = { value: string; literal: boolean };
 
@@ -85,6 +87,7 @@ export function executionObservations(command: string, language: 'shell' | 'powe
     out.sources.push({ path: word.value, language, ...(literalArgs ? { args: args!.map(arg => arg.value) } : {}) });
   };
   const merge = (other: ExecutionObservation) => {
+    if (other.wsl) out.wsl = true;
     if (directoryChanged && other.pytest.length) {
       other.pytest = [null];
       other.gaps.push('命令改变工作目录，不能按原目录推断 pytest 的实际目标');
@@ -97,6 +100,7 @@ export function executionObservations(command: string, language: 'shell' | 'powe
     if (i && !separator(tokens[i - 1]!.value) && !/^(?:&|command|exec|env|sudo)$/.test(tokens[i - 1]!.value)
       && !/^[\w:$]+=.*/.test(tokens[i - 1]!.value)) continue;
     if (['cd', 'chdir', 'pushd', 'popd', 'set-location', 'sl', 'push-location', 'pop-location'].includes(name)) directoryChanged = true;
+    if (name === 'wsl') out.wsl = true;
     const args: Word[] = [];
     for (let j = i + 1; j < tokens.length && !separator(tokens[j]!.value); j++) args.push(tokens[j]!);
     const python = /^python(?:\d+(?:\.\d+)*)?$/.test(name);

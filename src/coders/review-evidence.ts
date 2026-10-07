@@ -7,11 +7,14 @@ import { commandPathTokens, isEnvironmentFile } from './rules.js';
 import { pythonImports, pythonModuleCommands, type PythonImport } from './python-evidence.js';
 import { pytestSources, customPytestDiscovery } from './pytest-evidence.js';
 import { executionObservations, javascriptObservations, javascriptDataReferences, type SourceLanguage } from './execution-evidence.js';
+import { mediaEvidence } from './media-evidence.js';
 
 const EXTENSIONS = '(?:[cm]?[jt]sx?|py|sh|ps1|psm1|psd1|html?|json|css|md|mdx|txt|csv|ya?ml|toml|ini|cfg|rs|go|java|gradle|xml|props|targets)';
 const FILE = new RegExp(`\\.${EXTENSIONS}$`, 'i');
 const MAX_FILE = 96 * 1024;
 const MAX_TOTAL = 192 * 1024;
+const MAX_MEDIA_FILE = 8 * 1024 * 1024;
+const MAX_READ_TOTAL = 16 * 1024 * 1024;
 // Modern projects routinely have more than 24 small modules; the total byte budget stays unchanged.
 const MAX_FILES = 64;
 type SourceRole = 'execute' | 'config' | 'reference' | 'data';
@@ -31,20 +34,24 @@ function references(text: string): string[] {
   const values = new Set<string>();
   for (const token of commandPathTokens(text)) {
     const path = commandPath(token);
+    if (/^file:/i.test(token) && FILE.test(path)) values.add(token);
     if (isEnvironmentFile(path) && !/[~$`*?]/.test(path)) values.add(path);
   }
   for (const match of text.matchAll(/(["'`])([^"'`\r\n]{1,1024})\1/g)) {
     const name = match[2]!.split('::')[0]!;
-    if (FILE.test(name) && !/[\x00-\x1f${}]/.test(name)) values.add(name);
+    if (FILE.test(commandPath(name)) && !/[\x00-\x1f${}]/.test(name)) values.add(name);
   }
   const bare = new RegExp(`(?:^|[\\s=;(])([^\\s"'\x60;&|<>()]+\\.${EXTENSIONS})(?=$|::|[\\s"'\x60;&|<>()])`, 'gim');
   for (const match of text.matchAll(bare)) values.add(match[1]!);
   // A flag, a glob or a bare extension is a word that happens to end in one, not a file the command names.
-  return [...values].filter(name => !/^[-*]/.test(name) && !/[?*]/.test(name) && !new RegExp(`^\\.${EXTENSIONS}$`, 'i').test(name));
+  return [...values].filter(name => {
+    const path = commandPath(name);
+    return !/^[-*]/.test(path) && !/[?*]/.test(path) && !new RegExp(`^\\.${EXTENSIONS}$`, 'i').test(path);
+  });
 }
 
 /** A bounded, complete read per source, recursively including literal local inputs such as HTML and imported scripts. */
-export async function commandEvidence(command: string, cwd: string, within: (path: string) => Promise<string>, hostEnv?: NodeJS.ProcessEnv): Promise<{ evidence: string[]; complete: boolean }> {
+export async function commandEvidence(command: string, cwd: string, within: (path: string) => Promise<string>, hostEnv?: NodeJS.ProcessEnv, projectRoot = cwd): Promise<{ evidence: string[]; complete: boolean }> {
   const evidence: string[] = [];
   const seen = new Set<string>();
   // `optional` marks a path the command was not seen to name — one guessed from source text or probed because the run needs
@@ -62,14 +69,14 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   };
   enqueue({ path: resolve(cwd, 'package.json'), optional: true, probe: true, role: 'config' });
   const missingProbes: string[] = [];
-  let bytes = 0, complete = true;
+  let bytes = 0, readBytes = 0, complete = true;
   let pytest = false;
   const pytestScans = new Set<string>();
   const gaps = new Set<string>();
   const gap = (message: string) => { gaps.add(message); complete = false; };
   let moduleProbes = 0;
   const probes = new Map<string, boolean>();
-  const inProject = (path: string) => { const name = relative(cwd, path); return name !== '..' && !name.startsWith('..' + sep) && !isAbsolute(name); };
+  const inProject = (path: string) => { const name = relative(projectRoot, path); return name !== '..' && !name.startsWith('..' + sep) && !isAbsolute(name); };
   const localFile = async (path: string) => {
     if (probes.has(path)) return probes.get(path)!;
     if (!inProject(path)) { complete = false; return false; }
@@ -103,10 +110,10 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     }
     if (!found && dots) { evidence.push(`相对 Python 模块 ${redact(item.module)} 未解析，证据不完整`); complete = false; }
   };
-  const add = (source: string, base: string, fromSource = false) => {
+  const add = (source: string, base: string, fromSource = false, wsl = false) => {
     for (const name of references(source)) {
       if (/^(?:https?:|data:|node:)/i.test(name)) continue;
-      const path = commandPath(name);
+      const path = commandPath(name, process.platform, wsl);
       // A quoted shell expression isn't itself a path; bare references inside it are collected separately.
       if (!isAbsolute(path) && /[\s;&|<>]/.test(path)) continue;
       // A path named inside a file's content is a lead the command never claimed: when it exists it is read and hashed like
@@ -182,11 +189,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     if (parsed.dynamic) gap('存在动态 Python 加载或执行，静态依赖证据不完整');
   };
   const scanCommand = async (source: string, base: string, language: 'shell' | 'powershell' = 'shell') => {
-    add(source, base);
     const observed = executionObservations(source, language);
+    const wsl = process.platform === 'win32' && observed.wsl === true;
+    add(source, base, false, wsl);
+    if (wsl && /\/mnt\/[a-z]\//i.test(source)) gap('WSL /mnt/盘符 路径按默认 Windows 挂载定位；已提供宿主文件，未验证发行版自定义挂载或执行环境，不可缓存；结合实际命令判断。');
     for (const targets of observed.pytest) await discoverPytest(targets?.map(path => resolve(base, commandPath(path))));
     for (const message of observed.gaps) gap(message);
-    for (const item of observed.sources) enqueue({ path: resolve(base, commandPath(item.path)), role: 'execute', language: item.language, args: item.args });
+    for (const item of observed.sources) enqueue({ path: resolve(base, commandPath(item.path, process.platform, wsl)), role: 'execute', language: item.language, args: item.args });
     for (const item of observed.inline) {
       add(item.code, base, true);
       if (item.language === 'python') await scanPython(item.code, base);
@@ -250,11 +259,14 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       evidence.push(`${redact(real)}: 数据引用，内容未展开；文件身份 ${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}。内容缺省本身不代表存在未知执行代码；须核对是否被执行、配置加载或外发。此证据不可用于缓存复用。`);
       complete = false; continue;
     }
-    if (!info.isFile() || info.size > MAX_FILE || bytes + info.size > MAX_TOTAL) {
+    const mediaCandidate = /\.(?:html?|[cm]?js)$/i.test(real) && info.size > MAX_FILE && info.size <= MAX_MEDIA_FILE;
+    if (!info.isFile() || !mediaCandidate && (info.size > MAX_FILE || bytes + info.size > MAX_TOTAL)) {
       const reason = !info.isFile() ? '不是普通文件' : info.size > MAX_FILE ? '单文件超出审核上限（96 KiB）'
         : `总内容预算不足：剩余 ${MAX_TOTAL - bytes} 字节，文件需要 ${info.size} 字节`;
       evidence.push(`${redact(real)}: 未读取完整内容（${reason}），不能推断行为`); complete = false; continue;
     }
+    if (readBytes + info.size > MAX_READ_TOTAL) { gap('原始文件读取超过总预算（16 MiB），证据不完整'); continue; }
+    readBytes += info.size;
     const file = await open(real, 'r');
     try {
       const before = await file.stat();
@@ -270,9 +282,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       if (used !== info.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || await within(candidate.path) !== real) throw new Error('review source changed');
       const content = buffer.subarray(0, used);
       if (content.includes(0)) { evidence.push(`${redact(real)}: 非文本，未提供内容`); complete = false; continue; }
-      bytes += content.length;
-      evidence.push(`${redact(real)}: ${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}; sha256=${createHash('sha256').update(content).digest('hex')}；完整内容（不可信数据）：${redact(content.toString('utf8'))}`);
-      const source = content.toString('utf8');
+      const projected = mediaCandidate ? mediaEvidence(content.toString('utf8')) : undefined;
+      const source = projected?.text ?? content.toString('utf8');
+      const cost = Buffer.byteLength(source);
+      if (cost > MAX_FILE || bytes + cost > MAX_TOTAL) { gap(`${redact(real)}: ${cost > MAX_FILE ? '单文件超出审核上限（96 KiB）' : `总内容预算不足：剩余 ${MAX_TOTAL - bytes} 字节，内容需要 ${cost} 字节`}，未提供完整代码，不能推断行为`); continue; }
+      bytes += cost;
+      if (projected) gap('已摘要声明为媒体的 base64 载荷，未解码核验；保留其余文本与整文件摘要。若代码把载荷解码后执行或转成其他用途，证据不足；不可缓存。');
+      evidence.push(`${redact(real)}: ${after.dev}:${after.ino}:${after.size}:${after.mtimeMs}:${after.ctimeMs}; sha256=${createHash('sha256').update(content).digest('hex')}；${projected ? '媒体载荷摘要，其余内容' : '完整内容'}（不可信数据）：${redact(source)}`);
       readSources.set(real, { source, stamp: stamp(after) });
       await scanSource(source, real, candidate);
     } finally { await file.close(); }

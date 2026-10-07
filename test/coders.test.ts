@@ -2329,6 +2329,9 @@ test('user wait timeout interrupts the coder and releases its workspace for the 
     assert.equal(harness.tasks.get(first.task_id!)!.stopCause, 'user-wait-timeout');
     const timedOut = harness.tasks.get(first.task_id!)!;
     assert.equal(timedOut.decisions.at(-1)?.outcome, 'timeout');
+    assert.ok(timedOut.userWaitTimeout);
+    assert.ok(timedOut.userWaitTimeout.endedAt >= timedOut.userWaitTimeout.startedAt);
+    assert.match((await harness.jobs[0]!.done).result ?? '', /最后一次等待用户.*不是任务总耗时/);
     assert.match((await harness.jobs[0]!.done).result ?? '', /等待用户超时，已暂停/);
     assert.doesNotMatch((await harness.jobs[0]!.done).result ?? '', /编码任务.*已取消/);
     assert.match((await harness.run('coder_status', { task_id: first.task_id })).text ?? '', /等待用户超时，已暂停/);
@@ -2727,6 +2730,26 @@ test('missing verification cwd is not executed and does not reach approval or pr
   assert.equal(result.verifyExecuted, false);
   assert.equal(result.verifyChecks?.[0]?.executed, false);
   assert.match(result.verifyOutput!, /验证目录不存在/);
+});
+
+test('first dispatch rejects a repeated missing project path, reports corrected cwd, and preserves real nested projects', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-first-verify-directory-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const project = join(root, 'outputs', 'app'); await mkdir(project, { recursive: true });
+  const harness = coderHarness(undefined, root);
+  let runs = 0;
+  await installCoders(harness.ctx, { roots: [root], defaultCoder: 'claude', query: scriptedQuery(async function* () {
+    runs++; yield { type: 'result', subtype: 'success', result: 'fixture' };
+  }) });
+  await assert.rejects(harness.run('coder_task', { description: 'fixture', cwd: 'outputs/app', verify_cwd: 'outputs/app', verify: 'node --version' }), /任务未派发.*重复拼接.*省略 verify_cwd 或填/);
+  assert.equal(runs, 0); assert.equal(harness.jobs.length, 0); assert.equal(harness.tasks.size, 0);
+  const correct = await harness.run('coder_task', { description: 'fixture', cwd: 'outputs/app', verify_cwd: '.', verify: 'node --version' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(correct.verify_cwd, project);
+  const nested = join(project, 'outputs', 'app'); await mkdir(nested, { recursive: true });
+  const realNested = await harness.run('coder_task', { description: 'fixture', cwd: 'outputs/app', verify_cwd: 'outputs/app', verify: 'node --version' });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(realNested.verify_cwd, nested, 'do not silently reinterpret an existing intentional subproject');
 });
 
 test('retry rejects a removed verification directory before dispatch and accepts an explicit corrected root', { skip: noNamespaces }, async t => {

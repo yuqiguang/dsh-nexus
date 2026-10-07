@@ -3,7 +3,8 @@ import { projectPipEvidence } from './python-install.js';
 import { readonlyReview } from './readonly-review.js';
 import { UserWaits } from './user-waits.js';
 import { dispatchPrompt } from './prompt.js';
-import { timingSummary } from './timing.js';
+import { installPausedNoticeGuard } from './paused-notice.js';
+import { timingSummary, timeoutSummary } from './timing.js';
 import { taskNotices, taskSummary } from './presentation.js';
 import { nativeSafetyReviewer, prepareReview, reviewFingerprint, reviewUntilAborted, ReviewCache, acquireReviewSlot, type SafetyReviewer } from './review.js';
 import { installCoderPackaging } from './package.js';
@@ -37,7 +38,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-user-questions';
 import { createHash, randomBytes } from 'node:crypto';
 import { stat, mkdir } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import type { ChannelNotifier } from '../channels/notify.js';
 import { identity, sameChat } from '../channels/protocol.js';
 import { ChannelError } from '../channels/types.js';
@@ -172,6 +173,7 @@ export function interruptedNotice(task: TaskRecord): string {
   return [`编码任务 ${task.id} 因服务重启而中断（${CODER_NAMES[task.coder]}）。`, `任务：${clip(task.description, 200)}`,
     `目录：${task.cwd}`,
     timingSummary(task),
+    ...timeoutSummary(task),
     ...(task.permissions ? [permissionSummary(task.permissions)] : []), ...(task.pending ? [`中断时正在等待你回答：${task.pending.summary}`] : []),
     ...(task.coderSessionId ? [`${CODER_NAMES[task.coder]} 会话 ${task.coderSessionId} 已保留。`] : []),
     task.coderSessionId ? '任务不会自动重跑；需要继续时告诉我，可以接着原来的会话做下去。' : '任务不会自动重跑；需要继续时告诉我重新派发。'].join('\n');
@@ -229,6 +231,7 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []),
     `目录：${task.cwd}`,
     timingSummary(task),
+    ...timeoutSummary(task),
     ...(task.permissions ? [permissionSummary(task.permissions)] : []),
     '',
     `DSH 独立验证范围：${task.verify ? [task.verify, ...(task.verifyCommands ?? [])].join('；') : '未指定'}。编码工具自述的其他测试不代表 DSH 已独立运行。`,
@@ -271,6 +274,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   const resuming = new Set<string>();
   const planning = new Set<string>();
   const store = await CoderStore.open(ctx.storageDomain);
+  installPausedNoticeGuard(ctx, () => store.list());
   ctx.effect(() => () => { void store.close(); });
   config.manager?.attach(store);
   const syncNotices = taskNotices(ctx, store);
@@ -472,7 +476,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           }
           const allowed = readonlyUnchanged && result.safe && !!after && reviewFingerprint(after) === reviewFingerprint(envelope)
             && !!current && isActive(current) && !current.stopReason && config.manager?.current()?.autoApproveSafe !== false;
-          const reason = result.safe && !allowed ? rechecked.reason ?? '审核期间操作内容、目标路径或任务状态已变化' : cached ? `复用本任务 60 秒内的安全审核（命令、权限和文件证据未变）：${result.reason}` : result.reason;
+          const reason = result.safe && !allowed ? rechecked.reason ?? '审核期间操作内容、目标路径或任务状态已变化' : cached ? `复用本任务 5 分钟内的安全审核（命令、权限和文件证据未变）：${result.reason}` : result.reason;
           await store.update(taskId, current => ({ decisions: [...current.decisions, { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'supervisor', outcome: allowed ? 'allow' : 'ask', reason }] }));
           recorded = true;
           reviewSignal.throwIfAborted();
@@ -500,7 +504,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       return { behavior: 'allow', updatedInput: { ...request.raw, answers: cached } };
     }
     const waitId = Symbol('user-wait');
-    await store.update(taskId, current => userWaits.add(current, waitId, { at, kind: request.kind, summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
+    const waitStartedAt = Date.now();
+    await store.update(taskId, current => userWaits.add(current, waitId, { at: waitStartedAt, kind: request.kind, summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
       ...(request.detail ? { detail: clip(request.detail, 500) } : {}) }));
     step(`等待用户：${oneLine(request.summary, 100)}`);
     const resumeBudget = budgets.get(taskId)?.pause();
@@ -529,7 +534,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     if (waitSignal.aborted && !signal.aborted && !shutdown.signal.aborted && waitSignal.reason?.name === 'TimeoutError') {
       outcome = { decision: { behavior: 'deny', message: '等待用户超时，任务已暂停；未取得本次操作授权。', interrupt: true },
         record: { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user', outcome: 'timeout', reason: '等待用户超时，未收到决定；不是用户拒绝' } };
-      await store.update(taskId, () => ({ stopCause: 'user-wait-timeout' }));
+      await store.update(taskId, () => ({ stopCause: 'user-wait-timeout', userWaitTimeout: {
+        startedAt: waitStartedAt, endedAt: Date.now(), summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
+      } }));
       stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
     }
     if (outcome.decision.behavior === 'allow' && (requestedPaths.some(isEnvironmentFile) || projectEnvironments.length)) {
@@ -885,15 +892,15 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       retry_task_id: { type: 'string', description: '失败、取消或中断后的最新任务 ID；显式重试同一步骤。保留权限边界，有原生会话则续接，没有则重新启动。与 resume_task_id 互斥；不能重做已验证通过的步骤。' },
       resume_task_id: { type: 'string', description: '要续接的任务 ID（ct-xxxx），它必须已经停下、结束或因重启中断。用于用户叫停后要调整方向，或结束后要接着改：在原任务的编码工具会话里继续，而不是从头开始。' },
       verify_commands: { type: 'array', items: { type: 'string' }, description: '完整的独立验证命令列表（1 到 10 条），按顺序执行，每条单独审核，任一失败则停止；与 verify 二选一。覆盖验收所需的语法、逻辑和集成测试。' },
-      verify_cwd: { type: 'string', description: '独立验证的项目子目录，相对 cwd 或绝对路径，必须仍在任务目录内。默认 cwd；多项目工作区必须明确绑定，不能依赖编码工具临时 cd。' },
+      verify_cwd: { type: 'string', description: '独立验证目录，相对任务 cwd（不是会话工作区）或绝对路径，必须仍在任务目录内。在项目根验证时省略或填 .；例如 cwd=outputs/app 时，不再填 outputs/app。仅真正的项目子目录才填相对路径。' },
       verify_network: { type: 'string', enum: ['offline', 'loopback', 'ask'], description: '通常省略以沿用当前模式：标准模式默认 ask（由 DSH 审核验证命令），严格模式默认 offline（断网）。脚本本身不联网不等于需要强制断网，不要因此填写 offline。只有用户或验收明确要求网络隔离时才选择 offline；Windows 会在派发前检查其防火墙条件，条件不满足不得自动放宽。Windows 不支持隔离 loopback。本地服务与浏览器自检在 Linux 选 loopback：脚本须在同一次调用内启动服务和客户端，运行在独立回环网络中，不能访问宿主端口和外网，不需要联网审批。测试确实需要联网时选 ask：标准模式按 DSH 审核设置自动审核或请求本次批准，严格模式请求一次性批准，完全权限直接执行。批准只对这条验证命令有效，可访问任意网络目标；非完全权限模式仍限制文件写入；验证环境不继承密钥变量。拒绝则不执行验证，不回退到无隔离。' },
       verify: { type: 'string', description: '可选的验证命令，任务结束后由监工在工作目录独立执行，例如 "npm test"。任务的完成标准里写了要跑测试、构建、检查或跑通某条命令时，都要填上：监工自己跑一遍才算数，不填就只有编码工具自己说做完了。不经过 shell：只能是一条命令，第一个词是程序，其余按空格分成参数；不能用 &&、|、;、>、引号或 $()，要检查多件事就写一个脚本或 npm script。' },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
-        task_id: { type: 'string', required: true }, job_id: { type: 'string', required: true }, status: { type: 'string', required: true }, cwd: { type: 'string', required: true },
+        task_id: { type: 'string', required: true }, job_id: { type: 'string', required: true }, status: { type: 'string', required: true }, cwd: { type: 'string', required: true }, verify_cwd: { type: 'string' },
       } },
-      render: (_args, value) => [{ type: 'text', text: `已派发编码任务 ${value.task_id}，后台 job ${value.job_id}，状态：${value.status}。实际项目目录：${value.cwd}。排队中只表示受理时尚未启动，不能推断有其他任务占用；可能立即开始。任务结束时会收到 job 完成通知；当前动作和最近几步可用 coder_status 查看。` }],
+      render: (_args, value) => [{ type: 'text', text: `已派发编码任务 ${value.task_id}，后台 job ${value.job_id}，状态：${value.status}。实际项目目录：${value.cwd}。${value.verify_cwd ? `独立验证目录：${value.verify_cwd}。` : ''}排队中只表示受理时尚未启动，不能推断有其他任务占用；可能立即开始。任务结束时会收到 job 完成通知；当前动作和最近几步可用 coder_status 查看。` }],
     },
     async execute(args, exec) {
       if (!exec.agent) throw new Error('coder_task 只能在会话中调用。');
@@ -974,6 +981,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const verifyCommands = checks ? checks.slice(1) : args.verify !== undefined ? undefined : previous?.verifyCommands;
         const verifyCwd = await canonical(resolve(cwd, args.verify_cwd ?? previous?.verifyCwd ?? '.'));
         if (!isInside(cwd, verifyCwd)) throw new Error('验证目录必须位于任务目录内。');
+        if (!previous && (verify || preflight) && verifyCwd !== cwd && args.cwd && args.verify_cwd && !isAbsolute(args.verify_cwd)
+          && resolve(args.cwd) === resolve(args.verify_cwd) && !await stat(verifyCwd).then(info => info.isDirectory(), () => false)) {
+          throw new Error(`任务未派发：verify_cwd 相对任务 cwd，当前重复拼接为 ${verifyCwd}。项目根验证请省略 verify_cwd 或填 .；不要为此创建嵌套目录或转发脚本。`);
+        }
         if (previous && (verify || preflight) && !await stat(verifyCwd).then(info => info.isDirectory(), () => false)) throw new Error(`重试未启动：验证目录不存在或不可访问：${verifyCwd}。请先核实目录；verify_cwd 相对于任务 cwd，验证项目根目录用 .。不会原样重跑编码任务。`);
         const verifyNetwork = verificationNetwork(args.verify_network, previous?.verifyNetwork, permissions.securityMode ?? 'strict');
         if (verify || preflight) await preflightVerification(process.platform, coder, verifyNetwork);
@@ -1011,7 +1022,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         // The native job already exists; a delivery-metadata failure must not turn its receipt into a retryable dispatch failure.
         await config.channelWork?.bindJob(task.id, jobId).catch(() => { console.error('[nexus-coders] channel job binding unavailable'); });
         const running = await store.update(task.id, () => ({ jobId }));
-        return { task_id: task.id, job_id: jobId, status: taskStatusLabel(running), cwd };
+        return { task_id: task.id, job_id: jobId, status: taskStatusLabel(running), cwd, ...(task.verifyCwd ? { verify_cwd: task.verifyCwd } : {}) };
       } finally { if (!store.get(taskId)) reviewEnvs.delete(taskId); admitting.delete(taskId); if (resumeKey) resuming.delete(resumeKey); if (planKey) planning.delete(planKey); }
     },
   })));
@@ -1034,7 +1045,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           ...(isActive(task) ? [runningFor(task)] : []),
           ...(currentActivity(task) ? [`当前：${currentActivity(task)}`] : []),
           ...(task.retry ? [retryText(task.retry), ...(task.retry.retryAt && task.retry.phase === 'waiting' ? [`预计重试时间：${clock(task.retry.retryAt)}`] : [])] : []),
-          `任务：${task.description}`, timingSummary(task),
+          `任务：${task.description}`, timingSummary(task), ...timeoutSummary(task),
           ...(task.planStep ? [`计划步骤：${task.planStep}`] : []),
           ...(task.brief ? [`任务说明单：${task.brief.id} v${task.brief.revision}；验收项：${task.brief.acceptance.map(item => item.id).join('、')}`] : []),
           ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []), ...(task.dependsOn?.length ? [`前置任务（均需独立验证通过）：${task.dependsOn.join('、')}`] : []), `目录：${task.cwd}`,

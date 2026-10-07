@@ -118,6 +118,7 @@ export interface TaskRecord {
   safetyReviews?: (ReviewAudit & { at: number })[];
   stopReason?: string;
   stopCause?: 'user-wait-timeout';
+  userWaitTimeout?: { startedAt: number; endedAt: number; summary: string; reason?: string };
   retry?: TaskRetry;
   status: TaskStatus;
   /** DSH session that dispatched the task; escalations are asked on its live agent. */

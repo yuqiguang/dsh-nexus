@@ -62,6 +62,8 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
     return { decision: { behavior: 'deny', message: aborted ? '任务已取消。' : '用户未能回答，本次操作未执行。', interrupt: aborted },
       record: { ...base, outcome: 'deny', reason: aborted ? '任务取消' : `提问失败：${(error as Error)?.message ?? String(error)}` } };
   }
+  // Audit the time of the answer, not the time the prompt was created.
+  base.at = Date.now();
   if (request.kind !== 'question') {
     const choice = answer.answers.find(item => item.id === 'approve');
     const custom = choice?.custom?.trim() ?? '';
