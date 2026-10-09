@@ -63,6 +63,14 @@ test('literal target installs resolve the task interpreter, actual cwd, source a
   }
   assert.equal(await projectPipEvidence(command, cwd, { ...env, PATH: '.' + ':' + bin }, project), undefined);
   await mkdir(join(env.HOME, '.pip'), { recursive: true });
+  await writeFile(join(env.HOME, '.pip', 'pip.conf'), '[global]\nbreak-system-packages = true\n');
+  const managed = await projectPipEvidence(command, cwd, env, project);
+  assert.ok(managed); assert.match(managed.join('\n'), /break-system-packages=true/);
+  assert.ok(await projectPipEvidence(command, cwd, { ...env, PIP_BREAK_SYSTEM_PACKAGES: '1' }, project));
+  assert.equal(await projectPipEvidence(command, cwd, { ...env, PIP_BREAK_SYSTEM_PACKAGES: 'unknown' }, project), undefined);
+  assert.equal(await projectPipEvidence(command, cwd, { ...env, PIP_TARGET: '/tmp/shared' }, project), undefined);
+  assert.equal(await projectPipEvidence('python -m pip install imageio-ffmpeg', cwd, env, project), undefined, 'the compatibility flag does not admit a global installation');
+  assert.equal(await projectPipEvidence('python -m pip install --target ../../outside --no-cache-dir av', cwd, env, project), undefined);
   await writeFile(join(env.HOME, '.pip', 'pip.conf'), '[global]\nindex-url = https://pypi.org/simple/\n');
   assert.notDeepEqual(await projectPipEvidence(command, cwd, env, project), first);
   await writeFile(join(env.HOME, '.pip', 'pip.conf'), '[install]\ntarget = /tmp/shared\n');

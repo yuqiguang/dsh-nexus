@@ -39,6 +39,11 @@ async function pipConfiguration(env: NodeJS.ProcessEnv, venv?: string): Promise<
       for (const url of urls) sources.add(url!);
       return true;
     }
+    if (key === 'break-system-packages') {
+      if (!/^(?:true|false|yes|no|on|off|1|0)$/i.test(value)) return false;
+      evidence.push(`pip 兼容开关 break-system-packages=${value.toLowerCase()}；此开关不改变本次已核验的项目安装目标，整条命令仍需审核。`);
+      return true;
+    }
     return ['disable-pip-version-check', 'no-color', 'progress-bar', 'timeout', 'retries'].includes(key) && /^[\w.-]+$/.test(value);
   };
   for (const [key, value] of Object.entries(env)) {
