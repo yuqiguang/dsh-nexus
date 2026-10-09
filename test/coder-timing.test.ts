@@ -29,6 +29,7 @@ test('phase accounting splits nested review/user waits, retries, verification an
   assert.deepEqual(record.timing?.ms, { queue: 100, execution: 400, review: 300, user: 400, verification: 200, retry: 200 });
   assert.equal(record.timing?.reviews, 3);
   assert.equal(record.timing?.retries, 1);
+  assert.equal(record.timing?.toolRetries, 0); assert.equal(record.timing?.resumes, 1);
   assert.equal(Object.values(record.timing!.ms).reduce((a, b) => a + b), 1600);
   assert.deepEqual(taskSchema.parse(record).timing, record.timing);
   assert.equal(timingSummary(record, 9000), timingSummary(record, 5000));

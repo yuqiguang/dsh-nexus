@@ -453,9 +453,12 @@ test('the Claude adapter reports SDK errors and cancellation without rejecting',
 test('the verify command runs without a shell and reports exit status', { skip: noNamespaces }, async () => {
   const ok = await runVerifyCommand('true', process.cwd());
   assert.deepEqual(ok, { ok: true, output: '' });
-  const failed = await runVerifyCommand('sh -c exit_3_missing', process.cwd());
+  const failed = await runVerifyCommand('false', process.cwd());
   assert.equal(failed.ok, false);
-  assert.match(failed.output, /\[exit \d+\]/);
+  assert.match(failed.output, /\[exit 1\]/);
+  const wrapped = await runVerifyCommand('sh -c exit_3_missing', process.cwd());
+  assert.equal(wrapped.executed, false);
+  assert.match(wrapped.output, /内联 shell 包装/);
   const missing = await runVerifyCommand('definitely-not-a-program-xyz', process.cwd());
   assert.equal(missing.ok, false);
   if (process.platform === 'win32') assert.equal(missing.executed, false);
@@ -1356,8 +1359,9 @@ test('coder_task continues a stopped task in its session, keeping its coder, dir
   assert.match((await harness.run('coder_status', { task_id: second })).text!, new RegExp(`续接：${first}`));
 
   await assert.rejects(harness.run('coder_task', { description: 'x', cwd: workdir, resume_task_id: 'ct-missing' }), /没有编码任务 ct-missing/);
-  await assert.rejects(harness.run('coder_task', { description: 'x', cwd: other, resume_task_id: first }), /续接必须在原任务的目录里/);
-  await assert.rejects(harness.run('coder_task', { description: 'x', cwd: workdir, coder: 'claude', resume_task_id: first }), /续接不能换工具/);
+  await assert.rejects(harness.run('coder_task', { description: 'x', cwd: workdir, resume_task_id: first }), /已有后续执行/);
+  await assert.rejects(harness.run('coder_task', { description: 'x', cwd: other, resume_task_id: second }), /续接必须在原任务的目录里/);
+  await assert.rejects(harness.run('coder_task', { description: 'x', cwd: workdir, coder: 'claude', resume_task_id: second }), /续接不能换工具/);
   harness.tasks.set('ct-nosession', { ...task({ id: 'ct-nosession', cwd: workdir, status: 'failed' }) });
   await assert.rejects(harness.run('coder_task', { description: 'x', cwd: workdir, resume_task_id: 'ct-nosession' }), /没有留下 Claude Code 的会话/);
   assert.equal(harness.jobs.length, 2, 'refused continuations start no job');
@@ -2134,7 +2138,7 @@ test('briefs keep shared constraints, distinguish uncovered acceptance, and reje
     assert.match(seen, /a1\. 新流程测试通过/);
     assert.doesNotMatch(seen, /a2\. 旧流程兼容/);
     const report = (await harness.run('coder_brief', { action: 'get', brief_id: id })).text!;
-    assert.match(report, /a1：新流程测试通过 — 关联任务验证通过，待需求验收/);
+    assert.match(report, /a1：新流程测试通过 — 本项独立检查通过，待需求验收/);
     assert.match(report, /a2：旧流程兼容 — 尚未安排/);
     await harness.run('coder_brief', { action: 'save', brief_id: id, revision: 1, objective: '修订目标', acceptance: ['新的标准'] });
     await assert.rejects(harness.run('coder_brief', { action: 'save', brief_id: id, revision: 1, objective: '覆盖新目标', acceptance: ['旧标准'] }), /版本已变化/);
@@ -2659,6 +2663,132 @@ test('the original runtime budget expires during retry backoff without starting 
   assert.equal(starts, 1); assert.equal(harness.tasks.get(id)!.status, 'interrupted');
   assert.match(harness.tasks.get(id)!.stopReason!, /时间预算/);
   assert.equal(harness.tasks.get(id)!.retry?.phase, 'stopped');
+});
+
+test('local dispatch carries scoped approvals through interruption, original-session recovery, verification and delivery', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-closing-flow-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project'), pipeline = join(cwd, 'pipeline'), bin = join(root, 'bin');
+  await mkdir(pipeline, { recursive: true }); await mkdir(bin);
+  await writeFile(join(bin, process.platform === 'win32' ? 'python.exe' : 'python'), 'fixture interpreter; never launched', { mode: 0o755 });
+  await writeFile(join(pipeline, 'narrate.py'), '# Approval fixture only: no network or Python execution');
+  await writeFile(join(cwd, 'docs.cjs'), 'if (require("fs").readFileSync("README.md", "utf8") !== "current documentation") process.exit(3);');
+  await writeFile(join(cwd, 'output.cjs'), 'require("fs").readFileSync("result.txt");');
+  await writeFile(join(cwd, 'reproduce.cjs'), 'require("fs").writeFileSync(process.argv[2] + ".txt", "reproduced");');
+  const env = { PATH: bin + (process.platform === 'win32' ? ';' : ':') + (process.env.PATH ?? ''), HOME: join(root, 'home'), XDG_CONFIG_DIRS: join(root, 'xdg') };
+  const settings = { ...defaultSettings(), roots: [cwd], securityMode: 'standard' as const };
+  const manager = { load: async () => settings, current: () => settings, attach() {}, onConcurrencyChange() { return () => {}; },
+    runtime: async () => ({ roots: [cwd], defaultCoder: 'claude', securityMode: 'standard', autoApproveSafe: true,
+      codex: { command: 'codex', env, source: 'system' }, claude: { env, source: 'system' } }) } as unknown as CodersManager;
+  const harness = coderHarness(questions => questions.map(question => ({ id: question.id, selected: [question.id === 'accept' ? '已满足' : '允许'] })), cwd);
+  let codingRuns = 0, pipReviews = 0;
+  const query: ClaudeQuery = async function* ({ options }) {
+    const round = ++codingRuns;
+    if (round > 1) assert.equal(options.resume, 'closing-native-session');
+    yield { type: 'system', subtype: 'init', session_id: 'closing-native-session' };
+    if (round === 1) {
+      const pip = await options.canUseTool('Bash', { command: 'python -m pip install --target pydeps --cache-dir .pip-cache imageio-ffmpeg', cwd: pipeline }, { signal: options.abortController.signal });
+      assert.equal(pip.behavior, 'allow');
+    }
+    const operation = await options.canUseTool('Bash', { command: `python narrate.py${round === 1 ? ' --probe' : ''}`, cwd: pipeline }, { signal: options.abortController.signal });
+    assert.equal(operation.behavior, 'allow');
+    await writeFile(join(cwd, 'result.txt'), 'existing task output');
+    if (round === 1) {
+      yield { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 99, retry_delay_ms: 60_000, error_status: 429, error: 'rate_limit' };
+      await new Promise<void>(resolve => options.abortController.signal.addEventListener('abort', () => resolve(), { once: true }));
+      yield { type: 'result', subtype: 'success', result: 'must remain interrupted' };
+    } else {
+      await writeFile(join(cwd, 'README.md'), 'current documentation');
+      // Deliberately omit status.json: a model statement is not proof that a declared file exists.
+      yield { type: 'result', subtype: 'success', result: 'all files, including status.json, are ready' };
+    }
+  };
+  await installCoders(harness.ctx, { roots: [cwd], manager, query, retryProgressLimits: { warnAfterMs: 25, stopAfterMs: 80, intervalMs: 15 }, safetyReviewer: async (_task, input) => {
+    if (input.operation.includes('pip install')) {
+      pipReviews++; assert.match(input.evidence.join('\n'), /pipeline.*pydeps/); return { safe: true, reason: 'local installation fixture evidence' };
+    }
+    return input.operation.includes('narrate.py') ? { safe: false, reason: 'fixture external operation requires this scope to be answered by owner' } : { safe: true, reason: 'local verification fixture' };
+  } });
+  const saved = await harness.run('coder_brief', { action: 'save', objective: 'deliver complete reproducible project', acceptance: ['output', 'current documentation and declared status', 'changed input reproduction'] });
+  const briefId = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  const commands = ['node output.cjs', 'node docs.cjs', 'node reproduce.cjs changed-text', 'node reproduce.cjs changed-rate'];
+  const first = (await harness.run('coder_task', { cwd, description: 'complete project', brief_id: briefId, brief_revision: 1, acceptance_ids: ['a1', 'a2', 'a3'], verify_commands: commands,
+    outputs: ['result.txt', 'README.md', 'status.json'], acceptance_checks: [
+      { criterion: 'a1', commands: ['node output.cjs'], files: ['result.txt'] },
+      { criterion: 'a2', commands: ['node docs.cjs'], files: ['README.md', 'status.json'] },
+      { criterion: 'a3', commands: commands.slice(2), files: ['changed-text.txt', 'changed-rate.txt'] },
+    ] })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  const interrupted = taskSchema.parse(harness.tasks.get(first));
+  assert.equal(pipReviews, 1); assert.equal(harness.asked.length, 1, 'bounded pip evidence reaches review without an extra owner prompt');
+  assert.equal(interrupted.status, 'interrupted'); assert.equal(interrupted.stopCause, 'retry-no-progress');
+  assert.equal(interrupted.result?.execution, 'stopped'); assert.equal(interrupted.result?.verification, 'not-run');
+  assert.equal(interrupted.retry?.source, 'tool'); assert.equal(interrupted.retry?.phase, 'stopped');
+  assert.match(interrupted.stopReason!, /无进展/); assert.equal(interrupted.timing?.toolRetries, 1); assert.equal(interrupted.timing?.resumes, 0);
+  assert.ok(harness.panels[0]!.progress.some(text => /长时间没有执行进展/.test(text)));
+  assert.match((await harness.run('coder_brief', { action: 'recover', brief_id: briefId })).text!, new RegExp(`retry_task_id.*${first}`));
+  await assert.rejects(harness.run('coder_task', { retry_task_id: first, verification_only: true }), /编码已完成/);
+  await assert.rejects(harness.run('coder_task', { retry_task_id: first, acceptance_ids: ['a1'] }), /缩小/);
+  const resumed = (await harness.run('coder_task', { retry_task_id: first, continuation: 'Inspect existing output and finish the remaining documentation and verification' })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  const completedCode = taskSchema.parse(harness.tasks.get(resumed));
+  assert.equal(codingRuns, 2); assert.equal(harness.asked.length, 2, 'the probe approval cannot authorize the broader later command');
+  assert.equal(completedCode.result?.execution, 'completed'); assert.equal(completedCode.result?.verification, 'failed');
+  assert.equal(completedCode.resumedFrom, first);
+  assert.equal(completedCode.result?.artifactChecks?.find(check => check.path.endsWith('status.json'))?.ok, false);
+  assert.notEqual(interrupted.decisions.find(decision => decision.authorization)?.authorization?.operationId,
+    completedCode.decisions.find(decision => decision.authorization)?.authorization?.operationId);
+  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /检查通过 2\/3/);
+  await writeFile(join(cwd, 'status.json'), '{"generated":true}');
+  const verified = (await harness.run('coder_task', { retry_task_id: resumed, verification_only: true })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  assert.equal(codingRuns, 2, 'formal re-verification never reruns the coder');
+  assert.equal(harness.tasks.get(verified)!.result?.verification, 'passed');
+  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /已核验声明文件[\s\S]*status.json/);
+  for (const criterion of ['a1', 'a2', 'a3']) await harness.run('coder_brief', { action: 'review', brief_id: briefId, revision: 1, criterion });
+  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /检查与业务验收均通过/);
+  assert.deepEqual(harness.tasks.get(first), interrupted, 'old interruption and approval history remain immutable');
+  await assert.rejects(harness.run('coder_task', { resume_task_id: first }), /已有后续执行/);
+});
+
+test('recovery preserves same-version file checks and lets a revised brief replace obsolete deliverables', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-output-revision-'));
+  const harness = coderHarness(undefined, cwd);
+  t.after(async () => {
+    for (const job of harness.jobs) job.cancel('cleanup');
+    await Promise.all(harness.jobs.map(job => job.done));
+    await rm(cwd, { recursive: true, force: true });
+  });
+  await writeFile(join(cwd, 'replacement.txt'), 'new deliverable');
+  let codingRuns = 0;
+  await installCoders(harness.ctx, { roots: [cwd], defaultCoder: 'claude', query: async function* () {
+    codingRuns++;
+    yield { type: 'result', subtype: 'success', result: 'execution finished without a native session id' };
+  } });
+  const saved = await harness.run('coder_brief', { action: 'save', objective: 'original delivery', acceptance: ['deliver the original file'] });
+  const briefId = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  const first = (await harness.run('coder_task', { cwd, description: 'prepare output', brief_id: briefId, brief_revision: 1, acceptance_ids: ['a1'],
+    outputs: ['obsolete.txt'], acceptance_checks: [{ criterion: 'a1', files: ['obsolete.txt'] }] })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.get(first)!.result?.execution, 'completed');
+  assert.equal(harness.tasks.get(first)!.result?.verification, 'failed');
+  const original = structuredClone(harness.tasks.get(first));
+
+  const sameVersion = (await harness.run('coder_task', { retry_task_id: first, verification_only: true, outputs: ['replacement.txt'] })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  assert.deepEqual(harness.tasks.get(sameVersion)!.outputs?.toSorted(), ['obsolete.txt', 'replacement.txt']);
+  assert.equal(harness.tasks.get(sameVersion)!.result?.verification, 'failed', 'an added file cannot discard the existing requirement');
+  assert.equal(harness.tasks.get(sameVersion)!.resumedFrom, first, 'verification-only recovery retains the chain without a coder session id');
+
+  await harness.run('coder_brief', { action: 'save', brief_id: briefId, revision: 1, objective: 'revised delivery', acceptance: ['deliver the replacement file'] });
+  const revised = (await harness.run('coder_task', { retry_task_id: sameVersion, verification_only: true, brief_revision: 2,
+    outputs: ['replacement.txt'], acceptance_checks: [{ criterion: 'a1', files: ['replacement.txt'] }] })).task_id!;
+  await harness.jobs.at(-1)!.done;
+  assert.deepEqual(harness.tasks.get(revised)!.outputs, ['replacement.txt']);
+  assert.deepEqual(harness.tasks.get(revised)!.acceptanceChecks?.[0]?.files, ['replacement.txt']);
+  assert.equal(harness.tasks.get(revised)!.result?.verification, 'passed');
+  assert.equal(codingRuns, 1, 'both recovery checks leave the coding execution untouched');
+  assert.deepEqual(harness.tasks.get(first), original);
 });
 
 test('task list and notice routes require an owner, bound completed summaries and exclude private process records', async t => {

@@ -4,6 +4,7 @@ import type { CoderBrief } from './brief.js';
 import { isActive, type TaskRecord } from './types.js';
 import { isProtectedPath, isProjectEnvironment } from './rules.js';
 import { resolve } from 'node:path';
+import { acceptanceChecksSchema, resolveAcceptanceChecks } from './acceptance-checks.js';
 
 export const VERIFY_SHELL_SYNTAX = /[|&;<>`'"]|\$\(/;
 export const planSchema = z.array(z.object({
@@ -12,6 +13,8 @@ export const planSchema = z.array(z.object({
   acceptance_ids: z.array(z.string()).min(1).max(20),
   depends_on: z.array(z.string()).max(10).default([]),
   verify: z.string().trim().min(1).max(500),
+  verify_commands: z.array(z.string().trim().min(1).max(1000)).max(9).optional(),
+  acceptance_checks: acceptanceChecksSchema.optional(),
   preflight: z.string().trim().min(1).max(500).optional(),
   outputs: z.array(z.string().trim().min(1).max(1000)).max(100).optional(),
 })).min(1).max(20);
@@ -27,10 +30,11 @@ export function validatePlan(input: unknown, acceptance: readonly { id: string }
   for (const step of steps) {
     if (step.acceptance_ids.some(id => !acceptance.some(item => item.id === id))) throw new Error(`步骤 ${step.id} 引用了不存在的验收项。`);
     if (step.depends_on.some(id => !byId.has(id))) throw new Error(`步骤 ${step.id} 引用了不存在的前置步骤。`);
-    if (VERIFY_SHELL_SYNTAX.test(step.verify)) throw new Error(`步骤 ${step.id} 的验证命令不能包含 shell 组合语法，请使用单个脚本。`);
+    if ([step.verify, ...(step.verify_commands ?? [])].some(command => VERIFY_SHELL_SYNTAX.test(command))) throw new Error(`步骤 ${step.id} 的验证命令不能包含 shell 组合语法，请使用单个脚本。`);
+    resolveAcceptanceChecks(step.acceptance_checks, { id: 'plan', revision: 1, objective: 'plan', constraints: '', acceptance: step.acceptance_ids.map(id => ({ id, text: id })) }, [step.verify, ...(step.verify_commands ?? [])]);
     if (step.preflight && VERIFY_SHELL_SYNTAX.test(step.preflight)) throw new Error(`步骤 ${step.id} 的环境预检必须使用单个脚本。`);
     const outputRoot = resolve('/__nexus_plan_outputs__');
-    const protectedOutput = step.outputs?.find(path => isProtectedPath(resolve(outputRoot, path), [outputRoot], true)
+    const protectedOutput = [...(step.outputs ?? []), ...(step.acceptance_checks ?? []).flatMap(check => check.files)].find(path => isProtectedPath(resolve(outputRoot, path), [outputRoot], true)
       && !isProjectEnvironment(resolve(outputRoot, path), outputRoot, true));
     if (protectedOutput) throw new Error(`步骤 ${step.id} 的预期文件 ${protectedOutput} 受凭据保护规则限制，请在派发前调整交付文件。`);
   }

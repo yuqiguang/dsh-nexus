@@ -9,6 +9,8 @@ export interface TaskTiming {
   ms: Record<TimingPhase, number>;
   reviews: number;
   retries: number;
+  toolRetries?: number;
+  resumes?: number;
 }
 function phase(task: TaskRecord): TimingPhase | undefined {
   if (!isActive(task)) return undefined;
@@ -20,7 +22,7 @@ function phase(task: TaskRecord): TimingPhase | undefined {
   return 'execution';
 }
 export function initialTiming(task: TaskRecord, now = task.createdAt): TaskTiming {
-  return { since: now, phase: phase(task), ms: { queue: 0, execution: 0, review: 0, user: 0, verification: 0, retry: 0 }, reviews: 0, retries: 0 };
+  return { since: now, phase: phase(task), ms: { queue: 0, execution: 0, review: 0, user: 0, verification: 0, retry: 0 }, reviews: 0, retries: 0, toolRetries: 0, resumes: 0 };
 }
 /** Legacy tasks remain unmeasured; never fabricate durations from old activity messages. */
 export function advanceTiming(previous: TaskRecord, next: TaskRecord, now: number): TaskTiming | undefined {
@@ -30,14 +32,18 @@ export function advanceTiming(previous: TaskRecord, next: TaskRecord, now: numbe
   timing.since = Math.max(now, timing.since);
   timing.phase = phase(next);
   if ((next.reviewDepth ?? 0) > (previous.reviewDepth ?? 0)) timing.reviews++;
-  if (next.retry?.phase === 'waiting' && (previous.retry?.phase !== 'waiting' || next.retry.source !== previous.retry.source || next.retry.attempt !== previous.retry.attempt)) timing.retries++;
+  if (next.retry?.phase === 'waiting' && (previous.retry?.phase !== 'waiting' || next.retry.source !== previous.retry.source || next.retry.attempt !== previous.retry.attempt)) {
+    timing.retries++;
+    const key = next.retry.source === 'tool' ? 'toolRetries' : 'resumes';
+    if (timing[key] !== undefined) timing[key]++;
+  }
   return timing;
 }
 export function timingSummary(task: TaskRecord, now = Date.now()): string {
   const timing = advanceTiming(task, task, now);
   if (!timing) return '耗时分项：历史任务未记录。';
   const labels: Record<TimingPhase, string> = { queue: '排队', execution: '执行（含工具）', review: '自动审核（含审核排队）', user: '等待用户（含提问排队）', verification: '验证/收集改动', retry: '重试等待' };
-  return `耗时分项：${TIMING_PHASES.map(key => `${labels[key]} ${(timing.ms[key] / 1000).toFixed(1)} 秒`).join('；')}。审核请求 ${timing.reviews} 次，观察到重试 ${timing.retries} 次。各项为互斥阶段耗时，不代表纯模型推理时间。`;
+  return `耗时分项：${TIMING_PHASES.map(key => `${labels[key]} ${(timing.ms[key] / 1000).toFixed(1)} 秒`).join('；')}。审核请求 ${timing.reviews} 次，观察到重试 ${timing.retries} 次${timing.toolRetries !== undefined && timing.resumes !== undefined ? `（编码工具 ${timing.toolRetries} 次，Nexus 续接 ${timing.resumes} 次）` : ''}。各项为互斥阶段耗时，不代表纯模型推理时间。`;
 }
 
 export function timeoutSummary(task: TaskRecord): string[] {

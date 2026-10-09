@@ -14,6 +14,8 @@ import { dependencyPassed } from './dependencies.js';
 import { taskStatusLabel } from './status.js';
 import { isInside } from './rules.js';
 import { changeSummary } from './change-summary.js';
+import { acceptanceChecksParameter } from './acceptance-checks.js';
+import { currentArtifactEvidence, expectedArtifacts } from './artifacts.js';
 
 export const briefSnapshotSchema = z.object({
   id: z.string(), revision: z.number().int().positive(), objective: z.string().min(1).max(4000), constraints: z.string().max(4000),
@@ -130,14 +132,14 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
   for (const criterion of brief.acceptance) {
     const related = tasks.filter(task => task.brief!.acceptance.some(item => item.id === criterion.id));
     const state = !related.length ? '尚未安排' : related.some(isActive) ? '进行中或等待中' : related.some(task => ['failed', 'cancelled', 'interrupted'].includes(task.status))
-      ? '有失败、取消或中断，需复核' : related.every(dependencyPassed) ? '关联任务验证通过，待需求验收' : '任务执行结束，尚未全部独立验证';
+      ? '有失败、取消或中断，需复核' : criterionEvidence(brief, records, criterion.id).checked ? '本项独立检查通过，待需求验收' : '任务执行结束，本项检查未通过或未登记';
     lines.push(`- ${criterion.id}：${criterion.text} — ${state}${related.length ? `（${related.map(task => task.id).join('、')}）` : ''}`);
   }
   if (brief.plan) lines.push('步骤计划（依赖顺序；尚未派发不代表已执行）：', ...brief.plan.map(step => `${step.id}：${step.description}；验收项 ${step.acceptance_ids.join('、')}；前置步骤 ${step.depends_on.join('、') || '无'}；验证 ${step.verify}`));
   const obsolete = records.filter(task => sameChat(task.ownerSession, brief.ownerSession) && task.brief?.id === brief.id && task.brief.revision !== brief.revision && isActive(task));
   if (obsolete.length) lines.push(`旧版本仍有活动任务：${obsolete.map(task => task.id).join('、')}。运行中的任务仍按原说明执行；修改说明单不会自动调整已运行任务，请明确停止或调整它们。`);
   lines.push('任务结果：', ...(tasks.length ? tasks.slice(0, 50).map(task => {
-    const changes = changeSummary(task.result?.changedFiles ?? []);
+    const changes = changeSummary(task.result?.changedFiles ?? [], expectedArtifacts(task));
     return `${task.id}${task.planStep ? `（步骤 ${task.planStep}）` : ''} ${taskStatusLabel(task)}：${task.description.slice(0, 160)}${task.verify ? `；验证：${[task.verify, ...(task.verifyCommands ?? [])].join('；')}` : ''}${task.result ? `；项目文件 ${changes.project.length}，依赖 ${changes.dependencies.length}，测试/缓存产物 ${changes.generated.length}；${(task.result.detail || task.result.summary).slice(0, 240)}` : ''}`;
   }) : ['尚无本版本的关联任务。']),
     ...(tasks.length > 50 ? [`另有 ${tasks.length - 50} 个任务未展开；验收覆盖仍统计全部关联任务。`] : []),
@@ -145,11 +147,13 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
   return lines.join('\n');
 }
 
-export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd' | 'permissions'>): string {
+export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation' | 'brief' | 'verify' | 'verifyCommands' | 'verifyCwd' | 'permissions' | 'outputs' | 'acceptanceChecks'>): string {
   const description = task.description + CODER_WORK_GUIDANCE + (task.continuation ? `\n\n[本次续接说明]\n${task.continuation}\n仍须满足已保存的目标、共同约束和完整验收；不能用续接说明替换或缩小它们。` : '')
     + (task.permissions?.securityMode === 'full' ? '\n\n[执行权限]\n本任务已由设置授予完全权限：可用当前系统用户权限访问项目外文件、联网和运行命令，无执行沙箱或逐项权限审批；不需要为常规执行再申请权限。仍按用户目标工作，实质歧义应澄清；避免在输出中暴露密钥。' : '\n\n[环境配置与执行检查]\n' + (task.permissions?.securityMode === 'standard' ? '本任务工作区内经真实路径核验的 .env 及 .env.* 可以按项目配置读取、创建和修改，优先用原生文件工具，无需仅因文件名再次申请用户确认。读取结果仅用于本任务配置处理，不得把配置值复制到对话回复、普通日志、代码提交或交付物；工作区外凭据和受保护目录仍禁止访问。涉及配置的命令仍按具体行为审核，source / 点加载会执行文件内容，不能视为普通读取。' : '项目内 .env.example、.env.sample、.env.template 可用原生文件工具创建或修改，只填空值、占位符及本地非敏感配置。严格模式下实际 .env 仍受保护，不读取或打印已有密钥，不用 shell 绕过文件限制。') + '运行测试优先指定测试文件或目录，使用可检查的项目脚本；避免反复申请同一被拒操作。')
     + (task.brief ? '\n先核对实际项目目录和所需运行环境。发现环境或依赖加载失败，先定位并采用可恢复的修复，不通过删除依赖、改写测试或换技术栈掩盖真实启动失败。' : '')
-    + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件。修改中先做必要的针对性自测，不为收尾形式再重复整套验收；宿主会独立执行上述命令。任何一项失败或未执行都不能报告全部验收通过。` : '');
+    + (task.verify ? `\n\n[DSH 独立验证约定]\n任务结束后宿主将在 ${task.verifyCwd ?? '任务目录'} 按顺序运行：\n${[task.verify, ...(task.verifyCommands ?? [])].map(command => `- ${command}`).join('\n')}\n请准备这些验证所需的文件。修改中先做必要的针对性自测，不为收尾形式再重复整套验收；宿主会独立执行上述命令。任何一项失败或未执行都不能报告全部验收通过。` : '')
+    + (task.acceptanceChecks?.length ? `\n逐项检查：\n${task.acceptanceChecks.map(check => `${check.criterion}：命令 ${check.commands.join('；') || '无'}；文件 ${check.files.join('、') || '无'}`).join('\n')}` : '')
+    + (task.outputs?.length ? `\n声明交付文件（相对任务目录）：${task.outputs.join('、')}。宿主会检查实际文件；报告中声明存在的交付物应真实生成，文档更新和复现分支须各有对应证据。` : '');
   if (!task.brief) return description;
   return `${description}\n\n[派发时的任务说明单 ${task.brief.id}，版本 ${task.brief.revision}]\n总体目标：${task.brief.objective}\n共同约束：${task.brief.constraints || '无补充'}\n本任务负责的验收项：\n${task.brief.acceptance.map(item => `${item.id}. ${item.text}`).join('\n')}\n只完成本任务负责的部分，不把单个子任务完成表述为整个目标已完成。已明确的目标不重复澄清；技术细节先查项目，只有影响目标、范围或授权的新问题才反馈。说明单不会扩大工具权限。`;
 }
@@ -167,7 +171,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
       cwd: { type: 'string', description: 'save 时可指定项目根目录（相对于当前会话工作区）；新项目应在这里绑定目录。省略时首次派发会固定实际目录。后续步骤默认沿用，不能越出项目或会话边界。' },
       criterion: { type: 'string', description: 'review 必填，向用户确认的具体验收项 ID。' },
       note: { type: 'string', description: 'review 可填，向用户说明核验方式与实际结果，最多 1000 字；不能代替用户确认。' },
-      steps: { type: 'array', description: 'plan 必填，完整步骤列表。保存成功会生成新版本；不启动任务。需要已有运行环境的步骤用 preflight 登记环境自检脚本；outputs 列预期文件以便提前检查保护规则。', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, description: { type: 'string', required: true }, acceptance_ids: { type: 'array', items: { type: 'string' }, required: true }, depends_on: { type: 'array', items: { type: 'string' }, required: true }, verify: { type: 'string', required: true }, preflight: { type: 'string' }, outputs: { type: 'array', items: { type: 'string' } } } } },
+      steps: { type: 'array', description: 'plan 必填，完整步骤列表。保存成功会生成新版本；不启动任务。preflight 登记环境自检；verify_commands 追加 verify 之后的检查；acceptance_checks 对应逐项验收；outputs 列需实际核验的预期交付文件。', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, description: { type: 'string', required: true }, acceptance_ids: { type: 'array', items: { type: 'string' }, required: true }, depends_on: { type: 'array', items: { type: 'string' }, required: true }, verify: { type: 'string', required: true }, verify_commands: { type: 'array', items: { type: 'string' } }, acceptance_checks: acceptanceChecksParameter, preflight: { type: 'string' }, outputs: { type: 'array', items: { type: 'string' } } } } },
       objective: { type: 'string', description: '用户目标，不自行扩大范围。save 必填。' },
       constraints: { type: 'string', description: '用户已明确的范围、约束及关键决定。save 时完整填写。' },
       acceptance: { type: 'array', items: { type: 'string' }, description: '1 至 20 条具体可核验的验收标准。save 必填。修改会生成新版本，旧任务不自动计入新版本。' },
@@ -196,17 +200,17 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
         const brief = store.get(args.brief_id!, owner);
         if (args.action === 'review') {
           if (brief.revision !== args.revision || !args.criterion) throw new Error('review 需要当前 revision 和 criterion。');
-          const state = criterionEvidence(brief, records(), args.criterion);
+          const state = criterionEvidence(brief, await currentArtifactEvidence(briefTasks(brief, records()), exec.signal), args.criterion);
           if (!state.settled) throw new Error('该验收项尚未关联任务或任务仍在执行，请先完成工作。');
           const note = (args.note ?? '').slice(0, 1000);
           const answer = await (askUser ?? (request => ctx.userQuestions.ask(request)))({ agent: exec.agent, signal: exec.signal, wait: { callId: exec.callId }, questions: [{ id: 'accept', question: `请确认业务验收：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
             detail: `${state.checked ? '关联任务的独立检查已通过。' : '关联任务尚未全部通过独立检查。'}${note}\n任务：${state.tasks.map(task => task.id).join('、')}`, options: [{ label: '已满足' }, { label: '未满足' }] }] });
-          if (criterionEvidence(brief, records(), args.criterion).evidence !== state.evidence) throw new Error('验收期间任务证据已变化，请重新核对。');
+          if (criterionEvidence(brief, await currentArtifactEvidence(briefTasks(brief, records()), exec.signal), args.criterion).evidence !== state.evidence) throw new Error('验收期间任务证据已变化，请重新核对。');
           const selected = answer.answers.find(item => item.id === 'accept');
           if (!selected || selected.selected.length !== 1 || !['已满足', '未满足'].includes(selected.selected[0]!)) throw new Error('未取得明确的业务验收回答。');
           await store.review(brief.id, owner, brief.revision, { criterion: args.criterion, evidence: state.evidence, accepted: selected.selected.includes('已满足'), note: selected.custom?.slice(0, 1000) ?? note, at: Date.now() });
         }
-        return { text: deliveryReport(store.get(brief.id, owner), records()) };
+        return { text: deliveryReport(store.get(brief.id, owner), await currentArtifactEvidence(briefTasks(brief, records()), exec.signal)) };
       }
       let cwd: string | undefined;
       if (args.cwd !== undefined) {

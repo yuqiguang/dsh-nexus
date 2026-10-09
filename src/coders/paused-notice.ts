@@ -10,7 +10,7 @@ export function pausedNoticeTask(owner: string, events: readonly SessionEvent[],
   const start = events.findLastIndex(event => event.type === 'turn/start');
   if (start < 0) return;
   const turn = events.slice(start);
-  return tasks.find(task => task.ownerSession === owner && task.stopCause === 'user-wait-timeout' && task.status === 'interrupted'
+  return tasks.find(task => task.ownerSession === owner && ['user-wait-timeout', 'retry-no-progress'].includes(task.stopCause ?? '') && task.status === 'interrupted'
     && !tasks.some(next => next.ownerSession === owner && (next.resumedFrom === task.id || next.replaces === task.id))
     && turn.some(event => event.type === 'user/message' && (event.data.source as { kind: string }).kind === 'tool-jobs'
       && (event.seq === task.completionNotice?.seq || String((event.data.source as { summary?: string }).summary ?? '').includes(`[${task.id}]`)))
@@ -29,7 +29,7 @@ export function pausedNoticeRead(exec: Pick<ToolExecution, 'name' | 'arguments'>
 }
 
 export function pausedNoticeReason(task: TaskRecord): string {
-  return `任务 ${task.id} 因等待用户超时暂停，本次后台通知只读取状态与现有证据并汇报。未执行本次操作；不能改用主会话命令、修改文件或重新派发来继续待确认工作。等待用户明确续接后，按原任务权限恢复，保留原审批和验收记录。`;
+  return `任务 ${task.id} 因${task.stopCause === 'retry-no-progress' ? '重试长时间没有进展' : '等待用户超时'}暂停，本次后台通知只读取状态与现有证据并汇报。未执行本次操作；不能改用主会话命令、修改文件或重新派发来继续暂停的工作。等待用户明确续接后，按原任务权限恢复，保留原审批和验收记录。`;
 }
 
 export function installPausedNoticeGuard(ctx: Context, tasks: () => TaskRecord[]): void {

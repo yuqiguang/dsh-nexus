@@ -9,6 +9,9 @@ export interface RetryNotice { retrying?: boolean; failure: ProviderFailure; att
 export interface TaskRetry {
   source: 'tool' | 'nexus'; phase: 'waiting' | 'resuming' | 'recovered' | 'stopped';
   reason: string; attempt?: number; maxAttempts?: number; retryAt?: number;
+  /** Observed retry wait since the last successful operation, excluding review/user waits. */
+  waitedMs?: number;
+  prolonged?: boolean;
 }
 
 export const RESUME_PROMPT = '上一次模型请求因短暂故障停止。请在本会话核对已完成的操作和当前文件，继续尚未完成的工作。不要重复已成功的命令、提交或其他副作用；不能确认操作是否完成时先检查结果。原任务目标、验收要求和权限不变。';

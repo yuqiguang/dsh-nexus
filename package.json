@@ -1,6 +1,6 @@
 {
   "name": "dsh-nexus",
-  "version": "0.2.60",
+  "version": "0.2.61",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/",
@@ -31,6 +31,7 @@
     "dist/build-info.json",
     "cordis.patch.yml",
     "README.md",
+    "docs/CODER_VERIFICATION.md",
     "locale/*.json",
     "locale/memory/*.json",
     "locale/mail/*.json",

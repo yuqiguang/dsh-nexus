@@ -2,6 +2,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { SessionId } from '@deepseek-ai/dsh-session';
 import type { AskUserQuestionAnswer, AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
 import { CODER_NAMES, type CoderDecision, type CoderRequest, type DecisionRecord, type TaskRecord } from './types.js';
+import { approvalProvenance } from './approval-provenance.js';
+import { redact } from './normalize.js';
 
 /** The two native services an escalation needs; narrowed so tests can fake them. */
 export interface EscalationHost {
@@ -23,7 +25,9 @@ function clip(value: string, max: number): string {
 }
 
 function approvalQuestion(task: TaskRecord, request: CoderRequest, reason: string | undefined): AskUserQuestionItem {
-  const detail = [`任务：${clip(task.description, 200)}`, reason ? `原因：${reason}` : undefined,
+  const detail = [`任务：${clip(task.description, 200)}`,
+    `目录：${redact(typeof request.raw.cwd === 'string' ? request.raw.cwd : task.cwd)}${task.brief ? `；说明单 ${task.brief.id} v${task.brief.revision}` : ''}`,
+    '授权范围：仅本次具体操作，不适用于后续命令、整个会话或续接任务。', reason ? `原因：${reason}` : undefined,
     request.detail ? `详情：\n${clip(request.detail, DETAIL_LIMIT)}` : undefined].filter(Boolean).join('\n');
   return { id: 'approve', header: `编码任务 ${task.id}`, question: `${CODER_NAMES[task.coder]} 请求：${request.summary}`, detail,
     options: [{ label: '允许', description: request.tool === 'codex.permissions' ? '仅当前回合的上述权限，不延续到续接任务' : '仅本次' }, { label: '拒绝' }] };
@@ -45,6 +49,7 @@ function coderQuestions(task: TaskRecord, request: CoderRequest): AskUserQuestio
 export async function escalateToUser(host: EscalationHost, task: TaskRecord, request: CoderRequest,
   signal: AbortSignal, reason?: string): Promise<EscalationOutcome> {
   const base = { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user' as const };
+  const authorization = approvalProvenance(task, request);
   const found = await host.resolveAgent(task.ownerSession as SessionId).catch(error => ({ error }));
   if ('error' in found) {
     return { unreachable: true, decision: { behavior: 'deny', message: '无法联系用户，任务中断。', interrupt: true },
@@ -56,6 +61,7 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
   try {
     signal.throwIfAborted();
     answer = await host.ask({ questions, agent: found.agent, signal }, task.id);
+    signal.throwIfAborted();
   }
   catch (error) {
     const aborted = signal.aborted;
@@ -65,11 +71,15 @@ export async function escalateToUser(host: EscalationHost, task: TaskRecord, req
   // Audit the time of the answer, not the time the prompt was created.
   base.at = Date.now();
   if (request.kind !== 'question') {
+    if (approvalProvenance(task, request).operationId !== authorization.operationId) return { decision: { behavior: 'deny', message: '审批期间请求范围已变化，请重新申请。' },
+      record: { ...base, outcome: 'deny', reason: '审批期间请求范围已变化' } };
     const choice = answer.answers.find(item => item.id === 'approve');
     const custom = choice?.custom?.trim() ?? '';
-    const allowed = choice?.selected.includes('允许') || /^(允许|同意|是|yes|y)$/i.test(custom);
-    if (!allowed) return { decision: { behavior: 'deny', message: '用户拒绝了这次操作。' }, record: { ...base, outcome: 'deny', reason: '用户拒绝' } };
-    return { decision: { behavior: 'allow' }, record: { ...base, outcome: 'allow', ...(reason ? { reason } : {}) } };
+    const allowed = choice?.selected.length === 1 && choice.selected[0] === '允许' && !custom
+      || choice?.selected.length === 0 && /^(允许|同意|是|yes|y)$/i.test(custom);
+    if (!allowed) return { decision: { behavior: 'deny', message: '未取得对本次操作的明确允许。' }, record: { ...base, outcome: 'deny',
+      ...(choice?.selected.length === 1 && choice.selected[0] === '拒绝' ? { authorization, reason: '用户拒绝' } : { reason: '未取得明确允许，操作未执行' }) } };
+    return { decision: { behavior: 'allow' }, record: { ...base, authorization, outcome: 'allow', ...(reason ? { reason } : {}) } };
   }
   const answers: Record<string, string> = {};
   for (const [index, question] of (request.questions ?? []).entries()) {

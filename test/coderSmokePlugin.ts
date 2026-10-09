@@ -90,7 +90,8 @@ class FixtureModel extends LlmAdapter {
       const match = /cb-[a-f0-9]+/.exec(toolResultText(options, 'brief'));
       assert.ok(match); this.briefId = match[0];
       yield* this.toolCall('plan', 'coder_brief', { action: 'plan', brief_id: this.briefId, revision: 1, steps: [
-        { id: 'inspect', description: '列出目录内容并报告', acceptance_ids: ['a1'], depends_on: [], verify: 'true' },
+        { id: 'inspect', description: '列出目录内容并报告', acceptance_ids: ['a1'], depends_on: [], verify: 'true', outputs: ['README.md'],
+          acceptance_checks: [{ criterion: 'a1', commands: ['true'], files: ['README.md'] }] },
         { id: 'business', description: '后续业务验收', acceptance_ids: ['a2'], depends_on: ['inspect'], verify: 'true' },
       ] });
     } else if (step === 2) {
@@ -113,7 +114,7 @@ class FixtureModel extends LlmAdapter {
     } else {
       assert.equal(step, 6);
       const coverage = toolResultText(options, 'brief-report');
-      assert.match(coverage, /a1：目录检查通过 — 关联任务验证通过，待需求验收/);
+      assert.match(coverage, /a1：目录检查通过 — 本项独立检查通过，待需求验收/);
       assert.match(coverage, /a2：后续业务验收 — 尚未安排/);
       const report = toolResultText(options, 'read');
       assert.match(report, /编码任务 ct-[0-9a-f]{8} 执行结束/);
@@ -282,7 +283,13 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.equal(done.autoAllowed, 2);
     assert.equal(done.activity, undefined);
     assert.deepEqual(done.decisions.map(decision => [decision.layer, decision.outcome]), [['hard', 'deny'], ['supervisor', 'allow'], ['user', 'allow'], ['supervisor', 'allow']]);
+    const approval = done.decisions.find(decision => decision.layer === 'user')!.authorization!;
+    assert.deepEqual([approval.source, approval.scope, approval.taskId, approval.ownerSession, approval.cwd, approval.briefRevision],
+      ['native-user-question', 'once', done.id, sessionId, done.cwd, done.brief!.revision]);
+    assert.match(approval.operationId, /^[a-f0-9]{64}$/);
     assert.equal(done.result!.verifyOk, true);
+    assert.deepEqual(done.result!.artifactChecks?.map(check => [check.path, check.ok]), [[join(done.cwd, 'README.md'), true]]);
+    assert.match(done.result!.artifactChecks![0]!.sha256!, /^[a-f0-9]{64}$/);
     assert.ok(readTask);
     const detail = await readTask('get', { id: done.id }) as TaskDetailView;
     assert.equal(detail.ownerSession, sessionId);
@@ -358,10 +365,12 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     try { assert.equal(reopened.get(done.id)!.brief?.cwd, done.cwd, 'bound project snapshot survives native storage reopening');
       assert.deepEqual(reopened.get(done.id)!.safetyReviews, audits, 'native task audit survives closing and reopening storage');
       assert.deepEqual(reopened.get(done.id)!.retry, done.retry, 'retry state survives native storage reopening');
+      assert.deepEqual(reopened.get(done.id)!.decisions.find(decision => decision.layer === 'user')!.authorization, approval, 'once-only approval provenance survives native storage reopening');
+      assert.deepEqual(reopened.get(done.id)!.result!.artifactChecks, done.result!.artifactChecks, 'declared file evidence survives native storage reopening');
       assert.deepEqual(reopened.get(done.id)!.completionNotice, placed.completionNotice, 'notification placement survives reopening'); }
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
-      checks: ['native_direct_write_conflict_rejected_before_approval', 'native_read_available_during_coder', 'native_bash_job_keeps_workspace_lease', 'native_bash_notice_origin_persists_by_message_id', 'native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
+      checks: ['native_owner_approval_receipt_scoped_and_persisted', 'native_per_criterion_file_evidence_persisted', 'native_direct_write_conflict_rejected_before_approval', 'native_read_available_during_coder', 'native_bash_job_keeps_workspace_lease', 'native_bash_notice_origin_persists_by_message_id', 'native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
         'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }

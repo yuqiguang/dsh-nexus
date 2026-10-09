@@ -9,12 +9,15 @@ import { promisify } from 'node:util';
 import { isInside } from './rules.js';
 import { createOutputDecoder, pythonUtf8Output } from './decode.js';
 import type { TaskRecord } from './types.js';
+import { expectedArtifacts, inspectArtifact } from './artifacts.js';
+import type { ArtifactCheck } from './acceptance-checks.js';
 
 const run = promisify(execFile);
 
 export class SnapshotError extends Error {}
 
 export interface VerifyResult {
+  artifactChecks?: ArtifactCheck[];
   preflightCheck?: { command: string; ok: boolean; executed: boolean; output: string };
   changedFiles: string[];
   commits?: string[];
@@ -55,6 +58,19 @@ export function windowsVerifyWords(command: string): string[] {
   if (quote) throw new Error('验证命令的引号未闭合。');
   if (started) words.push(word);
   if (words.length && !words[0]) throw new Error('验证程序不能为空。');
+  return words;
+}
+
+/** One observable child exit per check. An inline shell can turn a failed child into a successful echo. */
+export function verifyCommandWords(command: string, platform = process.platform): string[] {
+  if (platform !== 'win32' && /[|&;<>`'"\r\n]|\$\(/.test(command)) throw new Error('验证命令不经过 shell，不能包含组合语法或引号；请用 verify_commands 分别登记检查。');
+  const words = platform === 'win32' ? windowsVerifyWords(command) : command.trim().split(/\s+/);
+  const name = words[0]?.replace(/\\/g, '/').split('/').at(-1)?.replace(/\.exe$/i, '').toLowerCase();
+  if (!name) throw new Error('验证命令不能为空。');
+  if (/^(?:pwsh|powershell|cmd|(?:ba|da|z|k)?sh)$/.test(name)
+    && words.slice(1).some(word => /^\/(?:c|k)$/i.test(word) || /^-(?:[a-z]*c|command.*|enc.*)$/i.test(word))) {
+    throw new Error('独立验证不接受内联 shell 包装：打印子进程退出码不等于传播失败。请用 verify_commands 逐条登记实际检查程序，或使用会传播失败的检查脚本。');
+  }
   return words;
 }
 /** Files a `walk` snapshot fingerprints at most; directories that are never a task's own output are skipped. */
@@ -181,7 +197,7 @@ export async function changedFiles(cwd: string, baseline?: WorkTreeSnapshot, sig
 export async function runVerifyCommand(command: string, cwd: string, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv): Promise<{ ok: boolean; output: string; executed?: boolean }> {
   if (!await stat(cwd).then(info => info.isDirectory(), () => false)) return { ok: false, executed: false, output: `验证未执行：验证目录不存在或不可访问：${cwd}。verify_cwd 相对于任务 cwd；项目根目录请填写 .，不要重复项目目录名。` };
   let words: string[];
-  try { words = process.platform === 'win32' ? windowsVerifyWords(command) : command.trim().split(/\s+/); }
+  try { words = verifyCommandWords(command); }
   catch (error) { return { ok: false, executed: false, output: (error as Error).message }; }
   const [program, ...args] = words;
   if (!program) return Promise.resolve({ ok: true, output: '' });
@@ -227,7 +243,7 @@ export async function runVerifyCommand(command: string, cwd: string, signal?: Ab
 }
 
 /** The supervisor's own check after the coder reports completion; never trusts the coder's summary. */
-export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'verifyCommands' | 'verifyCwd'>, roots: readonly string[], baseline?: WorkTreeSnapshot, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv, onCheck?: (check: NonNullable<VerifyResult['verifyChecks']>[number]) => void): Promise<VerifyResult> {
+export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'verifyCommands' | 'verifyCwd' | 'outputs' | 'acceptanceChecks'>, roots: readonly string[], baseline?: WorkTreeSnapshot, signal?: AbortSignal, confine?: (argv: string[], command: string) => Promise<string[]>, extraEnv?: NodeJS.ProcessEnv, onCheck?: (check: NonNullable<VerifyResult['verifyChecks']>[number]) => void): Promise<VerifyResult> {
   const result: VerifyResult = { changedFiles: [], outsideRoots: [] };
   if (task.verify) {
     const directory = await canonical(task.verifyCwd ?? task.cwd);
@@ -249,6 +265,15 @@ export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'veri
     result.verifyExecuted = checks.some(check => check.executed);
     result.verifyOutput = checks.length === 1 ? checks[0]!.output : checks.map(check => `验证 ${check.command}：${!check.executed ? '未执行' : check.ok ? '通过' : '失败'}\n${check.output}`).join('\n');
   }
+  const artifacts = expectedArtifacts(task);
+  if (artifacts.length) {
+    const checks: ArtifactCheck[] = [];
+    for (const path of artifacts) checks.push(await inspectArtifact(path, task.cwd, signal));
+    result.artifactChecks = checks;
+    result.verifyOk = result.verifyOk !== false && checks.every(check => check.ok);
+    result.verifyExecuted = result.verifyExecuted || !signal?.aborted;
+    result.verifyOutput = [result.verifyOutput, ...checks.map(check => `文件 ${check.path}：${check.ok ? '已核验' : '未通过'}；${check.detail}`)].filter(Boolean).join('\n');
+  }
   const files = await changedFiles(task.cwd, baseline, signal);
   result.changedFiles = files; result.outsideRoots = files.filter(file => !roots.some(root => isInside(root, file)));
   if (baseline?.head) {
@@ -260,7 +285,8 @@ export async function verifyTask(task: Pick<TaskRecord, 'cwd' | 'verify' | 'veri
 
 /** Inspect a package-manager invocation without guessing a project from task prose. */
 export async function verifyPreflight(command: string, cwd: string): Promise<string | undefined> {
-  const args = process.platform === 'win32' ? windowsVerifyWords(command) : command.trim().split(/\s+/);
+  let args: string[];
+  try { args = verifyCommandWords(command); } catch (error) { return (error as Error).message; }
   if (!['npm', 'pnpm', 'yarn'].includes(args[0]!) || !args.some(word => ['run', 'test', 'build'].includes(word))) return;
   let directory = cwd;
   for (let i = 1; i < args.length; i++) {

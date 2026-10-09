@@ -1,5 +1,6 @@
 import type { CoderBrief } from './brief.js';
-import { briefTasks } from './delivery.js';
+import { briefTasks, criterionEvidence } from './delivery.js';
+import { sameChat } from '../channels/protocol.js';
 import { dependencyPassed } from './dependencies.js';
 import { resolvePlanStep } from './plan.js';
 import { isActive, type TaskRecord } from './types.js';
@@ -10,17 +11,18 @@ export interface TaskRecoveryView {
   context?: string;
   blockers: string[];
   followingTasks: string[];
+  action?: { tool: 'coder_task'; arguments: { retry_task_id?: string; resume_task_id?: string; verification_only?: true } };
 }
 
 /** Read-only guidance from persisted records. Dispatch still checks the live native session and permissions. */
 export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: CoderBrief): TaskRecoveryView {
-  const own = records.filter(record => record.ownerSession === task.ownerSession);
+  const own = records.filter(record => sameChat(record.ownerSession, task.ownerSession));
   const followingTasks = own.filter(record => (record.replaces ?? record.resumedFrom) === task.id).map(record => record.id);
   const view: TaskRecoveryView = { title: '', nextStep: '', blockers: [], followingTasks };
   if (followingTasks.length) {
     return { ...view, title: '此任务已有后续执行', nextStep: '先查看后续任务的结果，在其所属会话中继续；不要重复恢复这条旧记录。' };
   }
-  if (task.brief && (!current || current.ownerSession !== task.ownerSession || current.id !== task.brief.id || current.revision !== task.brief.revision)) {
+  if (task.brief && (!current || !sameChat(current.ownerSession, task.ownerSession) || current.id !== task.brief.id || current.revision !== task.brief.revision)) {
     return { ...view, title: current ? '此任务属于旧目标版本' : '当前目标记录不可用',
       nextStep: '回到所属会话核对当前目标和验收项，再决定需要执行哪些步骤；这条记录不能作为当前版本的恢复依据。' };
   }
@@ -34,8 +36,13 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
     const [title, nextStep] = states[task.status as keyof typeof states];
     return { ...view, title, nextStep };
   }
-  if (dependencyPassed(task)) return { ...view, title: '指定检查已通过',
-    nextStep: '保留本步骤结果，查看目标与验收中尚未完成的项目；需要确认的业务效果仍由你验收。' };
+  if (dependencyPassed(task)) {
+    const uncovered = current && task.brief ? task.brief.acceptance.filter(item => !criterionEvidence(current, records, item.id).checked).map(item => item.id) : [];
+    return { ...view, title: '指定检查已通过',
+      nextStep: uncovered.length ? `验收项 ${uncovered.join('、')} 尚未有完整独立证据；先补齐 acceptance_checks 和对应命令/文件，再用 verification_only 沿原任务复验，最后读取 coder_brief delivery。`
+        : '保留本步骤结果，查看目标与验收中尚未完成的项目；需要确认的业务效果仍由你验收。',
+      ...(uncovered.length ? { action: { tool: 'coder_task', arguments: { resume_task_id: task.id, verification_only: true } } } : {}) };
+  }
   view.title = task.stopCause === 'user-wait-timeout' ? '等待用户超时，已暂停' : task.status === 'interrupted' ? '任务已中断' : task.status === 'cancelled' ? '任务已取消'
     : task.result?.execution === 'failed' ? '编码执行失败'
     : task.permissions?.securityMode !== 'full' && task.result?.outsideRoots.length ? '检测到工作区外改动'
@@ -63,8 +70,10 @@ export function taskRecovery(task: TaskRecord, records: TaskRecord[], current?: 
   if (blocked.length) view.blockers.push(`前置任务尚未通过或不可用：${blocked.join('、')}。先修复前置步骤，再核对最新任务依赖。`);
   view.nextStep = view.blockers.length ? '先在所属会话处理以下阻塞，再查看恢复清单。'
     : task.stopCause === 'user-wait-timeout' ? '等待用户明确要求继续；先解释未解决的具体审批原因，不自动重复派发，不改用主会话终端、文件修改或其他工具继续待确认操作，不将超时表述为用户拒绝。新请求仍需本次授权；从原任务续接并保留验收记录。'
-    : task.result?.execution === 'completed' ? '编码已完成，先核对验证条件；仅复验时使用 verification_only=true，沿用计划中的 verify，无需再次启动编码工具。'
-    : '回到所属会话说明继续要求，先核对停止原因、已有改动和验证结果，只恢复需要处理的步骤。';
+    : task.result?.execution === 'completed' ? '编码已完成，先核对验证条件；仅复验时使用 verification_only=true，保留本版本已登记的验证命令并补齐逐项检查，无需再次启动编码工具。结束后读取 coder_brief delivery。'
+    : '用户要求继续后，先核对停止原因和已有文件，再沿原编码会话完成剩余工作并独立验证。不能用主会话临时检查代替本恢复链；结束后读取 coder_brief delivery。';
+  if (!view.blockers.length && task.stopCause !== 'user-wait-timeout') view.action = { tool: 'coder_task', arguments: { retry_task_id: task.id,
+    ...(task.result?.execution === 'completed' ? { verification_only: true } : {}) } };
   return view;
 }
 
@@ -82,22 +91,24 @@ export function recoveryReport(brief: CoderBrief, records: TaskRecord[], forDisp
     lines.push(`${step.id}：${state}；任务说明：${step.description}${task?.stopReason ? `；停止原因：${task.stopReason}` : task?.result?.detail ? `；执行说明：${task.result.detail}` : ''}`);
   }
   if (!brief.plan) for (const task of tasks) {
-    const blockers = taskRecovery(task, records, brief).blockers;
-    lines.push(`${task.id}：${dependencyPassed(task) ? '保留已通过结果' : isActive(task) ? '仍在执行或等待' : blockers.length ? blockers.join('；') : '可检查后显式重试'}；${task.stopReason || task.result?.detail || task.result?.summary || ''}`);
+    const recovery = taskRecovery(task, records, brief);
+    lines.push(`${task.id}：${recovery.title}；${recovery.nextStep}；${task.stopReason || task.result?.detail || task.result?.summary || ''}`);
+    if (recovery.blockers.length) lines.push(...recovery.blockers);
+    if (recovery.action && !forDisplay) lines.push(`明确续接后调用 ${recovery.action.tool}：${JSON.stringify(recovery.action.arguments)}；其余目录、权限、验收和验证约定沿用原记录。`);
   }
-  lines.push('重试保留原任务与审批历史，不继承一次性授权；下游步骤须显式重新派发并绑定最新执行。');
+  lines.push('重试保留原任务与审批历史，不继承一次性授权；中断执行不能通过仅验证模式改写为编码完成。下游步骤须显式重新派发并绑定最新执行；交付前核对逐项检查、声明文件和业务验收。');
   return lines.join('\n');
 }
 
 export function assertRetry(previous: TaskRecord, records: TaskRecord[]): void {
   if (isActive(previous)) throw new Error('任务尚未停止，不能重试。');
   if (dependencyPassed(previous)) throw new Error('任务已验证通过，请保留结果；需求变化时修改计划。');
-  if (records.some(task => task.ownerSession === previous.ownerSession && (task.replaces ?? task.resumedFrom) === previous.id)) throw new Error('该任务已有后续执行，请读取最新任务后再恢复。');
+  if (records.some(task => sameChat(task.ownerSession, previous.ownerSession) && (task.replaces ?? task.resumedFrom) === previous.id)) throw new Error('该任务已有后续执行，请读取最新任务后再恢复。');
   const affected = new Set([previous.id]);
   let changed = true;
   while (changed) {
     changed = false;
-    for (const task of records) if (task.ownerSession === previous.ownerSession && !affected.has(task.id) && task.dependsOn?.some(id => affected.has(id))) { affected.add(task.id); changed = true; }
+    for (const task of records) if (sameChat(task.ownerSession, previous.ownerSession) && !affected.has(task.id) && task.dependsOn?.some(id => affected.has(id))) { affected.add(task.id); changed = true; }
   }
   if (records.some(task => task.id !== previous.id && affected.has(task.id) && isActive(task))) throw new Error('仍有下游任务活动，请先停止受影响任务再重试。');
 }

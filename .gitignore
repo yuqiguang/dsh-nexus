@@ -13,7 +13,8 @@ coverage/
 *.tgz
 
 # Private development material is not part of this repository.
-docs/
+docs/*
+!docs/CODER_VERIFICATION.md
 AGENTS.md
 dist.*/
 *.zip

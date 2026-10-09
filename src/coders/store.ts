@@ -1,12 +1,15 @@
 import { advanceTiming, initialTiming, TIMING_PHASES } from './timing.js';
 import { REVIEW_FAILURES, REVIEW_ERROR_CODES } from './review.js';
 import { briefSnapshotSchema } from './brief.js';
+import { acceptanceChecksSchema } from './acceptance-checks.js';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
 import { randomBytes } from 'node:crypto';
 import { z, type ZodType } from 'zod';
 import { isActive, type HabitRule, type TaskRecord } from './types.js';
 
 const decisionSchema = z.object({
+  authorization: z.object({ source: z.literal('native-user-question'), scope: z.literal('once'), taskId: z.string(), ownerSession: z.string(), cwd: z.string(),
+    briefId: z.string().optional(), briefRevision: z.number().int().positive().optional(), operationId: z.string().regex(/^[a-f0-9]{64}$/) }).optional(),
   at: z.number(),
   kind: z.enum(['command', 'file-write', 'file-read', 'network', 'question', 'other']),
   summary: z.string(),
@@ -18,6 +21,7 @@ const decisionSchema = z.object({
 });
 
 const resultSchema = z.object({
+  artifactChecks: z.array(z.object({ path: z.string(), ok: z.boolean(), detail: z.string(), sha256: z.string().optional(), size: z.number().nonnegative().optional() })).optional(),
   execution: z.enum(['completed', 'failed', 'stopped']).optional(),
   verification: z.enum(['passed', 'failed', 'not-run']).optional(),
   preflightCheck: z.object({ command: z.string(), ok: z.boolean(), executed: z.boolean(), output: z.string() }).optional(),
@@ -32,9 +36,11 @@ const resultSchema = z.object({
 });
 
 export const taskSchema: ZodType<TaskRecord> = z.object({
+  outputs: z.array(z.string()).max(100).optional(),
+  acceptanceChecks: acceptanceChecksSchema.optional(),
   timing: z.object({ since: z.number(), phase: z.enum(TIMING_PHASES).optional(),
     ms: z.object({ queue: z.number().nonnegative(), execution: z.number().nonnegative(), review: z.number().nonnegative(), user: z.number().nonnegative(), verification: z.number().nonnegative(), retry: z.number().nonnegative() }),
-    reviews: z.number().int().nonnegative(), retries: z.number().int().nonnegative() }).optional(),
+    reviews: z.number().int().nonnegative(), retries: z.number().int().nonnegative(), toolRetries: z.number().int().nonnegative().optional(), resumes: z.number().int().nonnegative().optional() }).optional(),
   reviewDepth: z.number().int().nonnegative().optional(),
   verificationOnly: z.boolean().optional(),
   id: z.string(),
@@ -51,9 +57,10 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   verifyNetwork: z.enum(['offline', 'loopback', 'ask']).optional(),
   verificationSkipped: z.object({ at: z.number(), command: z.string() }).optional(),
   stopReason: z.string().optional(),
-  stopCause: z.literal('user-wait-timeout').optional(),
+  stopCause: z.enum(['user-wait-timeout', 'retry-no-progress']).optional(),
   userWaitTimeout: z.object({ startedAt: z.number(), endedAt: z.number(), summary: z.string(), reason: z.string().optional() }).optional(),
   retry: z.object({ source: z.enum(['tool', 'nexus']), phase: z.enum(['waiting', 'resuming', 'recovered', 'stopped']), reason: z.string(),
+    waitedMs: z.number().nonnegative().optional(), prolonged: z.boolean().optional(),
     attempt: z.number().int().nonnegative().optional(), maxAttempts: z.number().int().nonnegative().optional(), retryAt: z.number().optional() }).optional(),
   permissions: z.object({ version: z.literal(1), mode: z.literal('unattended'), securityMode: z.enum(['standard', 'strict', 'full']).optional(), writableRoots: z.array(z.string()), network: z.enum(['ask', 'unrestricted']), webResearch: z.boolean().optional(), autoApproveSafe: z.boolean().optional(), reviewPolicy: z.object({ commands: z.enum(['auto', 'ask']), files: z.enum(['auto', 'ask']), network: z.enum(['auto', 'ask']), instructions: z.string().max(4000) }).strict().optional(), reviewRoots: z.array(z.string()).optional(), allowedNetworkDomains: z.array(z.string()).default([]),
     maxDurationMs: z.number().positive(), maxRepeatedDenials: z.number().int().positive(), isolation: z.enum(['codex-workspace', 'claude-sandbox', 'dsh-supervised', 'unrestricted']) }).optional(),

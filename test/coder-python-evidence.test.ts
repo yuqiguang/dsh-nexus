@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { taskPermissions } from '../src/coders/permissions.js';
 import { reviewEnvelope, reviewFingerprint } from '../src/coders/review.js';
 import { codexCommandRequest } from '../src/coders/normalize.js';
-import { pythonImports } from '../src/coders/python-evidence.js';
+import { pythonImports, pythonObservations } from '../src/coders/python-evidence.js';
 import { commandEvidence } from '../src/coders/review-evidence.js';
 import type { TaskRecord } from '../src/coders/types.js';
 
@@ -223,4 +223,48 @@ test('Python import traversal remains bounded and dynamic imports never claim co
   assert.ok(many.evidence.filter(line => line.includes('完整内容')).length <= 64);
   await f.write('check.py', 'import importlib\nimportlib.import_module(module_name)');
   assert.equal((await f.inspect('python check.py')).evidenceComplete, false);
+});
+
+test('literal project Python paths collect installed source and entry dependencies without executing them', async t => {
+  const f = await fixture(t);
+  await f.write('narrate.py', "from pathlib import Path\nimport sys\nROOT = Path(__file__).resolve().parent\nsys.path.insert(0, str(ROOT / 'pydeps'))\nimport speech\n");
+  await f.write('pydeps/speech/__init__.py', 'from .client import speak\n# INSTALLED_INIT');
+  await f.write('pydeps/speech/client.py', 'from .network import send\n# INSTALLED_CLIENT');
+  await f.write('pydeps/speech/network.py', 'open("must-not-run", "w").write("executed")\n# INSTALLED_NETWORK');
+  const first = await f.inspect('python narrate.py --probe');
+  for (const marker of ['INSTALLED_INIT', 'INSTALLED_CLIENT', 'INSTALLED_NETWORK']) assert.match(first.evidence.join('\n'), new RegExp(marker));
+  assert.equal(first.evidenceComplete, true);
+  assert.doesNotMatch(first.evidence.join('\n'), /动态 Python/);
+  await assert.rejects(access(join(f.cwd, 'must-not-run')));
+  const inline = await f.inspect('python -c "import sys; sys.path.insert(0, \'pydeps\'); import speech"');
+  assert.match(inline.evidence.join('\n'), /INSTALLED_NETWORK/);
+  await f.write('pydeps/speech/network.py', '# INSTALLED_NETWORK_CHANGED');
+  assert.notEqual(reviewFingerprint(first), reviewFingerprint(await f.inspect('python narrate.py --probe')));
+  assert.notEqual(reviewFingerprint(first), reviewFingerprint(await f.inspect('python narrate.py')));
+});
+
+test('unknown paths, changed bindings and native modules retain explicit evidence gaps', async t => {
+  const f = await fixture(t);
+  for (const expression of ["sys.path.insert(0, location)", "sys.path.extend(paths)", "sys.meta_path.append(loader)", "sys.path.insert(0, str(ROOT / value))"]) {
+    assert.equal(pythonObservations('import sys\n' + expression, f.cwd).dynamic, true, expression);
+  }
+  const root = "from pathlib import Path\nimport sys\nROOT = Path(__file__).resolve().parent\n";
+  assert.equal(pythonObservations(root + "ROOT = other\nsys.path.insert(0, str(ROOT / 'pydeps'))", f.cwd, join(f.cwd, 'main.py')).dynamic, true);
+  for (const shadow of ['def str(value): return elsewhere', 'ROOT: Path = other', 'ROOT, other = pair', 'Path.resolve = other']) {
+    assert.equal(pythonObservations(root + shadow + "\nsys.path.insert(0, str(ROOT / 'pydeps'))", f.cwd, join(f.cwd, 'main.py')).dynamic, true, shadow);
+  }
+  assert.equal(pythonObservations("import sys\ndef replace(sys):\n    sys.path.insert(0, 'pydeps')", f.cwd).dynamic, true);
+  assert.deepEqual(pythonObservations('# sys.path.insert(0, "fake")', f.cwd).paths, []);
+  await f.write('main.py', "import sys\nsys.path.insert(0, 'pydeps')\nimport native, missing_dependency");
+  await f.write('pydeps/native.cp314-win_amd64.pyd', 'binary fixture');
+  const native = await f.inspect('python main.py');
+  assert.equal(native.evidenceComplete, false);
+  assert.match(native.evidence.join('\n'), /原生或编译模块/);
+  assert.match(native.evidence.join('\n'), /missing_dependency.*未在静态候选路径/);
+  await rm(join(f.cwd, 'pydeps'), { recursive: true });
+  await mkdir(join(f.root, 'private')); await writeFile(join(f.root, 'private', 'native.py'), 'OUTSIDE_SECRET');
+  await symlink(join(f.root, 'private'), join(f.cwd, 'pydeps'));
+  const linked = await f.inspect('python main.py');
+  assert.equal(linked.evidenceComplete, false);
+  assert.doesNotMatch(linked.evidence.join('\n'), /OUTSIDE_SECRET/);
 });

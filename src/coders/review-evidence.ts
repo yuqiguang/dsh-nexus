@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { open, lstat } from 'node:fs/promises';
+import { open, lstat, opendir } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve, relative, sep } from 'node:path';
 import { commandPath } from './command-path.js';
 import { redact } from './normalize.js';
 import { commandPathTokens, isEnvironmentFile } from './rules.js';
-import { pythonImports, pythonModuleCommands, type PythonImport } from './python-evidence.js';
+import { pythonObservations, pythonModuleCommands, type PythonImport } from './python-evidence.js';
 import { pytestSources, customPytestDiscovery } from './pytest-evidence.js';
 import { executionObservations, javascriptObservations, javascriptDataReferences, type SourceLanguage } from './execution-evidence.js';
 import { mediaEvidence } from './media-evidence.js';
@@ -28,6 +28,7 @@ const priority: Record<SourceRole, number> = { execute: 0, config: 1, reference:
  * this: this only bounds how many paths are looked at.
  */
 const MAX_MODULE_PROBES = 2000;
+const PYTHON_STDLIB = new Set(('sys os pathlib json re math cmath time datetime collections itertools functools typing types enum dataclasses abc asyncio subprocess shutil tempfile logging argparse hashlib hmac secrets random socket ssl urllib http email html xml io csv struct statistics platform contextlib inspect copy traceback warnings weakref queue threading multiprocessing concurrent unittest importlib runpy builtins array base64 binascii codecs decimal fractions gzip bz2 lzma zipfile tarfile glob fnmatch pickle sqlite3 ctypes configparser textwrap string stringprep getpass gettext mimetypes uuid wave audioop atexit signal select selectors gc operator keyword tokenize token ast dis marshal bisect heapq numbers pprint resource locale encodings functools winreg msvcrt ntpath posixpath pkgutil sysconfig site').split(' '));
 
 /** Discover literal source references, not executable instructions. Dynamic references remain for the reviewer to assess. */
 function references(text: string): string[] {
@@ -76,12 +77,18 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
   const gap = (message: string) => { gaps.add(message); complete = false; };
   let moduleProbes = 0;
   const probes = new Map<string, boolean>();
+  const pythonRoots = new Set<string>();
+  const nativeDirectories = new Map<string, string[]>();
   const inProject = (path: string) => { const name = relative(projectRoot, path); return name !== '..' && !name.startsWith('..' + sep) && !isAbsolute(name); };
   const localFile = async (path: string) => {
     if (probes.has(path)) return probes.get(path)!;
     if (!inProject(path)) { complete = false; return false; }
     if (++moduleProbes > MAX_MODULE_PROBES) { complete = false; return false; }
-    try { const real = await within(path); const exists = (await lstat(real)).isFile(); probes.set(path, exists); return exists; }
+    try {
+      const real = await within(path);
+      if (real !== path) { gap(`${redact(path)}: 模块路径经过链接重定向，未据此推断导入`); probes.set(path, false); return false; }
+      const exists = (await lstat(real)).isFile(); probes.set(path, exists); return exists;
+    }
     catch (error) {
       if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
         evidence.push(`${redact(path)}: ${(error as Error).message === 'outside review boundary' ? '未读取，超出允许的审核边界' : '依赖模块路径未读取，不能确认审核边界或文件状态'}`); complete = false;
@@ -89,10 +96,33 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
       probes.set(path, false); return false;
     }
   };
+  const nativeModule = async (path: string) => {
+    const parent = dirname(path), name = relative(parent, path);
+    if (!inProject(parent) || moduleProbes >= MAX_MODULE_PROBES) return;
+    if (!nativeDirectories.has(parent)) {
+      const names: string[] = [];
+      nativeDirectories.set(parent, names);
+      try {
+        const real = await within(parent); if (real !== parent) { gap('Python 模块目录经过链接重定向'); return; }
+        let entries = 0;
+        for await (const entry of await opendir(real)) {
+          if (++entries > 256 || ++moduleProbes > MAX_MODULE_PROBES) { gap('Python 原生模块定位超过上限'); break; }
+          if (/\.(?:pyd|so|pyc)$/i.test(entry.name)) names.push(entry.name);
+        }
+      } catch (error) { if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) gap('Python 模块目录无法核验'); }
+    }
+    for (const entry of nativeDirectories.get(parent)!) {
+      if (entry.startsWith(name + '.')) {
+        // Binary identity is useful context, but it cannot substitute for executable source.
+        const binary = resolve(parent, entry);
+        if (await localFile(binary)) { const info = await lstat(binary); gap(`${redact(binary)}: Python 原生或编译模块，身份 ${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}；未核验执行代码`); }
+      }
+    }
+  };
   const addModule = async (item: PythonImport, base: string, entry = false) => {
     const dots = /^\.+/.exec(item.module)?.[0].length ?? 0;
     const name = item.module.slice(dots).split('.').filter(Boolean);
-    const bases = dots ? [resolve(base, ...Array(Math.max(0, dots - 1)).fill('..'))] : [...new Set([cwd, resolve(cwd, 'src'), base])];
+    const bases = dots ? [resolve(base, ...Array(Math.max(0, dots - 1)).fill('..'))] : [...new Set([...pythonRoots, cwd, resolve(cwd, 'src'), base])];
     let found = false;
     for (const root of bases) {
       if (!inProject(root)) { complete = false; continue; }
@@ -107,8 +137,13 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
           if (await localFile(init)) enqueue({ path: init, role: 'execute', language: 'python' });
         }
       }
+      if (pythonRoots.size || dots) {
+        await nativeModule(module);
+        for (const name of item.names) await nativeModule(resolve(module, name));
+      }
     }
     if (!found && dots) { evidence.push(`相对 Python 模块 ${redact(item.module)} 未解析，证据不完整`); complete = false; }
+    if (!found && !dots && pythonRoots.size && !PYTHON_STDLIB.has(name[0]!)) gap(`Python 模块 ${redact(item.module)} 未在静态候选路径中解析，不能假定其依赖代码已核验`);
   };
   const add = (source: string, base: string, fromSource = false, wsl = false) => {
     for (const name of references(source)) {
@@ -182,8 +217,19 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     }
     evidence.push('pytest 按实际指定目标展开测试、父级 conftest 与本地依赖；未指定目标或参数不明确时扫描项目。第三方插件尚未逐个核验，应结合实际配置和导入行为判断，不仅凭理论上的插件加载能力要求人工确认。');
   };
-  const scanPython = async (source: string, base: string) => {
-    const parsed = pythonImports(source);
+  const scanPython = async (source: string, base: string, file?: string) => {
+    const parsed = pythonObservations(source, cwd, file);
+    for (const path of parsed.paths) {
+      if (pythonRoots.has(path)) continue;
+      if (pythonRoots.size >= 16) { gap('Python 静态模块路径超过 16 个上限'); break; }
+      try {
+        if (!inProject(path)) throw new Error('outside');
+        const real = await within(path), info = await lstat(path);
+        if (real !== path || !info.isDirectory() || info.isSymbolicLink()) throw new Error('redirected');
+        pythonRoots.add(real);
+        evidence.push(`Python 静态模块路径候选：${redact(real)}；目录身份 ${info.dev}:${info.ino}:${info.mtimeMs}:${info.ctimeMs}；来自 ${file ? redact(file) : '内联代码'}；只用于收集依赖证据，不证明运行时解析或副作用安全。`);
+      } catch { gap(`${redact(path)}: Python 静态模块路径不存在、经过链接或超出项目边界，未读取`); }
+    }
     for (const item of parsed.imports) await addModule(item, base);
     for (const module of pythonModuleCommands(source)) if (module !== 'pytest') await addModule({ module, names: [] }, base, true);
     if (parsed.dynamic) gap('存在动态 Python 加载或执行，静态依赖证据不完整');
@@ -313,7 +359,7 @@ export async function commandEvidence(command: string, cwd: string, within: (pat
     const analysisKey = JSON.stringify([real, language, candidate.role === 'data', candidate.focus]);
     if (analyzed.has(analysisKey)) return;
     analyzed.add(analysisKey);
-    if (language === 'python') await scanPython(source, dirname(real));
+    if (language === 'python') await scanPython(source, dirname(real), real);
     if (language === 'javascript') await addJavascript(source, dirname(real));
     if (language === 'shell' || language === 'powershell') await scanCommand(source, cwd, language);
     if (pytest && /\.(?:toml|ini|cfg)$/i.test(real) && customPytestDiscovery(source)) gap(`${redact(real)}: 存在自定义测试发现或模块路径配置，默认命名扫描不能证明执行范围完整`);

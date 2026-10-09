@@ -201,7 +201,7 @@ export function hardRule(request: CoderRequest, roots: readonly string[], webRes
     for (const [pattern, reason] of DENY_COMMANDS) if (pattern.test(command)) return { verdict: 'deny', reason, key: `command:${reason}` };
     for (const [pattern, reason] of ESCALATE_COMMANDS) if (pattern.test(command)) return { verdict: 'escalate', reason, manualOnly: true };
     if (/\bpip(?:3)?\s+install\b/i.test(command)) return { verdict: 'escalate',
-      reason: standard && projectPip ? '项目虚拟环境依赖安装，需审核本次命令和安装来源' : 'Python 依赖安装目标尚未核验，需要你确认', manualOnly: !(standard && projectPip) };
+      reason: standard && projectPip ? '项目依赖安装目标已有证据，需审核本次命令和安装来源' : 'Python 依赖安装目标尚未核验，需要你确认', manualOnly: !(standard && projectPip) };
     if (outside) return { verdict: 'escalate', reason: `命令访问任务根目录之外的路径：${outside}` };
     return undefined;
   }

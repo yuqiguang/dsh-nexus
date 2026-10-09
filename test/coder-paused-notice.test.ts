@@ -52,3 +52,14 @@ test('persisted timeout duration is separate from whole-task time and legacy unk
   assert.match(timeoutSummary({ ...task, userWaitTimeout: undefined }).join('\n'), /未保存单次时长/);
   assert.deepEqual(timeoutSummary({ ...task, stopCause: undefined }), []);
 });
+
+test('no-progress retry completion cannot trigger an automatic fresh job that resets the wait budget', async () => {
+  const stalled = { ...task, stopCause: 'retry-no-progress' as const, userWaitTimeout: undefined };
+  let hook!: (exec: ToolExecution, next: () => Promise<PreToolDecision>) => Promise<PreToolDecision>;
+  installPausedNoticeGuard({ on(_name: string, fn: typeof hook) { hook = fn; } } as unknown as Context, () => [stalled]);
+  const call = (current: SessionEvent[]) => hook({ name: 'coder_task', arguments: { retry_task_id: stalled.id },
+    agent: { id: 'owner', session: { snapshotEvents: () => current } } } as unknown as ToolExecution, async () => ({ kind: 'allow' }));
+  const denied = await call(events);
+  assert.equal(denied.kind, 'deny'); if (denied.kind === 'deny') assert.match(denied.reason, /重试长时间没有进展/);
+  assert.equal((await call([...events, event('user/message', 3, { source: { kind: 'user' }, content: '继续' }, 702_000)])).kind, 'allow');
+});

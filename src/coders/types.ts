@@ -3,6 +3,8 @@ import type { TaskRetry } from './retry.js';
 import type { BriefSnapshot } from './brief.js';
 import type { TaskPermissions } from './permissions.js';
 import type { ReviewAudit } from './review.js';
+import type { ApprovalProvenance } from './approval-provenance.js';
+import type { AcceptanceCheck, ArtifactCheck } from './acceptance-checks.js';
 /** Coder-agnostic request, decision, and task shapes. Adapters normalize into these; the decider only sees these. */
 
 export type CoderKind = 'claude' | 'codex';
@@ -69,6 +71,8 @@ export type DecisionLayer = 'hard' | 'habit' | 'user' | 'supervisor';
 export interface TaskStep { at: number; text: string }
 
 export interface DecisionRecord {
+  /** Native owner-answer provenance. A once-only receipt must never be replayed as a grant. */
+  authorization?: ApprovalProvenance;
   at: number;
   kind: CoderRequestKind;
   summary: string;
@@ -84,6 +88,7 @@ export interface DecisionRecord {
 export type TaskStatus = 'queued' | 'running' | 'waiting-user' | 'verifying' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 
 export interface TaskResult {
+  artifactChecks?: ArtifactCheck[];
   summary: string;
   changedFiles: string[];
   commits?: string[];
@@ -98,6 +103,9 @@ export interface TaskResult {
 }
 
 export interface TaskRecord {
+  /** Explicit expected files and per-criterion checks; presentation never counts as verification. */
+  outputs?: string[];
+  acceptanceChecks?: AcceptanceCheck[];
   /** Run only the registered supervisor checks; no coding agent is invoked. */
   verificationOnly?: boolean;
   id: string;
@@ -117,7 +125,7 @@ export interface TaskRecord {
   permissions?: TaskPermissions;
   safetyReviews?: (ReviewAudit & { at: number })[];
   stopReason?: string;
-  stopCause?: 'user-wait-timeout';
+  stopCause?: 'user-wait-timeout' | 'retry-no-progress';
   userWaitTimeout?: { startedAt: number; endedAt: number; summary: string; reason?: string };
   retry?: TaskRetry;
   status: TaskStatus;
@@ -128,7 +136,7 @@ export interface TaskRecord {
   completionNotice?: { messageId: string; seq: number; at: number };
   /** The coder's own session id: set from the start when this task continues another, else once the coder reports it. */
   coderSessionId?: string;
-  /** The task this one continues in the same coder session. */
+  /** The prior task in this recovery chain; verification-only recovery does not launch its coder session. */
   resumedFrom?: string;
   replaces?: string;
   /** Explicit earlier tasks in the same owner session; all must pass independent verification. */

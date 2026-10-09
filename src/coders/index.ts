@@ -15,9 +15,13 @@ import { reviewRequiresOwner, type CoderReviewPolicy } from './review-policy.js'
 import { coderConcurrency, type CoderSecurityMode } from './settings.js';
 import { taskProcessArgv } from './process.js';
 import { ActiveBudget } from './budget.js';
+import { RetryProgressGuard, type RETRY_PROGRESS_LIMITS } from './retry-progress.js';
 import { failureLabel, resumeTransient, retryText, type CoderRun, type RetryNotice, type TaskRetry, type waitForRetry } from './retry.js';
 import { assertRetry, recoveryReport, taskRecovery, type TaskRecoveryView } from './recovery.js';
-import { resolvePlanStep, VERIFY_SHELL_SYNTAX } from './plan.js';
+import { resolvePlanStep } from './plan.js';
+import { acceptanceChecksParameter, resolveAcceptanceChecks } from './acceptance-checks.js';
+import { approvalProvenance } from './approval-provenance.js';
+import { expectedArtifacts } from './artifacts.js';
 import { installBriefs, type CoderBrief } from './brief.js';
 import { deliveryReport } from './delivery.js';
 import { changeSummary } from './change-summary.js';
@@ -56,7 +60,7 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy';
 import { CoderStore } from './store.js';
 import { CODER_NAMES, isActive, type CoderDecision, type CoderKind, type CoderRequest, type DecisionRecord, type HabitKind, type HabitRule, type TaskRecord, type TaskStep } from './types.js';
 import { coderHomes, taskTranscript, type Transcript } from './transcript.js';
-import { SnapshotError, snapshotWorkTree, workspaceScope, verifyTask, windowsVerifyWords, type WorkTreeSnapshot } from './verify.js';
+import { SnapshotError, snapshotWorkTree, workspaceScope, verifyTask, verifyCommandWords, type WorkTreeSnapshot } from './verify.js';
 import { requireWindowsFirewall } from './windows-firewall.js';
 import { windowsSandbox, windowsVerifyArgv, windowsVerifyExecutable } from './windows-sandbox.js';
 
@@ -85,6 +89,8 @@ export interface CodersConfig {
   maxUserWaitMs?: number;
   /** Test seam for cancellable retry waits; production uses bounded backoff. */
   retryWait?: typeof waitForRetry;
+  /** Test seam for the observed no-progress retry guard. Production uses 5/10 minute notification/stop thresholds. */
+  retryProgressLimits?: Partial<typeof RETRY_PROGRESS_LIMITS>;
   /** Coder used when the model does not choose one. Defaults to codex; overridden by the manager's settings when present. */
   defaultCoder?: CoderKind;
   /** Settings, installs, and per-coder runtime; without it the coders on PATH and in the plugin's node_modules are used as-is. */
@@ -153,8 +159,6 @@ const IDLE_NOTE_MS = 90_000;
 const IDLE_CHECK_MS = 30_000;
 /** At most one store write per task in this window; steps arriving inside it are written together at its end. */
 const ACTIVITY_INTERVAL_MS = 1000;
-/** What a verify command cannot contain: it runs without a shell and is split on spaces, so these would reach the program literally. */
-const SHELL_SYNTAX = VERIFY_SHELL_SYNTAX;
 /** Rules a user or project can still add: routine requests are allowed by default, so an allow rule would change nothing. */
 const RULE_DECISIONS = ['deny', 'answer'] as const;
 
@@ -224,7 +228,7 @@ function awaitsNotice(task: Pick<TaskRecord, 'status'>): boolean {
 
 export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaited<ReturnType<typeof verifyTask>>): string {
   const count = (layer: DecisionRecord['layer']) => task.decisions.filter(decision => decision.layer === layer).length;
-  const changes = changeSummary(verify.changedFiles);
+  const changes = changeSummary(verify.changedFiles, expectedArtifacts(task));
   const lines = [
     `编码任务 ${task.id} ${outcome.status === 'completed' ? (verify.verifyExecuted === false ? '执行结束，独立验证未执行' : verify.verifyOk === false ? '执行结束，但验证失败' : task.permissions?.securityMode !== 'full' && verify.outsideRoots.length ? '已完成，但有改动越出根目录' : verify.verifyOk === undefined ? '执行结束，尚未独立验证' : '执行结束，验证通过') : outcome.status === 'killed' ? task.stopCause === 'user-wait-timeout' ? '等待用户超时，已暂停' : task.stopReason ? '已暂停' : '已取消' : '失败'}${outcome.detail ? `（${outcome.detail}）` : ''}`,
     `任务：${task.description}`,
@@ -235,6 +239,9 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     ...(task.permissions ? [permissionSummary(task.permissions)] : []),
     '',
     `DSH 独立验证范围：${task.verify ? [task.verify, ...(task.verifyCommands ?? [])].join('；') : '未指定'}。编码工具自述的其他测试不代表 DSH 已独立运行。`,
+    ...(task.brief ? [`逐项验收覆盖：${task.brief.acceptance.map(item => `${item.id} ${task.acceptanceChecks?.some(check => check.criterion === item.id) || task.brief!.acceptance.length === 1 && task.verify ? '已对应检查' : '尚未登记对应检查'}`).join('；')}；结束后用 coder_brief delivery 核对。`] : []),
+    ...(verify.artifactChecks?.length ? [`声明文件检查 ${verify.artifactChecks.filter(check => check.ok).length}/${verify.artifactChecks.length}；文件存在与摘要不代替内容、复现和业务效果检查。`,
+      ...verify.artifactChecks.filter(check => !check.ok).map(check => `${check.path}：${check.detail}`)] : []),
     ...(verify.preflightCheck ? [`执行前环境预检 ${verify.preflightCheck.command}：${verify.preflightCheck.ok ? '通过' : verify.preflightCheck.executed ? '失败' : '未执行'}；${clip(verify.preflightCheck.output, 1200)}`] : []),
     task.verificationOnly ? '本轮执行方式：' : `${CODER_NAMES[task.coder]} 的结果（编码工具自述）：`,
     clip(outcome.result?.trim() || '（没有文本结果）', 4000),
@@ -245,7 +252,7 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     ...(verify.outsideRoots.length ? ['', task.permissions?.securityMode === 'full' ? '完全权限下观察到的任务目录外改动：' : '根目录之外的改动（需要人工检查）：', ...verify.outsideRoots.map(file => `- ${file}`)] : []),
     '',
     task.verify ? `验证命令 ${task.verify}：${verify.verifyOk === undefined || verify.verifyExecuted === false ? '未执行' : verify.verifyOk ? '通过' : '失败'}` : '验证命令：未指定',
-    ...(task.verify && verify.verifyOutput ? [clip(verify.verifyOutput, 2000)] : []),
+    ...(verify.verifyOutput ? [clip(verify.verifyOutput, 2000)] : []),
     '',
     `升级给用户 ${count('user')} 次，硬规则自动拒绝 ${count('hard')} 次，习惯规则自动决定 ${count('habit')} 次，DSH 自动审核 ${count('supervisor')} 次，常规操作自动放行 ${task.autoAllowed ?? 0} 次。`,
     ...task.decisions.map(describeDecision),
@@ -386,7 +393,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     if (signal.aborted || !currentTask || currentTask.stopReason || !isActive(currentTask)) return { behavior: 'deny', message: '任务已停止。', interrupt: true };
     const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
     const environmentRedirect = requestedPaths.some((path, index) => isEnvironmentFile(path) && !samePath(path, request.paths[index]!));
-    const projectPip = standard && request.kind === 'command' && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId));
+    const commandCwd = typeof request.raw.cwd === 'string' ? request.raw.cwd : task.cwd;
+    const projectPip = standard && request.kind === 'command' && !!await projectPipEvidence(request.command ?? request.detail, commandCwd, reviewEnvs.get(taskId), task.cwd);
     const verdict = environmentRedirect ? { layer: 'hard' as const, key: 'environment-link', reason: '环境配置路径通过链接重定向，请使用项目内真实文件路径' }
       : decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, safeTemplates, projectPip, projectEnvironments);
     const at = Date.now();
@@ -447,7 +455,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
             const slot = await acquireReviewSlot(reviewQueue, reviewSignal);
             release = slot.release; reviewSignal = slot.signal;
             // Admission may have taken minutes. Never send stale evidence or bypass a newly added owner rule.
-            const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)), await checkedEnvironments());
+            const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, commandCwd, reviewEnvs.get(taskId), task.cwd), await checkedEnvironments());
             if (latest.layer === 'hard' || latest.layer === 'habit' && latest.verdict.decision === 'deny') return decide(taskId, request, signal);
             if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
             const queuedTask = store.get(taskId);
@@ -466,7 +474,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           const after = rechecked.input;
           const readonlyUnchanged = !deterministic || !!await readonlyReview(task, request, reviewEnvs.get(taskId));
           const current = store.get(taskId);
-          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, task.cwd, reviewEnvs.get(taskId)), await checkedEnvironments());
+          const latest = decideLayers(request, roots, [...store.rules(), ...(projectRulesOf.get(taskId) ?? [])], task.cwd, task.permissions?.webResearch === true, standard, [], projectPip && !!await projectPipEvidence(request.command ?? request.detail, commandCwd, reviewEnvs.get(taskId), task.cwd), await checkedEnvironments());
           if (latest.layer === 'user' && latest.manualOnly) { escalationReason = latest.reason; break; }
           // A newly added deny must still win, even if the reviewer was already in flight.
           if (latest.layer === 'hard' || (latest.layer === 'habit' && latest.verdict.decision === 'deny')) return decide(taskId, request, signal);
@@ -538,6 +546,14 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         startedAt: waitStartedAt, endedAt: Date.now(), summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
       } }));
       stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
+    }
+    if (outcome.decision.behavior === 'allow') {
+      const current = store.get(taskId);
+      if (signal.aborted || shutdown.signal.aborted || !current || !isActive(current) || current.stopReason
+        || outcome.record.authorization && approvalProvenance(current, request).operationId !== outcome.record.authorization.operationId) {
+        outcome = { decision: { behavior: 'deny', message: '回答期间任务状态或操作边界已变化，本次不执行。', interrupt: true },
+          record: { at: Date.now(), kind: request.kind, summary: request.summary, layer: 'user', outcome: 'deny', reason: '回答期间任务状态或操作边界已变化' } };
+      }
     }
     if (outcome.decision.behavior === 'allow' && (requestedPaths.some(isEnvironmentFile) || projectEnvironments.length)) {
       const paths = await Promise.all(requestedPaths.map(path => canonical(path).catch(() => '')));
@@ -637,19 +653,35 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     let currentSessionId = task.coderSessionId;
     let writes = Promise.resolve();
     let retryState: TaskRetry | undefined;
+    const retryProgress = new RetryProgressGuard(event => {
+      if (runSignal.aborted || !retryState) return;
+      const reason = event.level === 'stop' ? '连续重试等待达到无进展上限，已暂停并保留原会话；请检查模型服务后显式续接。' : retryState.reason;
+      void setRetry({ ...retryState, reason, waitedMs: event.waitedMs, prolonged: event.level !== 'waiting',
+        ...(event.level === 'stop' ? { phase: 'stopped', retryAt: undefined } : {}) });
+      if (event.level === 'stop') {
+        void persist(() => store.update(task.id, () => ({ stopCause: 'retry-no-progress' })));
+        stopOf.get(task.id)?.(reason);
+      }
+    }, config.retryProgressLimits);
     const persist = (write: () => Promise<unknown>) => {
       writes = writes.then(async () => { await write(); });
       void writes.catch(() => {});
       return writes;
     };
     const setRetry = (retry: TaskRetry | undefined) => {
+      if (retryProgress.stopped && retryState?.phase === 'stopped') retry = retryState;
+      retryProgress.setWaiting(retry?.phase === 'waiting');
+      if (retry) retry = { ...retry, waitedMs: retryProgress.waitedMs, prolonged: retryProgress.warned || retryProgress.stopped };
       if (JSON.stringify(retryState) === JSON.stringify(retry)) return writes;
       retryState = retry;
       if (retry) activity.record(retryText(retry));
       return persist(() => store.update(task.id, () => ({ retry })));
     };
     const shared = {
-      decide: (request: CoderRequest, signal: AbortSignal) => decide(task.id, request, signal),
+      decide: async (request: CoderRequest, signal: AbortSignal) => {
+        const resume = retryProgress.pause();
+        try { return await decide(task.id, request, signal); } finally { resume(); }
+      },
       onSession: (coderSessionId: string) => {
         currentSessionId = coderSessionId;
         void persist(() => store.update(task.id, () => ({ coderSessionId })));
@@ -667,7 +699,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         failure = { key, count: failure?.key === key ? failure.count + 1 : 1 };
         if (failure.count >= (task.permissions?.maxRepeatedDenials ?? 3)) stopOf.get(task.id)?.('同一工具操作连续失败三次且没有成功操作，已暂停；请调整后续接。');
       },
-      onSuccess: () => { failure = undefined; },
+      onSuccess: () => { failure = undefined; retryProgress.progress(); },
     };
     /** The coder stopped: keep its last steps, drop what it was doing. */
     const settle = (current: TaskRecord): Partial<TaskRecord> => {
@@ -724,7 +756,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           if (task.preflight) {
             activity.record('执行前环境预检：' + task.preflight);
             await store.update(task.id, () => ({ status: 'verifying' }));
-            const check = await verifyTask({ ...task, verify: task.preflight, verifyCommands: undefined },
+            const check = await verifyTask({ ...task, verify: task.preflight, verifyCommands: undefined, outputs: undefined, acceptanceChecks: undefined },
               task.permissions?.writableRoots ?? [task.cwd], baselineOf.get(task.id), runSignal, authorizeCheck, verificationEnvironment(executionEnv),
               check => { preflightCheck = check; });
             preflightCheck = check.verifyChecks?.[0] ?? { command: task.preflight, ok: check.verifyOk === true,
@@ -768,7 +800,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
           });
         } catch {
           return { status: runSignal.aborted ? 'killed' : 'failed', detail: '编码任务启动已取消或 DSH 网页服务连接失败。' };
-        } finally { await research?.close(); }
+        } finally { retryProgress.close(); await research?.close(); }
       })(),
       cancel(reason) { cancellation.abort(); runner?.cancel(reason); },
     };
@@ -791,7 +823,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(task.id, current => ({ activity: undefined, ...(outcome.status !== 'killed' ? { status: 'verifying' as const } : {}) }));
       const settledTask = store.get(task.id) ?? task;
       if (outcome.status !== 'killed') job?.updateProgress(settledTask.verificationSkipped ? '收集改动（按用户要求不运行验证）' : '验证中');
-      const verify = await verifyTask({ ...settledTask, ...(outcome.status !== 'completed' || stopped || settledTask.verificationSkipped ? { verify: undefined } : {}) },
+      const verify = await verifyTask({ ...settledTask, ...(outcome.status !== 'completed' || stopped || settledTask.verificationSkipped ? { verify: undefined, outputs: undefined, acceptanceChecks: undefined } : {}) },
         task.permissions?.writableRoots ?? [task.cwd], baselineOf.get(task.id), stopped || outcome.status === 'killed' ? undefined : runSignal,
         authorizeCheck, verificationEnvironment(executionEnv));
       if (settledTask.verificationSkipped) Object.assign(verify, { verifyOk: false, verifyExecuted: false,
@@ -807,6 +839,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         ...(verify.verifyOk !== undefined ? { verifyOk: verify.verifyOk } : {}),
         ...(verify.verifyOutput !== undefined ? { verifyOutput: verify.verifyOutput } : {}),
         ...(verify.verifyChecks ? { verifyChecks: verify.verifyChecks } : {}),
+        ...(verify.artifactChecks ? { artifactChecks: verify.artifactChecks } : {}),
         ...(outcome.detail ? { detail: outcome.detail } : {}) } }));
       const report = taskReport(store.get(task.id) ?? task, outcome, verify);
       const detail = status === 'failed' && outcome.status === 'completed'
@@ -819,7 +852,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       const message = (error as Error)?.message ?? String(error);
       await store.update(task.id, current => ({ ...settle(current), status: 'failed', result: { summary: '', changedFiles: [], outsideRoots: [], detail: message } })).catch(() => {});
       return { status: 'failed', detail: message, result: `编码任务 ${task.id} 失败：${message}` };
-    }).finally(() => { budget.close(); budgets.delete(task.id); stopOf.delete(task.id); rejectionCounts.delete(task.id); projectRulesOf.delete(task.id); rootsOf.delete(task.id); reviewEnvs.delete(task.id); baselineOf.delete(task.id); liveOf.delete(task.id);
+    }).finally(() => { retryProgress.close(); budget.close(); budgets.delete(task.id); stopOf.delete(task.id); rejectionCounts.delete(task.id); projectRulesOf.delete(task.id); rootsOf.delete(task.id); reviewEnvs.delete(task.id); baselineOf.delete(task.id); liveOf.delete(task.id);
  });
     return { cancel: reason => { cancellation.abort(); hooks.cancel(reason); }, done };
   }
@@ -887,6 +920,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       brief_id: { type: 'string', description: '关联 coder_brief 任务说明单；复杂或分阶段任务应关联同一说明单。续接默认沿用原说明单。' },
       brief_revision: { type: 'integer', description: '说明单当前版本，关联时必填，防止按过期目标执行。' },
       acceptance_ids: { type: 'array', items: { type: 'string' }, description: '本任务负责的说明单验收项 ID，例如 a1、a2，关联时必填。' },
+      acceptance_checks: acceptanceChecksParameter,
+      outputs: { type: 'array', items: { type: 'string' }, description: '声明预期交付文件（最多 100 个，相对任务 cwd）；结束后核验存在性和内容身份。续接保留既有声明；不会凭文件名自动发送文件。' },
       depends_on: { type: 'array', items: { type: 'string' }, description: '前置任务 ID 列表（最多 10 个，必须已派发且属于同一聊天会话，含该会话更早的各代）。全部执行成功且独立验证通过才启动；失败、取消、中断或未验证都会阻止本任务。等待依赖不占执行名额。续接默认沿用原依赖；修复前置任务后须填新的任务 ID。' },
       verification_only: { type: 'boolean', description: '仅对已完成编码的原任务重新运行监工独立验证，不启动 Codex/Claude。须带 retry_task_id 或 resume_task_id；核实 verify_cwd，并用 verify_commands 登记所有需要的检查。原权限、工作区和审批边界不变。' },
       retry_task_id: { type: 'string', description: '失败、取消或中断后的最新任务 ID；显式重试同一步骤。保留权限边界，有原生会话则续接，没有则重新启动。与 resume_task_id 互斥；不能重做已验证通过的步骤。' },
@@ -894,7 +929,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       verify_commands: { type: 'array', items: { type: 'string' }, description: '完整的独立验证命令列表（1 到 10 条），按顺序执行，每条单独审核，任一失败则停止；与 verify 二选一。覆盖验收所需的语法、逻辑和集成测试。' },
       verify_cwd: { type: 'string', description: '独立验证目录，相对任务 cwd（不是会话工作区）或绝对路径，必须仍在任务目录内。在项目根验证时省略或填 .；例如 cwd=outputs/app 时，不再填 outputs/app。仅真正的项目子目录才填相对路径。' },
       verify_network: { type: 'string', enum: ['offline', 'loopback', 'ask'], description: '通常省略以沿用当前模式：标准模式默认 ask（由 DSH 审核验证命令），严格模式默认 offline（断网）。脚本本身不联网不等于需要强制断网，不要因此填写 offline。只有用户或验收明确要求网络隔离时才选择 offline；Windows 会在派发前检查其防火墙条件，条件不满足不得自动放宽。Windows 不支持隔离 loopback。本地服务与浏览器自检在 Linux 选 loopback：脚本须在同一次调用内启动服务和客户端，运行在独立回环网络中，不能访问宿主端口和外网，不需要联网审批。测试确实需要联网时选 ask：标准模式按 DSH 审核设置自动审核或请求本次批准，严格模式请求一次性批准，完全权限直接执行。批准只对这条验证命令有效，可访问任意网络目标；非完全权限模式仍限制文件写入；验证环境不继承密钥变量。拒绝则不执行验证，不回退到无隔离。' },
-      verify: { type: 'string', description: '可选的验证命令，任务结束后由监工在工作目录独立执行，例如 "npm test"。任务的完成标准里写了要跑测试、构建、检查或跑通某条命令时，都要填上：监工自己跑一遍才算数，不填就只有编码工具自己说做完了。不经过 shell：只能是一条命令，第一个词是程序，其余按空格分成参数；不能用 &&、|、;、>、引号或 $()，要检查多件事就写一个脚本或 npm script。' },
+      verify: { type: 'string', description: '可选的验证命令，任务结束后由监工在工作目录独立执行，例如 "npm test"。完成标准需要测试、构建或运行检查时应登记，不能用编码工具自述代替。不经过 shell：第一个词是程序，其余是参数；Windows 引号仅用于参数分组，不支持内联 shell 包装或打印子程序退出码来判断成功。多项检查用 verify_commands 逐条登记，或使用会传播失败的检查脚本。' },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -925,9 +960,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const previous = previousId ? store.get(previousId) : undefined;
         if (previousId) {
           if (!previous || !sameChat(previous.ownerSession, exec.agent.id)) throw new Error(`没有编码任务 ${previousId}。`);
+          if (store.list().some(item => sameChat(item.ownerSession, previous.ownerSession) && (item.replaces ?? item.resumedFrom) === previous.id)) throw new Error('该任务已有后续执行，请读取最新任务后再恢复。');
           if (isActive(previous) || store.active().some(item => item.coder === previous.coder && item.coderSessionId && item.coderSessionId === previous.coderSessionId)) throw new Error('该编码会话已有运行或排队任务，请等待它结束。');
           if (args.retry_task_id) assertRetry(previous, store.list());
-          if (!previous.coderSessionId && !args.retry_task_id) throw new Error(`任务 ${previous.id} 没有留下 ${CODER_NAMES[previous.coder]} 的会话，不能续接，请重新派发。`);
+          if (!previous.coderSessionId && !args.retry_task_id && !args.verification_only) throw new Error(`任务 ${previous.id} 没有留下 ${CODER_NAMES[previous.coder]} 的会话，不能续接，请重新派发。`);
           if (resolve(previous.cwd) !== cwd) throw new Error(`续接必须在原任务的目录里：${previous.cwd}`);
           if (args.coder && args.coder !== previous.coder) throw new Error(`任务 ${previous.id} 用的是 ${CODER_NAMES[previous.coder]}，续接不能换工具。`);
           const key = `${previous.coder}:${previous.coderSessionId ?? previous.id}`;
@@ -957,6 +993,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         if (continuation && (!previous || continuation.length > 4000)) throw new Error('continuation 仅供续接或重试，最多 4000 字；新目标请保存计划。');
         let brief = briefId ? briefs.snapshot(briefId, exec.agent.id, args.brief_revision ?? previous?.brief?.revision,
           planned?.step.acceptance_ids ?? args.acceptance_ids ?? previous?.brief?.acceptance.map(item => item.id)) : undefined;
+        const sameVersion = !!brief && previous?.brief?.id === brief.id && previous.brief.revision === brief.revision;
+        if (sameVersion && previous.brief!.acceptance.some(item => !brief!.acceptance.some(next => next.id === item.id))) throw new Error('续接不能缩小本版本的验收范围；要求变化请先修改说明单。');
         const dependsOn = dependencyIds(planned ? [...planned.dependsOn, ...(args.depends_on ?? previous?.dependsOn?.filter(id => { const prior = store.get(id); return !args.retry_task_id || prior?.brief?.id !== briefId || prior?.brief?.revision !== brief?.revision || !planned.step.depends_on.includes(prior?.planStep ?? ''); }) ?? [])] : args.depends_on ?? previous?.dependsOn ?? [], exec.agent.id, id => store.get(id));
         if (dependsOn.some(id => isActive(store.get(id)!) && !completions.has(id))) throw new Error('前置任务尚未受理完成，请稍后重试。');
         const coder: CoderKind = previous ? previous.coder : args.coder === 'claude' || args.coder === 'codex' ? args.coder : effective.defaultCoder;
@@ -972,13 +1010,19 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         if (args.verify_commands && args.verify !== undefined) throw new Error('verify_commands 与 verify 不能同时填写。');
         const suite = args.verify_commands;
         if (suite && (suite.length < 1 || suite.length > 10 || suite.some(command => !command.trim()))) throw new Error('独立验证列表需要 1 到 10 条非空命令。');
-        const planChecks = planned ? [...new Set([planned.step.verify, ...(previous?.brief?.revision === brief?.revision && previous?.verify ? [previous.verify, ...(previous.verifyCommands ?? [])] : [])])] : undefined;
+        const planChecks = planned || sameVersion ? [...new Set([...(planned ? [planned.step.verify, ...(planned.step.verify_commands ?? [])] : []), ...(sameVersion && previous?.verify ? [previous.verify, ...(previous.verifyCommands ?? [])] : [])])] : undefined;
         if (planChecks && suite && planChecks.some(command => !suite.includes(command))) throw new Error('独立验证列表必须保留计划及本版本已登记的验证命令；不能缩小验收范围。');
+        if (planChecks?.length && args.verify !== undefined && (planChecks.length > 1 || args.verify !== planChecks[0])) throw new Error('续接必须保留本版本已登记的验证命令；新增检查用完整的 verify_commands。');
         const checks = suite ?? planChecks;
         const verify = checks?.[0] ?? args.verify ?? previous?.verify;
         const preflight = planned?.step.preflight ?? args.preflight ?? previous?.preflight;
-        if (args.verification_only && !verify) throw new Error('仅验证模式必须指定独立验证命令。');
         const verifyCommands = checks ? checks.slice(1) : args.verify !== undefined ? undefined : previous?.verifyCommands;
+        const acceptanceChecks = resolveAcceptanceChecks(args.acceptance_checks ?? (sameVersion ? previous?.acceptanceChecks : undefined) ?? planned?.step.acceptance_checks,
+          brief, verify ? [verify, ...(verifyCommands ?? [])] : [], [...(planned?.step.acceptance_checks ?? []), ...(sameVersion ? previous?.acceptanceChecks ?? [] : [])]);
+        const outputs = [...new Set([...(planned?.step.outputs ?? []), ...(args.outputs ?? []), ...(!previous?.brief || sameVersion ? previous?.outputs ?? [] : [])])];
+        const artifacts = [...new Set([...outputs, ...(acceptanceChecks ?? []).flatMap(check => check.files)])];
+        if (artifacts.length > 100 || artifacts.some(path => !path.trim() || path.length > 1000)) throw new Error('预期文件需要最多 100 个非空项目路径。');
+        if (args.verification_only && !verify && !artifacts.length) throw new Error('仅验证模式必须指定独立验证命令或声明文件检查。');
         const verifyCwd = await canonical(resolve(cwd, args.verify_cwd ?? previous?.verifyCwd ?? '.'));
         if (!isInside(cwd, verifyCwd)) throw new Error('验证目录必须位于任务目录内。');
         if (!previous && (verify || preflight) && verifyCwd !== cwd && args.cwd && args.verify_cwd && !isAbsolute(args.verify_cwd)
@@ -989,11 +1033,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const verifyNetwork = verificationNetwork(args.verify_network, previous?.verifyNetwork, permissions.securityMode ?? 'strict');
         if (verify || preflight) await preflightVerification(process.platform, coder, verifyNetwork);
         for (const command of [...(preflight ? [preflight] : []), ...(verify ? [verify, ...(verifyCommands ?? [])] : [])]) {
-          if (process.platform === 'win32') {
-            windowsVerifyWords(command);
-          } else if (SHELL_SYNTAX.test(command)) throw new Error(`验证命令不经过 shell，只能是一条命令加空格分开的参数（如 npm test），不能用 &&、|、;、>、引号或 $()：${command}`);
+          verifyCommandWords(command);
         }
-        for (const file of planned?.step.outputs ?? []) {
+        for (const file of artifacts) {
           const path = await canonical(resolve(cwd, file));
           const environment = isProjectEnvironment(path, cwd, permissions.securityMode === 'standard');
           if (!isInside(cwd, path) || (permissions.securityMode !== 'full' && isProtectedPath(path, [cwd], permissions.securityMode === 'standard') && !environment)) throw new Error('计划的预期文件超出项目或涉及受保护路径，请先调整计划。');
@@ -1002,8 +1044,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         if (await canonical(cwd) !== cwd || !(await stat(cwd)).isDirectory()) throw new Error('创建项目目录时工作区发生变化，请重新检查。');
         if (brief) { await briefs.bindDirectory(brief.id, exec.agent.id, brief.revision, cwd); brief = { ...brief, cwd: briefs.get(brief.id, exec.agent.id).cwd }; }
         const task: TaskRecord = { id: taskId, ...(args.verification_only ? { verificationOnly: true } : {}), ...(planned ? { planStep: planned.step.id } : {}), ...(brief ? { brief } : {}), ...(dependsOn.length ? { dependsOn } : {}), coder, description, ...(continuation ? { continuation } : {}), ...(preflight ? { preflight } : {}), cwd, permissions,
+          ...(outputs.length ? { outputs } : {}), ...(acceptanceChecks?.length ? { acceptanceChecks } : {}),
           ...(verify || preflight ? { ...(verify ? { verify } : {}), ...(verifyCommands?.length ? { verifyCommands } : {}), verifyCwd, verifyNetwork } : {}), status: 'queued', ownerSession: exec.agent.id, createdAt: now, updatedAt: now,
-          ...(previous ? { ...(previous.coderSessionId ? { coderSessionId: previous.coderSessionId, resumedFrom: previous.id } : {}), ...(args.retry_task_id ? { replaces: previous.id } : {}) } : {}), escalations: 0, decisions: [] };
+          ...(previous ? { resumedFrom: previous.id, ...(previous.coderSessionId ? { coderSessionId: previous.coderSessionId } : {}), ...(args.retry_task_id ? { replaces: previous.id } : {}) } : {}), escalations: 0, decisions: [] };
         projectRulesOf.set(task.id, await projectRules(cwd, roots));
         rootsOf.set(task.id, permissions.writableRoots);
         await config.channelWork?.record(task.id, exec.agent.session, exec.rootCallId ?? exec.callId, await canonical(exec.agent.session.header.cwd ?? cwd));
