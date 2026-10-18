@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { parse } from 'yaml';
-import { assistantPlugins, projectRoot, scheduleBundle } from './setup.mjs';
+import { assistantPlugins, projectRoot } from './setup.mjs';
 import { renameProfile } from './rename-profile.mjs';
 import { ensureProfilePackage } from './profile-package.mjs';
 
@@ -25,7 +25,8 @@ await mkdir(profile, { recursive: true, mode: 0o700 });
 const require = createRequire(import.meta.url);
 const manifestPath = require.resolve('@deepseek-ai/dsh/package.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-assert.equal(manifest.version, '0.2.0-rc.2');
+const declared = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8')).devDependencies['@deepseek-ai/dsh'];
+assert.equal(manifest.version, declared);
 const entry = join(dirname(manifestPath), manifest.bin.dsh);
 await writeFile(join(profile, 'package.json'), JSON.stringify({
   private: true, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'], patchReload: 'startup' } },
@@ -93,7 +94,7 @@ for (const phase of pluginOnly ? [7, 8, 9, 10] : interactionOnly ? [11, 12] : co
     assert.ok(packed.files.every(file => !/^(?:\.nexus|workspace|src|test|node_modules)\//.test(file.path)));
     await mkdir(activeProfile, { recursive: true });
     await writeFile(join(activeProfile, 'package.json'), JSON.stringify({ private: true,
-      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', scheduleBundle], patchReload: 'startup' } } }));
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'], patchReload: 'startup' } } }));
     await writeFile(join(activeProfile, 'pnpm-workspace.yaml'), 'autoInstallPeers: false\nnodeLinker: hoisted\n');
     if (sourcePackageOnly) {
       await writeFile(join(activeProfile, 'cordis.patch.yml'), JSON.stringify([{ insert: [

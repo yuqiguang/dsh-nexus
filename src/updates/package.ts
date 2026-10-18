@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import semver from 'semver';
 import { ChannelError } from '../channels/types.js';
 
 const REPOSITORY = 'yuqiguang/dsh-nexus';
@@ -20,6 +21,28 @@ export function newerVersion(a: string, b: string): boolean {
 }
 export interface UpdatePackage { version: string; sha256: string; commit: string; dshVersion: string; path: string; releaseUrl: string; compatible: boolean }
 interface PackageMetadata { version: string; commit: string; dshVersion: string; compatible: boolean }
+
+/** Whether the running DSH version satisfies one declared range; malformed or empty ranges never match. */
+function satisfiesDsh(version: string, range: string): boolean {
+  const declared = range.trim();
+  if (!declared || semver.valid(version) === null) return false;
+  try { return semver.satisfies(version, declared, { includePrerelease: true }); }
+  catch { return false; }
+}
+
+/** `engines.dsh` decides alone, matching DSH; otherwise every published dsh peer must match. */
+function dshRequirement(pkg: { engines?: unknown; peerDependencies?: unknown }, dshVersion: string): { range: string; compatible: boolean } {
+  const engines = pkg.engines && typeof pkg.engines === 'object' ? pkg.engines as Record<string, unknown> : undefined;
+  if (engines && Object.hasOwn(engines, 'dsh')) {
+    const range = engines.dsh;
+    if (typeof range !== 'string') throw new Error();
+    return { range, compatible: satisfiesDsh(dshVersion, range) };
+  }
+  const peers = Object.entries(pkg.peerDependencies && typeof pkg.peerDependencies === 'object' ? pkg.peerDependencies as Record<string, unknown> : {})
+    .filter(([name]) => name.startsWith('@deepseek-ai/dsh-'));
+  if (!peers.length || !peers.every(([, value]) => typeof value === 'string')) throw new Error();
+  return { range: String(peers[0]![1]), compatible: peers.every(([, range]) => satisfiesDsh(dshVersion, range as string)) };
+}
 
 /** Read only two bounded metadata files; pnpm owns installation and extraction. */
 export function inspectPackage(archive: Buffer, expectedVersion: string, dshVersion: string): PackageMetadata {
@@ -55,9 +78,8 @@ export function inspectPackage(archive: Buffer, expectedVersion: string, dshVers
       || !names.has('package/dist/src/plugin.js') || !names.has('package/dist/client.js') || !names.has('package/cordis.patch.yml')
       || !/^[a-f0-9]{40}$/.test(build.commit) || build.dirty !== false
       || ['preinstall', 'install', 'postinstall', 'prepare'].some(key => pkg.scripts?.[key])) throw new Error();
-    const peers = Object.entries(pkg.peerDependencies ?? {}).filter(([name]) => name.startsWith('@deepseek-ai/dsh-'));
-    if (!peers.length || !peers.every(([, value]) => typeof value === 'string')) throw new Error();
-    return { version: pkg.version, commit: build.commit, dshVersion: String(peers[0]![1]), compatible: peers.every(([, value]) => value === dshVersion) };
+    const peers = dshRequirement(pkg, dshVersion);
+    return { version: pkg.version, commit: build.commit, dshVersion: peers.range, compatible: peers.compatible };
   } catch { throw new ChannelError('update_package_invalid'); }
 }
 

@@ -142,9 +142,11 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
       await bridge.drain();
       assert.equal(texts.at(-1), '好，两秒后提醒你带合同。');
       // The persona replaces both upstream identity lines; the preset's suffix and the tool guidance stay.
+      // DSH 0.2.1 moved the working directory from the preset suffix into a required context contribution,
+      // so the suffix is represented here by its file-reference guidance.
       assert.match(model.systemText, /^你是 Nexus，用户的私人助理/);
       assert.doesNotMatch(model.systemText, /powered by DeepSeek Harness|coding agent powered by/);
-      assert.match(model.systemText, /Your working directory is/);
+      assert.match(model.systemText, /Tokens prefixed with @ are paths the user explicitly referenced/);
       assert.match(model.systemText, /schedule_create/);
       await bridge.receive(inbound('s1', '状态'));
       assert.match(texts.at(-1)!, /待触发的提醒（1）/);

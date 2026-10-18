@@ -58,6 +58,14 @@ test('release packages validate the checksum and immutable version, then reuse a
 test('metadata rejects wrong packages and install scripts, and flags DSH version mismatch',()=>{
   assert.equal(inspectPackage(archive(),'0.2.40','0.2.0-rc.2').compatible,true);
   assert.equal(inspectPackage(archive('0.2.40','0.3.0'),'0.2.40','0.2.0-rc.2').compatible,false);
+  assert.equal(inspectPackage(archive('0.2.40','^0.2.0-rc.2'),'0.2.40','0.2.1-rc.2').compatible,true);
+  const range={engines:{dsh:'>=0.2.0-rc.2 <0.3.0'}};
+  const supported=inspectPackage(archive('0.2.40','0.3.0',range),'0.2.40','0.2.1-rc.2');
+  assert.equal(supported.compatible,true);assert.equal(supported.dshVersion,'>=0.2.0-rc.2 <0.3.0');
+  assert.equal(inspectPackage(archive('0.2.40',undefined,range),'0.2.40','0.3.0').compatible,false);
+  assert.equal(inspectPackage(archive('0.2.40','0.2.0-rc.2',{engines:{dsh:''}}),'0.2.40','0.2.0-rc.2').compatible,false);
+  assert.equal(inspectPackage(archive('0.2.40','not-a-range'),'0.2.40','0.2.0-rc.2').compatible,false);
+  assert.throws(()=>inspectPackage(archive('0.2.40','0.2.0-rc.2',{engines:{dsh:1}}),'0.2.40','0.2.0-rc.2'),/update_package_invalid/);
   assert.throws(()=>inspectPackage(archive('0.2.40',undefined,{name:'another-plugin'}),'0.2.40','0.2.0-rc.2'),/update_package_invalid/);
   assert.throws(()=>inspectPackage(archive('0.2.40',undefined,{scripts:{install:'run'}}),'0.2.40','0.2.0-rc.2'),/update_package_invalid/);
   assert.throws(()=>inspectPackage(Buffer.from('not gzip'),'0.2.40','0.2.0-rc.2'),/update_package_invalid/);

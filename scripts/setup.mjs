@@ -6,8 +6,7 @@ import { renamedModuleName } from './rename-profile.mjs';
 
 export const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 export const runtimeHome = join(projectRoot, '.nexus');
-/** Native reminder rows used by isolated smoke fixtures. Normal profiles use the official optional bundle. */
-export const scheduleBundle = '@deepseek-ai/dsh-experimental-schedule-bundle';
+/** Native reminder rows used by isolated smoke fixtures; DSH 0.2.1 ships them in the web-app bundle. */
 export const assistantPlugins = [
   { id: 'schedule', name: '@deepseek-ai/dsh-schedule' },
   { id: 'time-context', name: '@deepseek-ai/dsh-time-context', config: {} },
@@ -71,7 +70,7 @@ export async function setup() {
     'package.json': {
       name: 'nexus-dsh-profile', private: true,
       dsh: { profile: {
-        bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', scheduleBundle],
+        bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'],
         patchReload: 'startup',
       } },
     },
@@ -100,10 +99,6 @@ export async function setup() {
   const manifest = JSON.parse(await readFile(join(profile, 'package.json'), 'utf8'));
   if (!manifest.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-web-app')) {
     throw new Error('The existing nexus profile does not include the official DSH Web application.');
-  }
-  if (!manifest.dsh.profile.bundles.includes(scheduleBundle)) {
-    manifest.dsh.profile.bundles.push(scheduleBundle);
-    await writeFile(join(profile, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
   }
   return { projectRoot, runtimeHome, workspace };
 }

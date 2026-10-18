@@ -28,13 +28,14 @@ Nexus 的 `.tgz` 安装包包含本项目编译后的插件、客户端界面、
 | `nodemailer` | 10.0.10 | MIT-0 |
 | `npm-registry-fetch` | 19.0.0 | ISC |
 | `qrcode` | 1.5.4 | MIT |
+| `semver` | 7.8.5 | ISC |
 | `silk-wasm` | 3.7.1 | MIT |
 
 表中是直接依赖包的声明，不代表所有传递依赖或包内附带实现使用相同许可证。完整条款请查阅对应 npm 发布包内的 `LICENSE`、`NOTICE`、README 和其他许可文件。
 
 ## 宿主与编码工具
 
-- **DeepSeek Harness（DSH）及其公开服务包**：本版精确匹配 `0.2.0-rc.2`，使用 MIT 许可的[官方项目](https://github.com/deepseek-ai/deepseek-harness)。`@deepseek-ai/cordis` 使用 `4.0.4`。Nexus 是独立第三方插件，不代表 DeepSeek 官方产品或背书。
+- **DeepSeek Harness（DSH）及其公开服务包**：本版兼容 `0.2.0-rc.2` 与 `0.2.1-rc.2`，使用 MIT 许可的[官方项目](https://github.com/deepseek-ai/deepseek-harness)。`@deepseek-ai/cordis` 以 `^4.0.4` 声明，实际安装版本以锁文件为准。Nexus 是独立第三方插件，不代表 DeepSeek 官方产品或背书。
 - **React**：宿主提供 `18.3.1`，采用 MIT 许可。`zod` 也是 MIT 许可，其实际安装版本以锁文件为准。
 - **Codex**：本版推荐 `0.155.1`，程序单独安装；其代码许可和模型服务条款分别适用，参见[上游项目](https://github.com/openai/codex)。本项目不附带其程序、账号或服务额度。
 - **Claude Agent SDK**：本版推荐 `0.3.273`，为可选 peer 依赖和源码开发依赖。该发布包的 `LICENSE.md` 声明：

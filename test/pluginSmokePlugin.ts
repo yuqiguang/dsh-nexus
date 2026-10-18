@@ -31,15 +31,17 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
 
   async function run() {
     const carrier = ctx.connection.createSharedFetchHandler('/api');
+    const peer = ctx.connection.browserPeer;
+    const send = (request: Request) => carrier.fetch(request, peer);
     async function request(method: string, payload: unknown = {}) {
-      return carrier.fetch(new Request(`dsh-app://dsh/api/nexus-channels/${method}`, {
+      return send(new Request(`dsh-app://dsh/api/nexus-channels/${method}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'client-request', rpcId: 'package-smoke', method, payload }),
       }));
     }
     const checks: string[] = [];
     const rpc = async (family: string, method: string, payload: unknown = {}) => {
-      const response = await carrier.fetch(new Request(`dsh-app://dsh/api/nexus-${family}/${method}`, {
+      const response = await send(new Request(`dsh-app://dsh/api/nexus-${family}/${method}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'client-request', rpcId: 'modules-smoke', method, payload }) }));
       assert.equal(response.status, 200);
@@ -49,14 +51,14 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
     const agendaTools = ['calendar', 'todo'];
     const memoryTools = ['memory_recall', 'memory_remember', 'memory_forget'];
     const documentTools = ['doc_read', 'doc_create', 'doc_edit', 'doc_convert'];
-    const documentStatus = () => carrier.fetch(new Request('dsh-app://dsh/api/nexus-documents/list', { method: 'POST' }));
-    const coderRequest = (method: string, payload: unknown = {}) => carrier.fetch(new Request(`dsh-app://dsh/api/nexus-coders/${method}`, {
+    const documentStatus = () => send(new Request('dsh-app://dsh/api/nexus-documents/list', { method: 'POST' }));
+    const coderRequest = (method: string, payload: unknown = {}) => send(new Request(`dsh-app://dsh/api/nexus-coders/${method}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'client-request', rpcId: 'coders-smoke', method, payload }) }));
     if (config.phase === 10) {
       assert.equal((await request('list')).status, 404);
       assert.equal((await coderRequest('list')).status, 404);
-      assert.equal((await carrier.fetch(new Request('dsh-app://dsh/api/nexus-modules/list', { method: 'POST' }))).status, 404);
+      assert.equal((await send(new Request('dsh-app://dsh/api/nexus-modules/list', { method: 'POST' }))).status, 404);
       assert.equal(ctx.clientModules.clientPath(packageName), undefined);
       assert.equal((await documentStatus()).status, 404);
       assert.ok(documentTools.every(name => !ctx.tools.get(name)));
@@ -83,10 +85,10 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       const bundle = await ctx.clientModules.fetchBundle(new Request(new URL(entry.url, 'dsh-app://dsh')));
       assert.equal(bundle.status, 200);
       assert.ok((await bundle.text()).includes('settings.section'), 'packaged script must register the settings entry');
-      const capabilities = () => carrier.fetch(new Request('dsh-app://dsh/api/nexus-data/capabilities'));
+      const capabilities = () => send(new Request('dsh-app://dsh/api/nexus-data/capabilities'));
       await until(async () => (await capabilities()).status === 200, 'data capability route missing', 10_000);
       assert.deepEqual(await (await capabilities()).json(), { importEnabled: false });
-      const upload = await carrier.fetch(new Request('dsh-app://dsh/api/nexus-data/import', {
+      const upload = await send(new Request('dsh-app://dsh/api/nexus-data/import', {
         method: 'POST', headers: { 'Content-Type': 'application/zip' }, body: 'fixture' }));
       assert.equal(upload.status, 409, 'installed plugins cannot stage an import without a launcher');
       checks.push('installed_import_refused_without_launcher');
@@ -102,13 +104,13 @@ export function apply(ctx: Context, config: { phase: number; triggerFile: string
       assert.equal((memoryRow.meta?.title as { zh?: string })?.zh, '长期记忆');
       assert.doesNotMatch(await readFile(client, 'utf8'), /nexus-modules|Nexus 扩展|nexus-documents|文档兼容工具/);
       for (const method of ['list', 'save']) {
-        assert.equal((await carrier.fetch(new Request(`dsh-app://dsh/api/nexus-modules/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        assert.equal((await send(new Request(`dsh-app://dsh/api/nexus-modules/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: 'client-request', rpcId: 'retired', method, payload: { revision: 2, enabled: { agenda: false } } }) }))).status, 404);
       }
       checks.push('legacy_module_ui_and_rpc_removed');
       assert.ok(documentTools.every(name => !ctx.tools.get(name)));
       for (const method of ['list', 'detect', 'pandoc/install']) {
-        assert.equal((await carrier.fetch(new Request(`dsh-app://dsh/api/nexus-documents/${method}`, { method: 'POST' }))).status, 404);
+        assert.equal((await send(new Request(`dsh-app://dsh/api/nexus-documents/${method}`, { method: 'POST' }))).status, 404);
       }
       assert.throws(() => installed.resolve(`${packageName}/documents`), /ERR_PACKAGE_PATH_NOT_EXPORTED|not defined/);
       assert.ok(!(await ctx.pluginManager.listPlugins()).some(row => row.moduleName === `${packageName}/documents`));

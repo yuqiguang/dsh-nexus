@@ -34,7 +34,8 @@ console.log(`nexus: profile package ${prepared.status}; converted ${prepared.con
 const require = createRequire(import.meta.url);
 const manifestPath = require.resolve('@deepseek-ai/dsh/package.json');
 const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-if (manifest.version !== '0.2.0-rc.2') throw new Error('Unexpected DSH version; review the lockfile.');
+const declared = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8')).devDependencies['@deepseek-ai/dsh'];
+if (manifest.version !== declared) throw new Error(`Unexpected DSH version ${manifest.version}; review the lockfile.`);
 const entry = join(dirname(manifestPath), typeof manifest.bin === 'string' ? manifest.bin : manifest.bin.dsh);
 // In a terminal the login address is shown as DSH prints it. Anywhere else (systemd's journal keeps it for weeks)
 // the output is passed through except that line, which is split: the bare origin is printed, the address saved.
