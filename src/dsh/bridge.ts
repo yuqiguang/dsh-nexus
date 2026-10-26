@@ -30,6 +30,7 @@ import { interruptedNotice, interruptedWork } from './recovery.js';
 import { activeLegacyReminders, describeReminders, isQuietReply, pluginInitiated } from './schedule.js';
 import { storedEvents } from './history.js';
 import { ChannelNavigation } from './navigation.js';
+import { failureNotice } from './failure-notice.js';
 import { CHANNEL_HELP } from '../channels/help.js';
 
 /** When a user-started turn is still running, the channel hears about it: once after `firstMs`, then every `everyMs`. */
@@ -769,7 +770,7 @@ export class DshChannelBridge {
     const tail = (reminders.length ? `\n待触发的提醒（${reminders.length}）：\n${reminders.join('\n')}` : '')
       + (legacy ? `\n此会话还有 ${legacy} 条旧版提醒尚未迁移，新版不会执行；请在本机查看并重新建立。` : '');
     if (boundary?.type === 'turn/end') return (boundary.data.reason.kind === 'completed'
-      ? '当前没有执行中的任务，上一轮已完成。' : '上一轮执行未完成，详情可在本机 DSH 查看。') + tail;
+      ? '当前没有执行中的任务，上一轮已完成。' : failureNotice(boundary.data.reason, '上一轮')) + tail;
     return '当前没有任务记录，发送文字即可开始。' + tail;
   }
 
@@ -912,6 +913,8 @@ export class DshChannelBridge {
     const text = last?.type === 'assistant/message'
       ? last.data.message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n').trim() : '';
     const completed = end.data.reason.kind === 'completed';
+    // One line for every failure told the reader nothing about what to do next; name the cause instead.
+    const unfinished = completed ? '' : failureNotice(end.data.reason);
     // A turn the user did not start (a due reminder, a job notice) is a push: a quiet reply means "nothing to report".
     const start = events.findLastIndex(event => event.type === 'turn/start' && event.data.turn === turn);
     const typed = events.slice(Math.max(start, 0)).filter(event => event.type === 'user/message' && event.seq <= end.seq);
@@ -922,11 +925,11 @@ export class DshChannelBridge {
     const deliveryId = identity('turn', sessionId, String(turn));
     if (pushed && this.gate?.quiet()) {
       // The user asked not to be disturbed: keep the reply for the digest instead of sending it now.
-      await this.gate.hold(sessionId, this.historicalText(sessionId, completed ? (text || '本轮已结束，详情可在本机 DSH 查看。') : [text, '本轮执行未完成，详情可在本机 DSH 查看。'].filter(Boolean).join('\n\n')), deliveryId);
+      await this.gate.hold(sessionId, this.historicalText(sessionId, completed ? (text || '本轮已结束，详情可在本机 DSH 查看。') : [text, unfinished].filter(Boolean).join('\n\n')), deliveryId);
       return;
     }
     const notice = completed ? (text || '本轮已结束，详情可在本机 DSH 查看。')
-      : [text, '本轮执行未完成，详情可在本机 DSH 查看。'].filter(Boolean).join('\n\n');
+      : [text, unfinished].filter(Boolean).join('\n\n');
     // The words always go out as text. A spoken reply was tried on 2026-09-22 and removed: iLink accepted the voice
     // item but the WeChat client rendered nothing for it, in both upload slots and with either codec it declares.
     await this.transport.sendText(chatId, this.historicalText(sessionId, notice), deliveryId, { durable: true });
