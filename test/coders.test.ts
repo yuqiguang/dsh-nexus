@@ -1506,7 +1506,7 @@ test('coder_task refuses a verify command that needs a shell; coder_status says 
   });
   const harness = coderHarness();
   await installCoders(harness.ctx, { securityMode: 'strict', roots: [workdir], defaultCoder: 'codex', spawnCodex: () => quiet.process });
-  for (const verify of ['ls -la pelican.html && grep -c "<svg" pelican.html', 'npm test | tail', 'grep -c <svg pelican.html', "node -e 'x'", 'echo $(date)']) {
+  for (const verify of ['ls -la pelican.html && grep -c "<svg" pelican.html', 'npm test | tail', 'grep -c <svg pelican.html', 'echo $(date)']) {
     await assert.rejects(harness.run('coder_task', { description: '画鹈鹕', cwd: workdir, verify }), /验证命令不经过 shell/, verify);
   }
   assert.equal(harness.jobs.length, 0);
@@ -2329,7 +2329,7 @@ test('user wait timeout interrupts the coder and releases its workspace for the 
     const next = await harness.run('coder_task', { cwd: workdir, description: 'next task' });
     await Promise.all(harness.jobs.map(job => job.done));
     assert.equal(harness.tasks.get(first.task_id!)!.status, 'interrupted');
-    assert.match(harness.tasks.get(first.task_id!)!.stopReason!, /等待用户超过时限/);
+    assert.match(harness.tasks.get(first.task_id!)!.stopReason!, /等待用户超过时限.*未回答的问题：.*git push/);
     assert.equal(harness.tasks.get(first.task_id!)!.stopCause, 'user-wait-timeout');
     const timedOut = harness.tasks.get(first.task_id!)!;
     assert.equal(timedOut.decisions.at(-1)?.outcome, 'timeout');

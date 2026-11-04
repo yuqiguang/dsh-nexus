@@ -55,7 +55,7 @@ export class Assistant {
     const { ctx, registry } = this.deps;
     const report = this.deps.report ?? ((message: string) => console.error(`[nexus-assistant] ${message}`));
     this.settings = await this.store.read();
-    installPersona(ctx, () => this.settings.persona ?? DEFAULT_PERSONA);
+    installPersona(ctx, () => this.settings.persona ?? DEFAULT_PERSONA, session => registry.bound().includes(session));
     this.gate = await PushGate.open(ctx.storageDomain, registry, this.settings, this.now, report);
     registry.setPushGate(this.gate);
     this.briefing = new DailyBriefing({ ctx, notifier: this.gate, sessions: () => registry.bound(), sameChat: (a, b) => registry.sameChat(a, b), now: this.now, onError: report }, this.settings);

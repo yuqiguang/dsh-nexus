@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AUTO_RESUME_DELAYS, codexFailure, exceptionFailure, providerFailure, resumeTransient, retryAfter, safeFailureDetail, type CoderOutcome, type TaskRetry } from '../src/coders/retry.js';
+import { AUTO_RESUME_DELAYS, RATE_LIMIT_RESUME_DELAYS, codexFailure, failureLabel, exceptionFailure, providerFailure, resumeTransient, retryAfter, safeFailureDetail, type CoderOutcome, type TaskRetry } from '../src/coders/retry.js';
 
 test('provider metadata distinguishes temporary HTTP failures, exhausted quotas and permanent policy errors', () => {
   for (const status of [429, 500, 502, 503, 504, 529, 408]) assert.ok(providerFailure({ status }));
@@ -56,7 +56,7 @@ test('quota, auth, absent native session, cancellation and ordinary tool failure
 
 test('Retry-After delays are honored; long provider cooldowns stop rather than retry too early', async () => {
   const f = setup([{ ...network, providerFailure: { kind: 'rate-limit', retryAfterMs: 20000 } }, { status: 'completed' }]);
-  await resumeTransient(f.options); assert.deepEqual(f.waits, [20000]);
+  await resumeTransient(f.options); assert.deepEqual(f.waits, [RATE_LIMIT_RESUME_DELAYS[0]]);
   const long = setup([{ ...network, providerFailure: { kind: 'rate-limit', retryAfterMs: 180000 } }]);
   await resumeTransient(long.options); assert.equal(long.calls(), 1); assert.match(long.states.at(-1)!.reason, /超过 2 分钟/);
 });
@@ -83,4 +83,17 @@ test('retry diagnostics discard authenticated URLs and provider credentials', ()
   const detail = safeFailureDetail('503 https://name:password@example.com/secret?token=abc Bearer private-token api_key=hidden sk-abcdefghijkl');
   assert.doesNotMatch(detail, /password|example.com|abc|private-token|hidden/);
   assert.match(detail, /503/);
+});
+
+test('rate limits resume on a longer schedule than connection drops', async () => {
+  const limited: CoderOutcome = { status: 'failed', providerFailure: { kind: 'rate-limit' } };
+  const f = setup([limited]); await resumeTransient(f.options);
+  assert.equal(f.calls(), RATE_LIMIT_RESUME_DELAYS.length + 1); assert.deepEqual(f.waits, [...RATE_LIMIT_RESUME_DELAYS]);
+  assert.match(f.states.at(-1)!.reason, /上限（4 次）.*retry_task_id/);
+});
+
+test('a gateway-wrapped 400 is a readable permanent failure, not raw JSON', () => {
+  const failure = codexFailure({ message: '{"error":{"message":"bad response status code 400 (request id: x)","type":"upstream_error"}}' });
+  assert.equal(failure?.kind, 'permanent');
+  assert.match(failureLabel(failure!), /被拒绝.*原样重试/);
 });

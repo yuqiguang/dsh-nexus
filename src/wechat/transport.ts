@@ -1,4 +1,5 @@
 import type { ChannelTransport, DeliveryOptions, DroppedAttachment, InboundAttachment, InboundMessage, OutboundFile } from '../channels/protocol.js';
+import { plainChatText } from '../channels/plain-text.js';
 import { readDelivery } from '../channels/files.js';
 import { MAX_INBOUND_BYTES } from '../channels/inbox.js';
 import { ChannelError, type ConnectionRecord, type ConnectionState } from '../channels/types.js';
@@ -65,8 +66,9 @@ export class WechatTransport implements ChannelTransport {
     await Promise.allSettled([this.polling, this.outgoing, this.wire]);
   }
 
-  async sendText(chatId: string, text: string, deliveryId: string, options?: DeliveryOptions): Promise<void> {
+  async sendText(chatId: string, markdown: string, deliveryId: string, options?: DeliveryOptions): Promise<void> {
     if (chatId !== this.config.ownerId) throw new ChannelError('invalid_recipient');
+    const text = plainChatText(markdown);
     if (options?.durable) {
       try { await this.store.enqueue(deliveryId, text, options.batchKey); }
       catch (error) { this.publish({ deliveryError: this.code(error) }); throw error; }

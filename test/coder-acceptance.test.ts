@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile, rm, symlink, stat, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveAcceptanceChecks } from '../src/coders/acceptance-checks.js';
+import { acceptanceChecksParameter, resolveAcceptanceChecks } from '../src/coders/acceptance-checks.js';
 import { inspectArtifact, currentArtifactEvidence } from '../src/coders/artifacts.js';
 import { verifyCommandWords, verifyTask } from '../src/coders/verify.js';
+import { validateArgs } from '@deepseek-ai/dsh-tools';
 import { deliveryReport } from '../src/coders/delivery.js';
 import type { TaskRecord } from '../src/coders/types.js';
 import type { CoderBrief } from '../src/coders/brief.js';
@@ -80,4 +81,12 @@ test('declared files cannot redirect inspection through a link, or convert a mis
   assert.equal((await inspectArtifact(join(cwd, '..', 'outside'), cwd)).ok, false);
   const missing = await verifyTask({ cwd, outputs: ['missing'] }, [cwd]);
   assert.equal(missing.verifyOk, false); assert.equal(missing.verifyExecuted, true);
+});
+
+test('a note on a per-criterion check passes host argument validation and is dropped before use', () => {
+  const spec = { acceptance_checks: acceptanceChecksParameter };
+  const args = { acceptance_checks: [{ criterion: 'a1', commands: ['npm test'], note: '覆盖 a1' }] };
+  assert.deepEqual(validateArgs(spec as never, args), []);
+  const brief = { id: 'b', revision: 1, objective: 'o', constraints: '', acceptance: [{ id: 'a1', text: 'a1' }] };
+  assert.deepEqual(resolveAcceptanceChecks(args.acceptance_checks, brief, ['npm test']), [{ criterion: 'a1', commands: ['npm test'], files: [] }]);
 });

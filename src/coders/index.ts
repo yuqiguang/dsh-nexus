@@ -18,8 +18,8 @@ import { ActiveBudget } from './budget.js';
 import { RetryProgressGuard, type RETRY_PROGRESS_LIMITS } from './retry-progress.js';
 import { failureLabel, resumeTransient, retryText, type CoderRun, type RetryNotice, type TaskRetry, type waitForRetry } from './retry.js';
 import { assertRetry, recoveryReport, taskRecovery, type TaskRecoveryView } from './recovery.js';
-import { resolvePlanStep } from './plan.js';
-import { acceptanceChecksParameter, resolveAcceptanceChecks } from './acceptance-checks.js';
+import { proseVerify, resolvePlanStep } from './plan.js';
+import { unlistedCheckCommands, acceptanceChecksParameter, resolveAcceptanceChecks } from './acceptance-checks.js';
 import { approvalProvenance } from './approval-provenance.js';
 import { expectedArtifacts } from './artifacts.js';
 import { installBriefs, type CoderBrief } from './brief.js';
@@ -67,6 +67,9 @@ import { windowsSandbox, windowsVerifyArgv, windowsVerifyExecutable } from './wi
 declare module '@deepseek-ai/dsh-jobs' {
   interface JobKindMap { coder: 'coder' }
 }
+
+/** A desktop user may step away; a paused task still keeps its records, but asking again costs a fresh dispatch. */
+const USER_WAIT_MS = 30 * 60_000;
 
 export interface CodersConfig {
   channelWork?: ChannelWork;
@@ -231,6 +234,9 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
   const changes = changeSummary(verify.changedFiles, expectedArtifacts(task));
   const lines = [
     `编码任务 ${task.id} ${outcome.status === 'completed' ? (verify.verifyExecuted === false ? '执行结束，独立验证未执行' : verify.verifyOk === false ? '执行结束，但验证失败' : task.permissions?.securityMode !== 'full' && verify.outsideRoots.length ? '已完成，但有改动越出根目录' : verify.verifyOk === undefined ? '执行结束，尚未独立验证' : '执行结束，验证通过') : outcome.status === 'killed' ? task.stopCause === 'user-wait-timeout' ? '等待用户超时，已暂停' : task.stopReason ? '已暂停' : '已取消' : '失败'}${outcome.detail ? `（${outcome.detail}）` : ''}`,
+    // The reason a reader acts on comes before the task record, permissions and file lists.
+    ...(outcome.status === 'completed' && (verify.verifyOk === false || verify.verifyExecuted === false) && verify.verifyOutput?.trim()
+      ? [`首要原因：${oneLine(verify.verifyOutput, 300)}`] : []),
     `任务：${task.description}`,
     ...(task.resumedFrom ? [`续接：${task.resumedFrom}`] : []),
     `目录：${task.cwd}`,
@@ -239,7 +245,10 @@ export function taskReport(task: TaskRecord, outcome: JobOutcome, verify: Awaite
     ...(task.permissions ? [permissionSummary(task.permissions)] : []),
     '',
     `DSH 独立验证范围：${task.verify ? [task.verify, ...(task.verifyCommands ?? [])].join('；') : '未指定'}。编码工具自述的其他测试不代表 DSH 已独立运行。`,
-    ...(task.brief ? [`逐项验收覆盖：${task.brief.acceptance.map(item => `${item.id} ${task.acceptanceChecks?.some(check => check.criterion === item.id) || task.brief!.acceptance.length === 1 && task.verify ? '已对应检查' : '尚未登记对应检查'}`).join('；')}；结束后用 coder_brief delivery 核对。`] : []),
+    ...(task.brief ? [(() => {
+      const missing = task.brief!.acceptance.filter(item => !(task.acceptanceChecks?.some(check => check.criterion === item.id) || task.brief!.acceptance.length === 1 && task.verify)).map(item => item.id);
+      return `逐项验收覆盖：${task.brief!.acceptance.length - missing.length}/${task.brief!.acceptance.length} 项已对应检查${missing.length ? `；尚未登记对应检查：${missing.join('、')}` : ''}；结束后用 coder_brief delivery 核对。`;
+    })()] : []),
     ...(verify.artifactChecks?.length ? [`声明文件检查 ${verify.artifactChecks.filter(check => check.ok).length}/${verify.artifactChecks.length}；文件存在与摘要不代替内容、复现和业务效果检查。`,
       ...verify.artifactChecks.filter(check => !check.ok).map(check => `${check.path}：${check.detail}`)] : []),
     ...(verify.preflightCheck ? [`执行前环境预检 ${verify.preflightCheck.command}：${verify.preflightCheck.ok ? '通过' : verify.preflightCheck.executed ? '失败' : '未执行'}；${clip(verify.preflightCheck.output, 1200)}`] : []),
@@ -296,7 +305,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     if (tasks.some(task => { const current = store.get(task.id); return current && isActive(current); })) throw new Error('旧任务尚未停止。');
   }, async request => {
     if (!request.agent) throw new Error('提问需要所属会话。');
-    const signal = AbortSignal.any([request.signal ?? shutdown.signal, shutdown.signal, AbortSignal.timeout(config.maxUserWaitMs ?? 10 * 60_000)]);
+    const signal = AbortSignal.any([request.signal ?? shutdown.signal, shutdown.signal, AbortSignal.timeout(config.maxUserWaitMs ?? USER_WAIT_MS)]);
     const queue = questionQueues.get(request.agent.id) ?? new CoderQueue(1);
     questionQueues.set(request.agent.id, queue);
     const release = await queue.acquire(signal);
@@ -517,7 +526,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       ...(request.detail ? { detail: clip(request.detail, 500) } : {}) }));
     step(`等待用户：${oneLine(request.summary, 100)}`);
     const resumeBudget = budgets.get(taskId)?.pause();
-    const waitSignal = AbortSignal.any([signal, AbortSignal.timeout(config.maxUserWaitMs ?? 10 * 60_000)]);
+    const waitSignal = AbortSignal.any([signal, AbortSignal.timeout(config.maxUserWaitMs ?? USER_WAIT_MS)]);
     const queue = questionQueues.get(task.ownerSession) ?? new CoderQueue(1);
     questionQueues.set(task.ownerSession, queue);
     let releaseQuestion: (() => void) | undefined;
@@ -545,7 +554,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       await store.update(taskId, () => ({ stopCause: 'user-wait-timeout', userWaitTimeout: {
         startedAt: waitStartedAt, endedAt: Date.now(), summary: request.summary, ...(escalationReason ? { reason: escalationReason } : {}),
       } }));
-      stopOf.get(taskId)?.('等待用户超过时限，任务已暂停；请回答或调整后显式续接。');
+      stopOf.get(taskId)?.(`等待用户超过时限，任务已暂停。未回答的问题：${oneLine(request.kind === 'question' && request.questions?.length ? request.questions.map(item => item.question).join('；') : request.summary, 300)}。请向用户转述，回答后显式续接。`);
     }
     if (outcome.decision.behavior === 'allow') {
       const current = store.get(taskId);
@@ -909,7 +918,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_task',
-    description: '将需深入调查、跨模块协调或持续执行的完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行；用户指定编码工具、后台跟进或宿主独立验收时也使用。范围明确、低风险且当前会话工具可短步骤完成并验证的局部改动直接处理，遵循当前会话权限与审批；相关已有任务优先插话或续接，不与活动任务同时修改同一工作树。派发后报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖须成功且独立验证通过。工具自身重试后，短暂网络或限流最多自动续接原会话两次；额度、认证失败或等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。结束后用 resume_task_id 续接，失败恢复用 retry_task_id，仅复验用 verification_only。',
+    description: '将需深入调查、跨模块协调或持续执行的完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行；用户指定编码工具、后台跟进或宿主独立验收时也使用。范围明确、低风险且当前会话工具可短步骤完成并验证的局部改动直接处理，遵循当前会话权限与审批；相关已有任务优先插话或续接，不与活动任务同时修改同一工作树。派发后报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖须成功且独立验证通过。工具自身重试后，短暂网络故障最多自动续接原会话两次、限流最多四次（间隔递增至 2 分钟）；模型服务拒绝请求（如 400）不要原样重试，先缩短说明或检查配置；额度、认证失败或等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。结束后用 resume_task_id 续接，失败恢复用 retry_task_id，仅复验用 verification_only。',
     parameters: {
       coder: { type: 'string', enum: ['codex', 'claude'], description: '执行任务的工具：codex 或 claude（Claude Code）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
       description: { type: 'string', description: '无计划的新任务必填完整说明。有 plan_step 时省略，系统采用已保存的步骤说明；续接补充内容用 continuation，不重复抄写或修改计划。' },
@@ -935,7 +944,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       schema: { type: 'object', additionalProperties: false, properties: {
         task_id: { type: 'string', required: true }, job_id: { type: 'string', required: true }, status: { type: 'string', required: true }, cwd: { type: 'string', required: true }, verify_cwd: { type: 'string' },
       } },
-      render: (_args, value) => [{ type: 'text', text: `已派发编码任务 ${value.task_id}，后台 job ${value.job_id}，状态：${value.status}。实际项目目录：${value.cwd}。${value.verify_cwd ? `独立验证目录：${value.verify_cwd}。` : ''}排队中只表示受理时尚未启动，不能推断有其他任务占用；可能立即开始。任务结束时会收到 job 完成通知；当前动作和最近几步可用 coder_status 查看。` }],
+      render: (_args, value) => [{ type: 'text', text: `已派发编码任务 ${value.task_id}，后台 job ${value.job_id}，状态：${value.status}。实际项目目录：${value.cwd}。${value.verify_cwd ? `独立验证目录：${value.verify_cwd}。` : ''}${value.status === 'queued' ? '排队中只表示受理时尚未启动，可能立即开始。' : ''}结束时会收到 job 完成通知；进展用 coder_status 查看。` }],
     },
     async execute(args, exec) {
       if (!exec.agent) throw new Error('coder_task 只能在会话中调用。');
@@ -1016,7 +1025,11 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const checks = suite ?? planChecks;
         const verify = checks?.[0] ?? args.verify ?? previous?.verify;
         const preflight = planned?.step.preflight ?? args.preflight ?? previous?.preflight;
-        const verifyCommands = checks ? checks.slice(1) : args.verify !== undefined ? undefined : previous?.verifyCommands;
+        const listed = checks ? checks.slice(1) : args.verify !== undefined ? undefined : previous?.verifyCommands;
+        // A criterion check naming a command the suite left out registers it rather than bouncing the whole dispatch.
+        const unlisted = verify ? unlistedCheckCommands(args.acceptance_checks, [verify, ...(listed ?? [])]) : [];
+        const verifyCommands = unlisted.length ? [...(listed ?? []), ...unlisted] : listed;
+        if ((verifyCommands?.length ?? 0) > 9) throw new Error('独立验证列表需要 1 到 10 条非空命令（含逐项检查引用的命令）。');
         const acceptanceChecks = resolveAcceptanceChecks(args.acceptance_checks ?? (sameVersion ? previous?.acceptanceChecks : undefined) ?? planned?.step.acceptance_checks,
           brief, verify ? [verify, ...(verifyCommands ?? [])] : [], [...(planned?.step.acceptance_checks ?? []), ...(sameVersion ? previous?.acceptanceChecks ?? [] : [])]);
         const outputs = [...new Set([...(planned?.step.outputs ?? []), ...(args.outputs ?? []), ...(!previous?.brief || sameVersion ? previous?.outputs ?? [] : [])])];
@@ -1033,6 +1046,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         const verifyNetwork = verificationNetwork(args.verify_network, previous?.verifyNetwork, permissions.securityMode ?? 'strict');
         if (verify || preflight) await preflightVerification(process.platform, coder, verifyNetwork);
         for (const command of [...(preflight ? [preflight] : []), ...(verify ? [verify, ...(verifyCommands ?? [])] : [])]) {
+          if (proseVerify(command)) throw new Error(`任务未派发：验证命令「${command}」像是说明文字，会被当作程序执行。请填写可直接运行的命令，多项检查用 verify_commands 逐条登记。`);
           verifyCommandWords(command);
         }
         for (const file of artifacts) {

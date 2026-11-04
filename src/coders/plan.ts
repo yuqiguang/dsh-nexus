@@ -4,9 +4,18 @@ import type { CoderBrief } from './brief.js';
 import { isActive, type TaskRecord } from './types.js';
 import { isProtectedPath, isProjectEnvironment } from './rules.js';
 import { resolve } from 'node:path';
-import { acceptanceChecksSchema, resolveAcceptanceChecks } from './acceptance-checks.js';
+import { acceptanceChecksSchema, resolveAcceptanceChecks, unlistedCheckCommands } from './acceptance-checks.js';
 
-export const VERIFY_SHELL_SYNTAX = /[|&;<>`'"]|\$\(/;
+/** Unquoted shell operators only; paired quotes group an argument (see `verifyCommandWords`). */
+export const VERIFY_SHELL_SYNTAX = /[|&;<>`]|\$\(/;
+/** A prose summary ("ruff + mypy + pytest 相关子集") would be run as a program and fail only after the coder finishes. */
+export function proseVerify(command: string): boolean {
+  const bare = command.replace(/"[^"]*"|'[^']*'/g, '');
+  const program = bare.trim().split(/\s+/)[0] ?? '';
+  // Full-width punctuation or " + " joins clauses; a CJK first word is a sentence, unless it is a script path such as 检查.py.
+  return /[，。；：、！？]/.test(bare) || /\s\+\s/.test(bare) || /[\u4e00-\u9fff]/.test(program) && !/[\\/.]/.test(program);
+}
+const issuePath = (issue: z.core.$ZodIssue) => issue.path.map(part => typeof part === 'number' ? `[${part}]` : `.${String(part)}`).join('').replace(/^\./, '');
 export const planSchema = z.array(z.object({
   id: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
   description: z.string().trim().min(1).max(2000),
@@ -23,13 +32,22 @@ export type PlanStep = z.infer<typeof planSchema>[number];
 /** Validate the whole graph before persisting it. This does not schedule or execute work. */
 export function validatePlan(input: unknown, acceptance: readonly { id: string }[]): PlanStep[] {
   const parsed = planSchema.safeParse(input);
-  if (!parsed.success) throw new Error('计划需要 1 至 20 个步骤，每步包含唯一 id、任务说明、验收项、依赖列表和验证命令。');
-  const steps = parsed.data;
+  if (!parsed.success) {
+    const detail = parsed.error.issues.slice(0, 3).map(issue => `${issuePath(issue) || 'plan'}：${issue.message}`).join('；');
+    throw new Error(`计划需要 1 至 20 个步骤，每步包含唯一 id、任务说明、验收项、依赖列表和验证命令。问题：${detail}`);
+  }
+  const steps = parsed.data.map(step => {
+    const extra = unlistedCheckCommands(step.acceptance_checks, [step.verify, ...(step.verify_commands ?? [])]);
+    return extra.length ? { ...step, verify_commands: [...(step.verify_commands ?? []), ...extra] } : step;
+  });
+  if (steps.some(step => (step.verify_commands?.length ?? 0) > 9)) throw new Error('每个计划步骤最多 10 条验证命令（verify 加 verify_commands，含逐项检查引用的命令）。');
   const byId = new Map(steps.map(step => [step.id, step]));
   if (byId.size !== steps.length) throw new Error('计划步骤 ID 不能重复。');
   for (const step of steps) {
     if (step.acceptance_ids.some(id => !acceptance.some(item => item.id === id))) throw new Error(`步骤 ${step.id} 引用了不存在的验收项。`);
     if (step.depends_on.some(id => !byId.has(id))) throw new Error(`步骤 ${step.id} 引用了不存在的前置步骤。`);
+    const prose = [step.verify, ...(step.verify_commands ?? [])].find(proseVerify);
+    if (prose) throw new Error(`步骤 ${step.id} 的 verify「${prose}」像是说明文字；verify 会作为第一条命令执行，请填写可直接运行的命令（如 pytest -q tests），多项检查列入 verify_commands。`);
     if ([step.verify, ...(step.verify_commands ?? [])].some(command => VERIFY_SHELL_SYNTAX.test(command))) throw new Error(`步骤 ${step.id} 的验证命令不能包含 shell 组合语法，请使用单个脚本。`);
     resolveAcceptanceChecks(step.acceptance_checks, { id: 'plan', revision: 1, objective: 'plan', constraints: '', acceptance: step.acceptance_ids.map(id => ({ id, text: id })) }, [step.verify, ...(step.verify_commands ?? [])]);
     if (step.preflight && VERIFY_SHELL_SYNTAX.test(step.preflight)) throw new Error(`步骤 ${step.id} 的环境预检必须使用单个脚本。`);

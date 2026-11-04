@@ -227,3 +227,10 @@ test('the inbound hook authenticates with a constant-time bearer check and frame
   assert.equal(tokenMatches(token.slice(1), token), false);
   assert.equal(tokenMatches(undefined, token), false);
 });
+
+test('only channel-bound sessions get the phone-length reply rule', () => {
+  assert.match(renderPersona(DEFAULT_PERSONA), /两三句话说完/);
+  const desktop = renderPersona(DEFAULT_PERSONA, false);
+  assert.doesNotMatch(desktop, /两三句话说完|不用标题和表格/);
+  assert.match(desktop, /结论先行.*不要描述你调用了什么工具/);
+});

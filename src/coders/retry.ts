@@ -17,10 +17,13 @@ export interface TaskRetry {
 export const RESUME_PROMPT = '上一次模型请求因短暂故障停止。请在本会话核对已完成的操作和当前文件，继续尚未完成的工作。不要重复已成功的命令、提交或其他副作用；不能确认操作是否完成时先检查结果。原任务目标、验收要求和权限不变。';
 
 export const AUTO_RESUME_DELAYS = [5_000, 15_000] as const;
+/** Rate limits clear on the provider's window, not in seconds; a long task should outlast a few of them. */
+export const RATE_LIMIT_RESUME_DELAYS = [30_000, 60_000, 120_000, 120_000] as const;
+const resumeDelays = (failure: ProviderFailure): readonly number[] => failure.kind === 'rate-limit' ? RATE_LIMIT_RESUME_DELAYS : AUTO_RESUME_DELAYS;
 export const MAX_RETRY_WAIT_MS = 120_000;
 const labels: Record<ProviderFailureKind, string> = {
   network: '模型请求连接中断或超时', 'rate-limit': '模型服务暂时限流', overloaded: '模型服务暂时不可用',
-  quota: '模型额度或预算已用尽', authentication: '模型认证或账号不可用', permanent: '模型请求无法自动恢复',
+  quota: '模型额度或预算已用尽', authentication: '模型认证或账号不可用', permanent: '模型请求被拒绝或无法自动恢复，原样重试通常仍会失败（常见原因：说明或上下文过长、模型或编码工具配置不兼容）',
 };
 export const failureLabel = (failure: ProviderFailure) => labels[failure.kind];
 export const transient = (failure: ProviderFailure) => ['network', 'rate-limit', 'overloaded'].includes(failure.kind);
@@ -38,7 +41,8 @@ export function safeFailureDetail(value: string): string {
 export function providerFailure(value: { code?: unknown; status?: unknown; message?: unknown; retryAfterMs?: unknown }): ProviderFailure | undefined {
   const code = typeof value.code === 'string' ? value.code : '';
   const message = typeof value.message === 'string' ? value.message.slice(0, 8192) : '';
-  const status = value.status;
+  // Gateways wrap the upstream status in text: `bad response status code 400 (request id: …)`.
+  const status = value.status ?? (/\bstatus code (\d{3})\b/i.exec(message)?.[1] ? Number(/\bstatus code (\d{3})\b/i.exec(message)![1]) : undefined);
   let kind: ProviderFailureKind | undefined;
   if (['usageLimitExceeded', 'sessionBudgetExceeded', 'billing_error', 'insufficient_quota', 'credits_required', 'quota_exceeded'].includes(code)
     || /insufficient[_ ]quota|\b(?:quota|credits?|budget)\b.{0,35}\b(?:exhausted|exceeded|depleted)\b|\bout of credits\b|\bcredit balance\b|\b(?:billing|usage) limit\b|exceeded.{0,30}quota/i.test(message)) kind = 'quota';
@@ -98,6 +102,7 @@ export async function resumeTransient(options: {
   wait?: typeof waitForRetry;
 }): Promise<CoderOutcome> {
   let outcome: CoderOutcome = { status: 'killed' };
+  let lastDelays: readonly number[] = AUTO_RESUME_DELAYS;
   try {
     for (let attempt = 0; ; attempt++) {
       options.signal.throwIfAborted();
@@ -112,26 +117,27 @@ export async function resumeTransient(options: {
       const failure = outcome.providerFailure;
       if (outcome.status !== 'failed' || !failure) {
         await options.state(attempt && outcome.status === 'completed'
-          ? { source: 'nexus', phase: 'recovered', attempt, maxAttempts: AUTO_RESUME_DELAYS.length, reason: '连接已恢复，原会话执行结束' } : undefined);
+          ? { source: 'nexus', phase: 'recovered', attempt, maxAttempts: lastDelays.length, reason: '连接已恢复，原会话执行结束' } : undefined);
         return outcome;
       }
-      const baseDelay = AUTO_RESUME_DELAYS[attempt];
+      lastDelays = resumeDelays(failure);
+      const baseDelay = lastDelays[attempt];
       const wait = Math.max(baseDelay ?? 0, failure.retryAfterMs ?? 0);
       const stop = !transient(failure) ? '请处理后再继续'
         : !options.sessionId() ? '未取得原编码会话，需检查已有改动后手动重试'
-        : baseDelay === undefined ? '已达到自动续接上限，请稍后在所属会话继续'
+        : baseDelay === undefined ? `已达到自动续接上限（${attempt} 次），请稍后在所属会话用 coder_task 的 retry_task_id 续接`
         : wait > MAX_RETRY_WAIT_MS ? '服务要求等待超过 2 分钟，请稍后在所属会话继续' : undefined;
       if (stop) {
-        await options.state({ source: 'nexus', phase: 'stopped', attempt, maxAttempts: AUTO_RESUME_DELAYS.length, reason: `${failureLabel(failure)}；${stop}` });
+        await options.state({ source: 'nexus', phase: 'stopped', attempt, maxAttempts: lastDelays.length, reason: `${failureLabel(failure)}；${stop}` });
         return outcome;
       }
-      await options.state({ source: 'nexus', phase: 'waiting', attempt: attempt + 1, maxAttempts: AUTO_RESUME_DELAYS.length,
+      await options.state({ source: 'nexus', phase: 'waiting', attempt: attempt + 1, maxAttempts: lastDelays.length,
         reason: `${failureLabel(failure)}；等待后恢复原会话`, retryAt: Date.now() + wait });
       await (options.wait ?? waitForRetry)(wait, options.signal);
       options.signal.throwIfAborted();
       await options.beforeResume();
       options.signal.throwIfAborted();
-      await options.state({ source: 'nexus', phase: 'resuming', attempt: attempt + 1, maxAttempts: AUTO_RESUME_DELAYS.length, reason: '正在恢复原编码会话' });
+      await options.state({ source: 'nexus', phase: 'resuming', attempt: attempt + 1, maxAttempts: lastDelays.length, reason: '正在恢复原编码会话' });
     }
   } catch (error) {
     if (options.signal.aborted) {

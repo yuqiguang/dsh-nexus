@@ -6,6 +6,7 @@ import { LOCAL_CHECK_GUIDANCE, RESEARCH_GUIDANCE, RESEARCH_TOKEN_ENV, type Resea
 import type { TaskPermissions } from './permissions.js';
 import { isInside } from './rules.js';
 import { codexFailure, exceptionFailure, failureLabel, safeFailureDetail, RESUME_PROMPT, type CodexError, type CoderRun, type CoderOutcome as JobOutcome, type RetryNotice } from './retry.js';
+import { readableFailure } from '../dsh/failure-notice.js';
 import { codexCommandRequest, codexFileChangeRequest, codexPermissionRequest, codexQuestionRequest, codexStep, codexTextQuestion, narration, outputTail } from './normalize.js';
 import { commandMentionsEnvironment } from './rules.js';
 import type { CoderDecision, CoderRequest, TaskRecord } from './types.js';
@@ -231,7 +232,9 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
     const items = turn?.items?.length ? turn.items : turnItems;
     if (turn?.status === 'failed') {
       const error = turn.error ?? errors.at(-1), failure = codexFailure(error);
-      return finish({ status: 'failed', detail: failure ? failureLabel(failure) : safeFailureDetail(error?.message ?? 'turn failed'), result: lastAssistant,
+      // A rejected request keeps its short provider reason (without the request id) beside the advice.
+      const reason = failure?.kind === 'permanent' ? readableFailure(error) : '';
+      return finish({ status: 'failed', detail: failure ? `${failureLabel(failure)}${reason ? `。服务返回：${reason}` : ''}` : safeFailureDetail(error?.message ?? 'turn failed'), result: lastAssistant,
         ...(failure ? { providerFailure: failure } : {}) });
     }
     if (turn?.status === 'interrupted') return finish({ status: 'killed', detail: cancelReason ?? 'interrupted', result: lastAssistant });

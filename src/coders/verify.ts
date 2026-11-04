@@ -47,13 +47,18 @@ const GIT_BUFFER = 4 * 1024 * 1024;
 
 /** Windows paths keep backslashes; quotes delimit argv without introducing a shell. */
 export function windowsVerifyWords(command: string): string[] {
+  return quotedWords(command, /[&|;<>`$\r\n]/, '验证只接受单条命令，不支持 shell 运算符。');
+}
+
+/** Quotes only group one argument; no shell sees them, so quoted operators stay literal text. */
+function quotedWords(command: string, operator: RegExp, refusal: string): string[] {
   const words: string[] = [];
   let word = '', quote = '', started = false;
   for (const char of command.trim()) {
     if (quote) { if (char === quote) quote = ''; else word += char; started = true; }
     else if (char === '"' || char === "'") { quote = char; started = true; }
     else if (/\s/.test(char)) { if (started) { words.push(word); word = ''; started = false; } }
-    else { if (/[&|;<>`$\r\n]/.test(char)) throw new Error('验证只接受单条命令，不支持 shell 运算符。'); word += char; started = true; }
+    else { if (operator.test(char)) throw new Error(refusal); word += char; started = true; }
   }
   if (quote) throw new Error('验证命令的引号未闭合。');
   if (started) words.push(word);
@@ -63,8 +68,9 @@ export function windowsVerifyWords(command: string): string[] {
 
 /** One observable child exit per check. An inline shell can turn a failed child into a successful echo. */
 export function verifyCommandWords(command: string, platform = process.platform): string[] {
-  if (platform !== 'win32' && /[|&;<>`'"\r\n]|\$\(/.test(command)) throw new Error('验证命令不经过 shell，不能包含组合语法或引号；请用 verify_commands 分别登记检查。');
-  const words = platform === 'win32' ? windowsVerifyWords(command) : command.trim().split(/\s+/);
+  const words = platform === 'win32' ? windowsVerifyWords(command)
+    : quotedWords(command, /[|&;<>`\r\n]/, '验证命令不经过 shell，不能包含组合语法；可用成对引号包住含空格的参数，多项检查请用 verify_commands 分别登记。');
+  if (platform !== 'win32' && /\$\(/.test(command)) throw new Error('验证命令不经过 shell，不能包含命令替换；多项检查请用 verify_commands 分别登记。');
   const name = words[0]?.replace(/\\/g, '/').split('/').at(-1)?.replace(/\.exe$/i, '').toLowerCase();
   if (!name) throw new Error('验证命令不能为空。');
   if (/^(?:pwsh|powershell|cmd|(?:ba|da|z|k)?sh)$/.test(name)

@@ -26,15 +26,20 @@ export async function runtimeEnvironment(env: NodeJS.ProcessEnv, value: unknown,
   return result;
 }
 
+/** Marks the dispatcher's own runtime lookup: it only resolves interpreters and runs before the task takes its workspace lease. */
+export const CODER_RUNTIME_CALL = ':coder-runtime';
 export interface CoderRuntimeEnvironment { env: NodeJS.ProcessEnv; executables: Record<string, string> }
 
 /** Keep the host-resolved executable identities separate from the command's untrusted arguments. */
 export async function loadCoderRuntime(ctx: Context, exec: ToolRunContext, env: NodeJS.ProcessEnv): Promise<CoderRuntimeEnvironment> {
   if (process.platform !== 'win32' || !ctx.tools.get('load_workspace_dependencies', exec.agent?.id)) return { env, executables: {} };
   const result = await ctx.tools.execute({ name: 'load_workspace_dependencies', arguments: {}, agent: exec.agent,
-    callId: ToolCallId(`${exec.callId}:coder-runtime`), rootCallId: exec.rootCallId, parent: exec.token, signal: exec.signal });
+    callId: ToolCallId(`${exec.callId}${CODER_RUNTIME_CALL}`), rootCallId: exec.rootCallId, parent: exec.token, signal: exec.signal });
   for (const context of result.additionalContexts ?? []) exec.deferContext(context);
-  if (result.isError) throw new Error('DSH 内置运行环境加载失败，请先检查 load_workspace_dependencies 的结果。');
+  if (result.isError) {
+    const reason = (result.content ?? []).map(part => part.type === 'text' ? part.text : '').join(' ').trim().slice(0, 300);
+    throw new Error(`DSH 内置运行环境加载失败${reason ? `：${reason}` : '，请先检查 load_workspace_dependencies 的结果'}。`);
+  }
   const prepared = await runtimeEnvironment(env, result.value);
   const entries = result.value as Record<string, unknown>;
   const executables: Record<string, string> = {};

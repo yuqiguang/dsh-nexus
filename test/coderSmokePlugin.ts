@@ -342,10 +342,10 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     const background = await ctx.tools.execute({ name: 'bash', arguments: { command: 'node background-fixture.cjs', description: 'Local background lifecycle fixture', run_in_background: true },
       agent, callId: ToolCallId('smoke-native-background'), rootCallId: ToolCallId(channelWork.get(task.id)!.rootCallId), signal: new AbortController().signal });
     assert.equal(background.isError, false, JSON.stringify(background.content));
-    const locked = await ctx.tools.execute({ name: 'write', arguments: { file_path: join(task.cwd, 'blocked-background.txt'), content: 'must not be written' },
+    // The session's own background job does not lock the session out; coders and other sessions stay excluded (coder-workspace-access tests).
+    const beside = await ctx.tools.execute({ name: 'write', arguments: { file_path: join(task.cwd, 'beside-background.txt'), content: 'own session' },
       agent, callId: ToolCallId('smoke-background-write'), signal: new AbortController().signal });
-    assert.equal(locked.isError, true);
-    assert.match(JSON.stringify(locked.content), /工作区正在执行/);
+    assert.equal(beside.isError, false, JSON.stringify(beside.content));
     await writeFile(join(task.cwd, 'background-release'), 'release');
     await until(() => agent.session.snapshotEvents().some(event => event.type === 'user/message' && (event.data.source as { kind: string }).kind === 'tool-jobs' && JSON.stringify(event.data.content).includes('background job bash-')), 'native bash completion notice', 10_000);
     await agent.whenIdle(); await bridge.drain();

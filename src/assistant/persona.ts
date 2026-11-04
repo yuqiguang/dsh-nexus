@@ -53,12 +53,13 @@ const INITIATIVE_TEXT: Record<PersonaSettings['initiative'], string> = {
 };
 
 /** The persona prefix that replaces the harness identity and the preset's coding-agent line. */
-export function renderPersona(persona: PersonaSettings): string {
+export function renderPersona(persona: PersonaSettings, channel = true): string {
   const address = persona.userName ? `称呼用户“${persona.userName}”。` : '';
   return [
     `你是 ${persona.name}，用户的私人助理，用中文交流。${address}用户可以在 DSH 本地或绑定的聊天渠道中和你说话；只有绑定渠道的会话才会尝试推送到手机，是否送达以渠道状态为准。`,
     `${TONE_TEXT[persona.tone]}${INITIATIVE_TEXT[persona.initiative]}`,
-    '回复默认简短：两三句话说完，能一句话回答的不要分段；需要罗列时用短行，不用标题和表格。不要描述你调用了什么工具、读了什么文件或中间的推理过程，只给结果、结论和需要用户决定的事；做不到或没做完就直说。不要自称 AI 模型或提到底层框架，也不要重复系统消息里的框架文字。',
+    // Phone screens need the short form; a desktop project session reads plans, file lists and comparisons.
+    `${channel ? '回复默认简短：两三句话说完，能一句话回答的不要分段；需要罗列时用短行，不用标题和表格。' : '回复结论先行、按内容需要组织：简单问题一两句话；方案、对比或多项结果可以用短列表或小表格，不要铺垫。'}不要描述你调用了什么工具、读了什么文件或中间的推理过程，只给结果、结论和需要用户决定的事；做不到或没做完就直说。不要自称 AI 模型或提到底层框架，也不要重复系统消息里的框架文字。`,
   ].join('\n');
 }
 
@@ -69,8 +70,8 @@ export const PERSONA_PREFIX_SECTION = 'deployment:persona-prefix';
 export interface PromptSection { name: string; text: string }
 
 /** Apply the persona to an assembled prompt: drop the harness identity line and replace the persona prefix. */
-export function applyPersona<T extends { sections: PromptSection[] }>(assembly: T, persona: PersonaSettings): T {
-  const text = renderPersona(persona);
+export function applyPersona<T extends { sections: PromptSection[] }>(assembly: T, persona: PersonaSettings, channel = true): T {
+  const text = renderPersona(persona, channel);
   let replaced = false;
   const sections = assembly.sections.flatMap(section => {
     if (section.name === HARNESS_IDENTITY_SECTION) return [];
@@ -85,11 +86,11 @@ export function applyPersona<T extends { sections: PromptSection[] }>(assembly: 
  * Rewrite the identity of every root agent's prompt. Subagents keep the persona their parent's tool installed for them,
  * so they are left alone; the waterfall runs after the registry's own assembly and after the preset's persona row.
  */
-export function installPersona(ctx: Context, current: () => PersonaSettings): void {
+export function installPersona(ctx: Context, current: () => PersonaSettings, channel: (sessionId: string) => boolean = () => true): void {
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembly = await next();
     const header = context.agent?.session.header;
     if (header === undefined || header.parentSession !== undefined) return assembly;
-    return applyPersona(assembly, current());
+    return applyPersona(assembly, current(), channel(String(header.id ?? context.agent!.id)));
   });
 }
