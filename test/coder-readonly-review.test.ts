@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, symlink, rm, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readonlyReview } from '../src/coders/readonly-review.js';
+import { readonlyReview, systemUtility } from '../src/coders/readonly-review.js';
 import { codexCommandRequest } from '../src/coders/normalize.js';
 import { taskPermissions } from '../src/coders/permissions.js';
 import type { TaskRecord } from '../src/coders/types.js';
+
+test('the resolved utility must be the one invoked, including the uutils coreutils layout', ()=>{
+ for(const [binary,name] of <[string,string][]>[['/usr/bin/cat','cat'],['/bin/head','head'],['/usr/lib/cargo/bin/coreutils/cat','cat'],['/usr/lib/cargo/bin/coreutils/wc','wc'],['/usr/bin/rg','rg']])assert.equal(systemUtility(binary,name),true,binary);
+ for(const [binary,name] of <[string,string][]>[['/usr/bin/head','cat'],['/usr/lib/cargo/bin/coreutils/head','cat'],['/usr/lib/cargo/bin/coreutils/rg','rg'],['/usr/lib/cargo/bin/coreutils','cat'],['/usr/lib/cargo/bin/coreutils/coreutils','cat'],['/usr/local/bin/cat','cat'],['/bin/busybox','cat'],['/usr/lib/cargo/bin/cat','cat']])assert.equal(systemUtility(binary,name),false,binary);
+});
 
 test('deterministic reads allow only explicit project files with an OS program and no extra grants', {skip:process.platform !== 'linux'}, async()=>{
  const cwd=await mkdtemp(join(tmpdir(),'nexus-readonly-'));

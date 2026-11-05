@@ -5,6 +5,13 @@ import { isInside, isProtectedPath } from './rules.js';
 import type { CoderRequest, TaskRecord } from './types.js';
 import type { ReviewResult } from './review.js';
 
+/** The resolved program must still be the utility it was called as. Ubuntu 25.10+ links coreutils
+ * to uutils, a multicall binary that picks the utility from the name it is invoked by. */
+export function systemUtility(binary: string, name: string): boolean {
+  return [`/usr/bin/${name}`, `/bin/${name}`].includes(binary)
+    || name !== 'rg' && binary === `/usr/lib/cargo/bin/coreutils/${name}`;
+}
+
 /** Deliberately not a shell parser. Only direct OS utilities with explicit regular-file
  * operands qualify. Wrappers, PATH lookup, recursion, config and unknown grants keep model review. */
 export async function readonlyReview(task: TaskRecord, request: CoderRequest, env?: NodeJS.ProcessEnv): Promise<ReviewResult | undefined> {
@@ -40,7 +47,7 @@ export async function readonlyReview(task: TaskRecord, request: CoderRequest, en
   }
   try {
     const binary = await realpath(program), info = await lstat(binary);
-    if (!/^\/(?:usr\/)?bin\/(?:cat|head|tail|wc|rg)$/.test(binary) || !info.isFile() || info.uid !== 0 || (info.mode & 0o022)) return;
+    if (!systemUtility(binary, name) || !info.isFile() || info.uid !== 0 || (info.mode & 0o022)) return;
     const roots = task.permissions.reviewRoots ?? [task.cwd];
     const credentials = await Promise.all(credentialPaths().map(canonical));
     for (const path of [cwd, ...request.paths, ...paths]) {
