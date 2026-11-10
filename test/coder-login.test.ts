@@ -10,15 +10,15 @@ test('Bash login instructions preserve literal paths and deliver the dedicated h
   const root = await mkdtemp(join(tmpdir(), 'nexus-login-'));
   const home = join(root, "home ' $HOME `printf wrong` $(printf wrong)"), executable = join(root, "claude ' program");
   try {
-    await writeFile(executable, '#!/bin/sh\nprintf "%s\\0" "$CLAUDE_CONFIG_DIR" "$@"\n', { mode: 0o700 });
+    await writeFile(executable, '#!/bin/sh\nprintf "%s\\0" "$CLAUDE_CONFIG_DIR" "$DISABLE_AUTOUPDATER" "$@"\n', { mode: 0o700 });
     const login = claudeLoginInstructions('linux', home, executable);
     const output = execFileSync('bash', ['--noprofile', '--norc', '-c', login.command], { encoding: 'utf8' });
-    assert.deepEqual(output.split('\0'), [home, 'auth', 'login', '']);
+    assert.deepEqual(output.split('\0'), [home, '1', 'auth', 'login', '']);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('Windows login instructions use PowerShell literal strings and its call operator for executable paths', () => {
   const login = claudeLoginInstructions('win32', "C:\\Users\\O'Brien $user\\.dsh\\claude home", 'C:\\Program Files\\Claude\\claude.exe');
   assert.equal(login.shell, 'PowerShell');
-  assert.equal(login.command, "$env:CLAUDE_CONFIG_DIR = 'C:\\Users\\O''Brien $user\\.dsh\\claude home'; & 'C:\\Program Files\\Claude\\claude.exe' auth login");
+  assert.equal(login.command, "$env:CLAUDE_CONFIG_DIR = 'C:\\Users\\O''Brien $user\\.dsh\\claude home'; $env:DISABLE_AUTOUPDATER = '1'; & 'C:\\Program Files\\Claude\\claude.exe' auth login");
 });

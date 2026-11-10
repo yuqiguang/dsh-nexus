@@ -316,7 +316,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   });
   /** Roots and default coder as configured right now; settings from the page win over the profile. */
   const runtime = async (mode?: CoderSecurityMode): Promise<EffectiveRuntime> => config.manager ? config.manager.runtime(mode)
-    : { reviewPolicy: config.reviewPolicy, securityMode: mode ?? config.securityMode ?? 'standard', roots: fallbackRoots, defaultCoder: config.defaultCoder ?? 'codex', codex: { command: 'codex', env: process.env, source: 'system' }, claude: { env: process.env, source: 'system' } };
+    : { reviewPolicy: config.reviewPolicy, securityMode: mode ?? config.securityMode ?? 'standard', roots: fallbackRoots, defaultCoder: config.defaultCoder ?? 'codex', codex: { command: 'codex', env: process.env, source: 'system' }, claude: { env: { ...process.env, DISABLE_AUTOUPDATER: '1' }, source: 'system' } };
   const currentRoots = (): string[] => {
     const settings = config.manager?.current();
     return settings?.roots?.length ? settings.roots : fallbackRoots;

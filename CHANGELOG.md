@@ -1,5 +1,14 @@
 # 版本记录
 
+## 0.2.68 — 阻止 Claude Code 自更新破坏托管安装
+
+- 托管 Claude 的二进制位于 `node_modules/@anthropic-ai` 下，Claude Code 自带的 AutoUpdater 按路径判断安装方式，把它当成 npm 全局安装。每次启动检查到 npm 上有新版本，就先把正在使用的 `claude.exe` 改名为 `claude.exe.old.<时间戳>`，再把新版本装进 npm 全局目录，托管副本因此消失，编码工具报平台包缺失，只能手工还原。反复出现的「一运行 claude 就重装」就是这个过程。
+- Nexus 启动 Claude 时统一注入 `DISABLE_AUTOUPDATER=1`：托管和系统来源的编码任务、无管理器时的回退运行时，以及设置页给出的登录命令。只关闭后台自更新，用户手动执行 `claude update` 或自行升级不受影响。
+- 本机验证：带该变量启动托管 `claude.exe`（当前 2.1.319）后，没有产生新的 npm 查询日志、没有生成 `.old` 备份，`.last-update-result.json` 保持不变。
+- 未覆盖：不经过 Nexus 的启动（例如直接运行手工创建的 shim）不会带上该变量；需要时可在 shim 或 `claude-home/settings.json` 中自行设置。
+
+验证：`npm run check`、`npm run build` 通过；824 项本地回归零失败、零跳过，新增登录命令与运行时环境的断言。用真实托管二进制复核了自更新不再触发。未重跑 `npm run smoke`，也未在 Windows DSH 桌面端派发真实编码任务验收。
+
 ## 0.2.67 — 在 Ubuntu 25.10 及以后系统上恢复只读命令快速审批
 
 - 确定性只读审批（`/usr/bin/cat`、`head`、`tail`、`wc` 读取显式项目文件）认可 uutils 的 coreutils 位置 `/usr/lib/cargo/bin/coreutils/<程序名>`。Ubuntu 25.10 起 `/usr/bin/cat` 等链接到这个多合一程序，它按调用名决定行为；旧检查只认 `/usr/bin` 和 `/bin`，于是这些系统上的只读命令全部转交模型审核，结果仍然安全，只是更慢，也会占用审核名额。

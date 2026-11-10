@@ -457,6 +457,7 @@ test('the manager falls back from the preferred source, explains what is missing
     assert.equal(runtime.claude.sdkPath, undefined, 'the plugin SDK is imported by name');
     assert.equal(runtime.claude.executable, join(system.bin, 'claude'), 'the SDK drives the claude CLI on PATH');
     assert.equal(runtime.claude.env.CLAUDE_CONFIG_DIR, system.layout.claudeHome);
+    assert.equal(runtime.claude.env.DISABLE_AUTOUPDATER, '1');
     assert.equal(runtime.claude.env.ANTHROPIC_BASE_URL, 'https://api.deepseek.com/anthropic');
     assert.equal(runtime.claude.env.ANTHROPIC_AUTH_TOKEN, 'claude-secret');
     assert.equal(runtime.claude.env.ANTHROPIC_API_KEY, undefined);

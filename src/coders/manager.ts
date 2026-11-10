@@ -242,7 +242,9 @@ export class CodersManager {
 
   private claudeEnv(settings: CoderSettingsRecord): NodeJS.ProcessEnv {
     const { claude } = settings;
-    return { ...this.env, CLAUDE_CONFIG_DIR: this.deps.layout.claudeHome,
+    // The updater treats a binary under node_modules/@anthropic-ai as a global npm install: it
+    // backs up the running file and updates the npm prefix, leaving the managed copy missing.
+    return { ...this.env, CLAUDE_CONFIG_DIR: this.deps.layout.claudeHome, DISABLE_AUTOUPDATER: '1',
       ...(claude.baseUrl ? { ANTHROPIC_BASE_URL: claude.baseUrl } : {}),
       ...(claude.token ? (claude.authHeader === 'api-key' ? { ANTHROPIC_API_KEY: claude.token } : { ANTHROPIC_AUTH_TOKEN: claude.token }) : {}),
       ...(claude.model ? { ANTHROPIC_MODEL: claude.model } : {}) };

@@ -7,8 +7,8 @@ export interface ClaudeLoginInstructions {
 export function claudeLoginInstructions(platform: NodeJS.Platform, home: string, executable: string): ClaudeLoginInstructions {
   if (platform === 'win32') {
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
-    return { shell: 'PowerShell', command: `$env:CLAUDE_CONFIG_DIR = ${quote(home)}; & ${quote(executable)} auth login` };
+    return { shell: 'PowerShell', command: `$env:CLAUDE_CONFIG_DIR = ${quote(home)}; $env:DISABLE_AUTOUPDATER = '1'; & ${quote(executable)} auth login` };
   }
   const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
-  return { shell: 'Bash', command: `CLAUDE_CONFIG_DIR=${quote(home)} ${quote(executable)} auth login` };
+  return { shell: 'Bash', command: `CLAUDE_CONFIG_DIR=${quote(home)} DISABLE_AUTOUPDATER=1 ${quote(executable)} auth login` };
 }
