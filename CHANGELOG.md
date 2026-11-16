@@ -1,5 +1,14 @@
 # 版本记录
 
+## 0.2.69 — 适配 DSH 0.2.2：不再导入被移除的 `foldScheduleEvents`
+
+- DSH 0.2.2 的 `@deepseek-ai/dsh-schedule` 移除了根入口助手 `foldScheduleEvents`（官方升级指南 `v0.2.2-alpha.2/schedule-remote-host-tasks`）。Nexus 之前静态具名导入它，ESM 在链接期就会抛 `does not provide an export named 'foldScheduleEvents'`，而链接错误发生在任何代码执行之前，外层的 `try/catch` 拦不住；结果是 `dsh-nexus` 主模块整体导入失败，`nexus-channels` 永远建不出 fiber，`memory`/`mail`/`agenda` 三个子插件也一直停在 pending。桌面端表现就是升级 DSH 后插件“启用了但没反应”。
+- `src/dsh/schedule.ts` 改为自己回放冻结的版本 1 `schedule/change` 事件：只认 `create`/`delete`/`dispatch`，一次性提醒被 dispatch 后退出，`every` 类按原生语义继续保留；字段不可读的变更跳过而不是让 `/status` 整体失败。这条回放只用于“此会话还有 N 条旧版提醒尚未迁移”的提示，DSH 0.2.2 已不再执行这些记录。
+- 插件清单的 26 条 DSH peer 补上 `0.2.2-rc.3`（`0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.2-rc.3`）。`engines.dsh` 仍为 `>=0.2.0-rc.2 <0.3.0`：有它时宿主只按它判定兼容，所以 0.2.2 下 Nexus 不会被停用——也正是因此，缺导出这类运行期错误只能靠本版修掉，不会被安装检查拦住。
+- `test/reminders.test.ts` 新增本地回放用例（空日志、创建、dispatch 对一次性与固定间隔的不同处理、删除、以及版本号或字段不可读的跳过）；`test/manifest-compat.test.ts` 的宿主版本列表补上 `0.2.2-rc.3`；README 的兼容版本同步。
+
+验证：`npm run check`、`npm run build` 通过；本地回归见下方记录。未执行 `npm run smoke`，也未在 Windows 桌面端做真实渠道与编码任务验收。
+
 ## 0.2.68 — 阻止 Claude Code 自更新破坏托管安装
 
 - 托管 Claude 的二进制位于 `node_modules/@anthropic-ai` 下，Claude Code 自带的 AutoUpdater 按路径判断安装方式，把它当成 npm 全局安装。每次启动检查到 npm 上有新版本，就先把正在使用的 `claude.exe` 改名为 `claude.exe.old.<时间戳>`，再把新版本装进 npm 全局目录，托管副本因此消失，编码工具报平台包缺失，只能手工还原。反复出现的「一运行 claude 就重装」就是这个过程。

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Context } from '@deepseek-ai/cordis';
 import { DshChannelBridge, TRANSCRIBED_NOTE, describeToolCall, heartbeatText, type BridgeExtras } from '../src/dsh/bridge.js';
-import { describeReminders, isQuietReply, pluginInitiated } from '../src/dsh/schedule.js';
+import { activeLegacyReminders, describeReminders, isQuietReply, pluginInitiated } from '../src/dsh/schedule.js';
 import { sessionIdFor, type ChannelTransport } from '../src/channels/protocol.js';
 
 test('quiet replies and plugin-initiated messages are recognised', () => {
@@ -98,6 +98,20 @@ test('a long WeChat user turn sends one progress reminder; pushed turns and fini
   await bridge.drain();
   await tick(80);
   assert.deepEqual(texts.slice(1), ['整理好了。'], 'no heartbeat after the turn ended');
+});
+
+test('version-1 schedule events fold locally without the removed native helper', () => {
+  const change = (data: unknown) => ({ type: 'schedule/change', data, seq: 0 });
+  const oneShot = { version: 1, operation: 'create', schedule: { id: 'schedule-1', kind: 'at', prompt: '带合同', scheduledAt: '2026-09-20T00:00:00.000Z' } };
+  const every = { version: 1, operation: 'create', schedule: { id: 'schedule-2', kind: 'every', prompt: '巡检', everySeconds: 600, scheduledAt: '2026-09-20T01:00:00.000Z' } };
+  assert.deepEqual(activeLegacyReminders([]), [], 'an empty log folds to nothing');
+  assert.deepEqual(activeLegacyReminders([change(oneShot), change(every)] as never).map(record => record.id), ['schedule-1', 'schedule-2']);
+  // A dispatch retires a one-shot record but only advances a fixed-rate one.
+  assert.deepEqual(activeLegacyReminders([change(oneShot), change(every), change({ version: 1, operation: 'dispatch', id: 'schedule-1' })] as never).map(record => record.id), ['schedule-2']);
+  assert.deepEqual(activeLegacyReminders([change(oneShot), change(every), change({ version: 1, operation: 'dispatch', id: 'schedule-2' })] as never).map(record => record.id), ['schedule-1', 'schedule-2']);
+  assert.deepEqual(activeLegacyReminders([change(oneShot), change({ version: 1, operation: 'delete', id: 'schedule-1' })] as never), []);
+  // Unreadable payloads are skipped instead of failing the status reply.
+  assert.deepEqual(activeLegacyReminders([change({ version: 2, operation: 'create', schedule: oneShot.schedule }), change(null), change({ version: 1, operation: 'create', schedule: { kind: 'at' } })] as never), []);
 });
 
 test('heartbeat text picks a readable detail from the tool arguments and truncates', () => {

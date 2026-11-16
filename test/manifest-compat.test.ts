@@ -28,7 +28,7 @@ test('no DSH peer drifts: all of them declare the same host releases', () => {
 });
 
 test('every supported host release passes every DSH peer; 0.3.0 and older lines do not', () => {
-  for (const version of ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3']) {
+  for (const version of ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.3']) {
     assert.equal(semver.satisfies(version, hostRange, { includePrerelease: true }), true, `engines.dsh excludes ${version}`);
     for (const [name, range] of dshPeers) {
       assert.equal(semver.satisfies(version, range, { includePrerelease: true }), true, `${name} excludes ${version}`);

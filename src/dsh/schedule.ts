@@ -1,12 +1,44 @@
-import { foldScheduleEvents, type LegacyScheduleRecord, type ScheduleRecord } from '@deepseek-ai/dsh-schedule';
+import type { LegacyScheduleRecord, ScheduleRecord } from '@deepseek-ai/dsh-schedule';
 import type { SessionEvent, UserMessage } from '@deepseek-ai/dsh-session';
 
 /** Only this module reads the native Schedule plugin's durable events and message framing. */
 
-/** Historical reminders only: DSH 0.2 no longer schedules these events. Used for upgrade diagnostics. */
+/** One frozen version-1 `schedule/change` payload, read without trusting any of its fields. */
+interface RawScheduleChange {
+  readonly version?: unknown;
+  readonly operation?: unknown;
+  readonly id?: unknown;
+  readonly schedule?: unknown;
+}
+
+/**
+ * Replay the version-1 `schedule/change` events an older Session log still carries.
+ *
+ * DSH 0.2.2 removed the native `foldScheduleEvents` helper together with the Session-local
+ * reminder runtime, so Nexus folds the frozen events itself instead of importing it. Neither
+ * side executes these records any more: the fold only powers the "old reminders were not
+ * migrated" diagnostic, so an unreadable change is skipped rather than failing the whole log.
+ */
 export function activeLegacyReminders(events: readonly SessionEvent[]): readonly LegacyScheduleRecord[] {
-  try { return foldScheduleEvents(events).active; }
-  catch { return []; }
+  const active = new Map<string, LegacyScheduleRecord>();
+  for (const event of events) {
+    if (event.type !== 'schedule/change') continue;
+    const change = event.data as unknown as RawScheduleChange;
+    if (change === null || typeof change !== 'object' || change.version !== 1) continue;
+    if (change.operation === 'create') {
+      const record = change.schedule as Partial<LegacyScheduleRecord> | undefined;
+      if (record === null || typeof record !== 'object') continue;
+      if (typeof record.id !== 'string' || typeof record.kind !== 'string') continue;
+      active.set(record.id, record as LegacyScheduleRecord);
+      continue;
+    }
+    if (typeof change.id !== 'string') continue;
+    if (change.operation === 'delete') { active.delete(change.id); continue; }
+    // A dispatch retires a one-shot record and advances a fixed-rate one; only the latter survives.
+    const current = active.get(change.id);
+    if (change.operation === 'dispatch' && current !== undefined && current.kind !== 'every') active.delete(change.id);
+  }
+  return [...active.values()];
 }
 
 const zone = 'Asia/Shanghai';
