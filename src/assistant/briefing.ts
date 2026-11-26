@@ -1,3 +1,4 @@
+import { scheduleCatalog } from '../dsh/schedule.js';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ScheduleRecord } from '@deepseek-ai/dsh-schedule';
 import type { ChannelNotifier } from '../channels/notify.js';
@@ -82,7 +83,7 @@ export class DailyBriefing {
     for (const sessionId of this.deps.sessions()) {
       try {
         const schedule = typeof this.deps.ctx.get === 'function' ? this.deps.ctx.get('schedule') as Context['schedule'] | undefined : this.deps.ctx.schedule;
-        const reminders = (await schedule?.catalog() ?? []).filter(record => record.status === 'active'
+        const reminders = (await scheduleCatalog(schedule)).filter(record => record.status === 'active'
           && (this.deps.sameChat?.(sessionId, record.sessionId) ?? sessionId === record.sessionId));
         const text = briefingText(this.now(), this.settings.timeZone, reminders, this.agenda?.(this.now(), 1));
         if (await this.deps.notifier.notify(sessionId, text, identity('briefing', sessionId, today))) sent++;

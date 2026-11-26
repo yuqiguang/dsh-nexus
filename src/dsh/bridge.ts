@@ -1,8 +1,9 @@
+import { scheduleCatalog } from '../dsh/schedule.js';
 import type { ChannelWork } from '../channels/work.js';
 import { firstAvailable, isNativeMirror, nativeApproval, nativeQuestion } from './interaction.js';
 import { desktopApprovalReceipt, desktopQuestionReceipt } from './receipts.js';
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
-import type { ScheduleCatalogEntry } from '@deepseek-ai/dsh-schedule';
+import type { ScheduleCatalogEntry } from '../dsh/schedule.js';
 import type { Context } from '@deepseek-ai/cordis';
 // Declares `ctx.workspaceRegistry`, whose archive set decides whether a session this bridge is about to
 // write into can still run a step at all.
@@ -637,7 +638,7 @@ export class DshChannelBridge {
 
   private async reminders(sessionId: SessionId): Promise<ScheduleCatalogEntry[]> {
     const schedule = typeof this.ctx.get === 'function' ? this.ctx.get('schedule') as Context['schedule'] | undefined : this.ctx.schedule;
-    const records = await schedule?.catalog() ?? [];
+    const records = await scheduleCatalog(schedule);
     return records.filter(record => record.status === 'active' && this.sameChat(sessionId, record.sessionId));
   }
 

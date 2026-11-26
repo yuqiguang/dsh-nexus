@@ -1,4 +1,26 @@
 import type { LegacyScheduleRecord, ScheduleRecord } from '@deepseek-ai/dsh-schedule';
+import type { SessionId } from '@deepseek-ai/dsh-session';
+
+/** A session-bound view across the old Session scheduler and new Host scheduler. */
+export type ScheduleCatalogEntry = ScheduleRecord & {
+  sessionId: SessionId; status: 'active' | 'inactive' | 'paused' | 'ended'; lastDelivery?: unknown;
+  target?: { kind: string; sessionId?: SessionId }; updatedAt?: string;
+};
+export type ScheduleTimingChange =
+  | { kind: 'at'; at: string } | { kind: 'every'; every_seconds: number }
+  | { kind: 'daily'; daily: { time: string; time_zone: string } }
+  | { kind: 'weekly'; weekly: { time: string; time_zone: string; weekdays: number[] } }
+  | { kind: 'cron'; cron: { expression: string; time_zone: string } };
+
+/** Only fixed destination tasks belong to a channel; involved editors are not owners. */
+export async function scheduleCatalog(service: { catalog(): Promise<unknown[]> } | undefined): Promise<ScheduleCatalogEntry[]> {
+  const entries = await service?.catalog() ?? [];
+  return entries.flatMap(value => {
+    const entry = value as ScheduleCatalogEntry;
+    const sessionId = entry.target ? entry.target.kind === 'session' ? entry.target.sessionId : undefined : entry.sessionId;
+    return sessionId ? [{ ...entry, sessionId }] : [];
+  });
+}
 import type { SessionEvent, UserMessage } from '@deepseek-ai/dsh-session';
 
 /** Only this module reads the native Schedule plugin's durable events and message framing. */

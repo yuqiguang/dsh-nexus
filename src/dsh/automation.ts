@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools';
-import { ScheduleInputError, type ScheduleCatalogEntry, type ScheduleRecord, type ScheduleTimingChange } from '@deepseek-ai/dsh-schedule';
+import { ScheduleInputError, type ScheduleRecord } from '@deepseek-ai/dsh-schedule';
+import { scheduleCatalog, type ScheduleCatalogEntry, type ScheduleTimingChange } from './schedule.js';
 import type { BridgeRegistry } from '../channels/notify.js';
 
 /** Compare native task data, excluding changing delivery telemetry. */
@@ -21,7 +22,10 @@ const failure = (code: string, message: string) => ({ code, message });
 export async function manageAutomation(ctx: Context, registry: Pick<BridgeRegistry, 'sameChat'>, args: Args, exec: ToolRunContext): Promise<unknown> {
   const agent = exec.agent;
   const schedule = ctx.get('schedule');
-  if (!agent || !schedule || !ctx.tools.get(`schedule_${args.action}`, agent)) {
+  const modern = schedule as unknown as { edit?: (request: unknown, actor: unknown, signal: AbortSignal) => Promise<Record<string, unknown>> };
+  const available = () => ctx.tools.get(`schedule_${args.action}`, agent)
+    || (args.action !== 'list' && typeof modern?.edit === 'function' && ctx.tools.get('schedule_edit', agent));
+  if (!agent || !schedule || !available()) {
     return failure('automation_unavailable', '当前会话未启用对应的官方自动化工具，无法查询或修改；不能用日历代替。');
   }
   exec.signal.throwIfAborted();
@@ -30,10 +34,10 @@ export async function manageAutomation(ctx: Context, registry: Pick<BridgeRegist
   }
   // Never infer authority from an ID prefix, title, user text or native task state.
   const owns = (entry: ScheduleCatalogEntry) => entry.sessionId === agent.session.id || registry.sameChat(agent.session.id, entry.sessionId);
-  const entries = (await schedule.catalog()).filter(owns);
+  const entries = (await scheduleCatalog(schedule)).filter(owns);
   // Cordis returns traced service wrappers; wrapper identity is not service lifetime.
   const active = ctx.get('schedule');
-  if (!active || !ctx.tools.get(`schedule_${args.action}`, agent)) return failure('automation_unavailable', '自动化能力已变化，请重新查询。');
+  if (!active || !available()) return failure('automation_unavailable', '自动化能力已变化，请重新查询。');
   if (args.action !== 'list' && ctx.sandboxPolicy.resolve({ session: agent.session }).mode === 'read-only') return failure('read_only', '只读会话不能修改自动化任务。');
   if (args.action === 'list') return { type: 'automation', scope: 'current_session_and_configured_chat', tasks: entries.map(view),
     note: '包含同一已绑定聊天的新旧会话；不包含日历或其他聊天。lastDelivery 仅表示进入原会话，不代表工作完成或微信已收到。' };
@@ -42,20 +46,42 @@ export async function manageAutomation(ctx: Context, registry: Pick<BridgeRegist
   if (!args.revision || args.revision !== automationRevision(entry)) return failure('schedule_conflict', '任务已变化或缺少 list 返回的 revision，请重新查询后修改。');
   exec.signal.throwIfAborted();
   // A disabled capability or changed route must not grant a stale write.
-  if (!ctx.get('schedule') || !ctx.tools.get(`schedule_${args.action}`, agent) || !owns(entry)) {
+  if (!ctx.get('schedule') || !available() || !owns(entry)) {
     return failure('automation_unavailable', '自动化能力或聊天绑定已变化，请重新查询。');
   }
+  const editor = active as unknown as typeof modern;
+  if (typeof editor.edit === 'function') {
+    const patch = { ...(args.title === undefined ? {} : { title: args.title }),
+      ...(args.prompt === undefined ? {} : { prompt: args.prompt }),
+      ...(args.change === undefined ? {} : { timing: args.change }) };
+    const result = await editor.edit({ id: entry.id, action: args.action,
+      expectedUpdatedAt: entry.updatedAt ?? null, ...(args.action === 'update' ? { patch } : {}) }, agent.session.id, exec.signal);
+    if ('code' in result) return result;
+    const committed = (await scheduleCatalog(active)).find(item => item.id === entry.id);
+    if (args.action === 'delete') return result.deleted === true && !committed
+      ? { type: 'automation', id: entry.id, deleted: true, note: '已删除原生自动化；已经进入会话的任务不会撤回。' }
+      : failure('verification_failed', '删除后核对失败，请重新查询。');
+    const [returned] = await scheduleCatalog({ catalog: async () => [result] });
+    if (!committed || !returned || !owns(committed) || automationRevision(committed) !== automationRevision(returned)) {
+      return failure('verification_failed', '写入后任务再次变化或无法核对，请重新查询。');
+    }
+    return { ...view(committed), updated: true, note: '已核对原生自动化记录；未提供的字段保持原值。' };
+  }
+  const legacy = active as unknown as {
+    delete(request: unknown, signal: AbortSignal): Promise<{ deleted: boolean }>;
+    update(request: unknown, signal: AbortSignal): Promise<{ record: ScheduleRecord; updated: boolean } | { code: string }>;
+  };
   if (args.action === 'delete') {
-    const result = await active.delete({ sessionId: entry.sessionId, id: entry.id }, exec.signal);
+    const result = await legacy.delete({ sessionId: entry.sessionId, id: entry.id }, exec.signal);
     if (!result.deleted) return result;
-    if ((await active.catalog()).some(item => item.id === entry.id)) return failure('verification_failed', '删除后核对失败，请先查询，不要声称已删除。');
+    if ((await scheduleCatalog(active)).some(item => item.id === entry.id)) return failure('verification_failed', '删除后核对失败，请先查询，不要声称已删除。');
     return { type: 'automation', id: entry.id, deleted: true, note: '已删除原生自动化；已经进入会话的任务不会撤回。' };
   }
-  const result = await active.update({ sessionId: entry.sessionId, id: entry.id, expected: recordOf(entry),
+  const result = await legacy.update({ sessionId: entry.sessionId, id: entry.id, expected: recordOf(entry),
     ...(args.title === undefined ? {} : { title: args.title }), ...(args.prompt === undefined ? {} : { prompt: args.prompt }),
     ...(args.change === undefined ? {} : { change: args.change }) }, exec.signal);
   if (!('record' in result)) return result;
-  const committed = (await active.catalog()).find(item => item.id === entry.id && item.sessionId === entry.sessionId);
+  const committed = (await scheduleCatalog(active)).find(item => item.id === entry.id && item.sessionId === entry.sessionId);
   if (!committed || automationRevision(committed) !== automationRevision({ ...result.record, sessionId: entry.sessionId, status: entry.status })) {
     return failure('verification_failed', '写入后任务再次变化或无法核对，请重新查询；不要重复创建或声称旧值仍有效。');
   }

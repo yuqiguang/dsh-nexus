@@ -5,6 +5,7 @@ import { realpathNormalize } from '@deepseek-ai/dsh-workspace';
 import { baseSessionOf, sessionIdAt, type NavigationCommand } from '../channels/protocol.js';
 import type { SessionRosterView } from '../sessions/index.js';
 import { redact } from '../coders/normalize.js';
+import { inspectSession } from './history.js';
 
 const safe = (value: string) => redact(value).replace(/[\r\n\t]/g, ' ').slice(0, 100);
 const modelName = (model: ModelSelection) => `${safe(model.provider)}/${safe(model.model)}`;
@@ -34,7 +35,7 @@ export class ChannelNavigation {
     if (!row) return true;
     const inbox = row.projections?.values.inbox;
     if (row.running || inbox?.['next-turn'].length || inbox?.['next-step'].length) return false;
-    const { events } = await this.ctx.sessionController.inspect(row.sessionId, this.signal);
+    const { events } = await inspectSession(this.ctx, row.sessionId, this.signal);
     const last = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
     // A cold interrupted turn must be recovered explicitly on the desktop, not resumed by a selector.
     return last?.type !== 'turn/start';

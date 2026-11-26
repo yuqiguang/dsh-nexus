@@ -4,6 +4,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm/brand';
 import { dirname, isAbsolute, join } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
 import { onPath } from './install.js';
+import { executeNativeTool } from '../dsh/tools.js';
 
 /** A task-local PATH; do not change the Desktop host or overwrite a real system interpreter. */
 export async function runtimeEnvironment(env: NodeJS.ProcessEnv, value: unknown, platform = process.platform): Promise<NodeJS.ProcessEnv> {
@@ -33,8 +34,8 @@ export interface CoderRuntimeEnvironment { env: NodeJS.ProcessEnv; executables: 
 /** Keep the host-resolved executable identities separate from the command's untrusted arguments. */
 export async function loadCoderRuntime(ctx: Context, exec: ToolRunContext, env: NodeJS.ProcessEnv): Promise<CoderRuntimeEnvironment> {
   if (process.platform !== 'win32' || !ctx.tools.get('load_workspace_dependencies', exec.agent?.id)) return { env, executables: {} };
-  const result = await ctx.tools.execute({ name: 'load_workspace_dependencies', arguments: {}, agent: exec.agent,
-    callId: ToolCallId(`${exec.callId}${CODER_RUNTIME_CALL}`), rootCallId: exec.rootCallId, parent: exec.token, signal: exec.signal });
+  const result = await executeNativeTool(ctx, 'load_workspace_dependencies', {}, exec,
+    ToolCallId(`${exec.callId}${CODER_RUNTIME_CALL}`));
   for (const context of result.additionalContexts ?? []) exec.deferContext(context);
   if (result.isError) {
     const reason = (result.content ?? []).map(part => part.type === 'text' ? part.text : '').join(' ').trim().slice(0, 300);

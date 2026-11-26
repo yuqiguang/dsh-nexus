@@ -69,7 +69,7 @@ export function taskNotices(ctx: Context, store: CoderStore) {
   return async (owner: string) => {
     if (!inspected.has(owner)) {
       const read = (async () => {
-        const history = await ctx.sessionController.inspect(owner as SessionId, shutdown.signal);
+        const history = await inspectSession(ctx, owner as SessionId, shutdown.signal);
         for (const event of history.events.slice(history.inheritedEventCount)) await record(owner, event);
       })();
       inspected.set(owner, read);
@@ -80,3 +80,4 @@ export function taskNotices(ctx: Context, store: CoderStore) {
     await pending;
   };
 }
+import { inspectSession } from '../dsh/history.js';

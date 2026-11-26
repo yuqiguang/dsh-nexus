@@ -38,7 +38,7 @@ test('native Office guidance uses only the visible skill loader after compatibil
 test('assistant prompt follows live capabilities and keeps file delivery and untrusted content boundaries', () => {
   const enabled = renderAssistantPrompt({ agenda: true, memory: true, reminders: true });
   const disabled = renderAssistantPrompt({ agenda: false, reminders: false });
-  for (const name of ['memory_recall', 'schedule_create', 'schedule_list', 'schedule_delete']) {
+  for (const name of ['memory_recall', 'schedule_create', 'schedule_list']) {
     assert.ok(enabled.includes(name));
     assert.ok(!disabled.includes(name), `${name} must not be advertised`);
   }
@@ -54,5 +54,9 @@ test('assistant prompt follows live capabilities and keeps file delivery and unt
   assert.match(nativeOnly, /daily.*08:00:00/);
   assert.match(nativeOnly, /需要搜索、检查或生成内容的任务先完成工作再汇报/);
   assert.match(nativeOnly, /DSH 自动化页面/);
+  assert.match(nativeOnly, /支持 timing 时把时间规则放在 timing/);
+  assert.match(nativeOnly, /target=.*当前会话的精确 id/);
+  assert.match(nativeOnly, /默认创建新会话的目标不会自动绑定手机渠道/);
+  assert.doesNotMatch(nativeOnly, /任务属于创建它的原会话/);
   assert.ok(disabled.length < enabled.length);
 });

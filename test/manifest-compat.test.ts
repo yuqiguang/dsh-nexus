@@ -4,15 +4,11 @@ import { readFileSync } from 'node:fs';
 import semver from 'semver';
 
 /**
- * The published manifest is what a DSH host and the plugin market read before
- * loading Nexus: the host's boot gate skips a plugin whose dsh peer range
- * excludes the running runtime, and the market reports the same verdict.
- *
- * The peers must therefore name every host release we support. They are an
- * explicit "||" list and not a `>=x <y` range on purpose: npm resolves a peer
- * range to its LOWEST satisfying version, so `>=0.2.0-rc.2 <0.3.0` makes
- * `npm ci` install 0.2.0-rc.2 next to this repo's 0.2.1-rc.2 dev toolchain and
- * fail with ERESOLVE. Keep the list; add the next release when the host ships it.
+ * engines.dsh is DSH's authoritative activation requirement and accepts the
+ * entire 0.2 line, including prereleases, using includePrerelease: true.
+ * Peers use the same range, with explicit prerelease anchors for npm's default
+ * prerelease handling so the pinned development toolchain remains installable.
+ * A range permits activation; future host API changes still need regression checks.
  */
 const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
   version: string; engines: Record<string, string>; peerDependencies: Record<string, string>;
@@ -28,13 +24,24 @@ test('no DSH peer drifts: all of them declare the same host releases', () => {
 });
 
 test('every supported host release passes every DSH peer; 0.3.0 and older lines do not', () => {
-  for (const version of ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.3']) {
+  for (const version of ['0.2.0-alpha.0', '0.2.0-rc.2', '0.2.0', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.5', '0.2.2', '0.2.99-beta.1', '0.2.999']) {
     assert.equal(semver.satisfies(version, hostRange, { includePrerelease: true }), true, `engines.dsh excludes ${version}`);
     for (const [name, range] of dshPeers) {
       assert.equal(semver.satisfies(version, range, { includePrerelease: true }), true, `${name} excludes ${version}`);
     }
   }
-  for (const version of ['0.3.0', '0.1.9', '1.0.0']) {
+  for (const version of ['0.3.0-0', '0.3.0-alpha.1', '0.3.0', '0.1.9', '1.0.0']) {
     assert.equal(semver.satisfies(version, hostRange, { includePrerelease: true }), false, `engines.dsh accepts ${version}`);
+    for (const [name, range] of dshPeers) {
+      assert.equal(semver.satisfies(version, range, { includePrerelease: true }), false, `${name} accepts ${version}`);
+    }
+  }
+});
+
+test('npm accepts the pinned development hosts and current desktop without prerelease options', () => {
+  for (const version of ['0.2.0-rc.2', '0.2.1-rc.2', '0.2.1-rc.3', '0.2.2-rc.5', '0.2.2']) {
+    for (const [name, range] of dshPeers) {
+      assert.equal(semver.satisfies(version, range), true, `${name} excludes ${version} under npm defaults`);
+    }
   }
 });
