@@ -175,7 +175,7 @@ export function runClaudeTask(task: TaskRecord, deps: ClaudeRunDeps): CoderRun {
       } });
       for await (const message of stream) {
         if (message.type === 'system' && message.subtype === 'init' && message.session_id) {
-          if (deps.continuation && task.coderSessionId && message.session_id !== task.coderSessionId) throw new Error('Claude 未恢复原会话，任务已停止。');
+          if (task.coderSessionId && message.session_id !== task.coderSessionId) throw new Error('Claude 未恢复原会话，任务已停止。');
           deps.onSession?.(message.session_id);
         }
         else if (message.type === 'system' && message.subtype === 'api_retry') {

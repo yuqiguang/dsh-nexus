@@ -24,6 +24,15 @@ test('native notices require the owner, coder, job, stable task ID and a settled
   assert.equal(noticeTask([task({ status: 'running' })], 'owner', notice()), undefined);
 });
 
+test('Gemini native completion notices attach to the original task and cannot match another coder or owner', () => {
+  const record = task({ coder: 'gemini' });
+  const event = notice({ text: 'background job coder-1 (coder: Gemini CLI [ct-00000001]: do work) finished completed.' });
+  assert.equal(noticeTask([record], 'owner', event), record);
+  assert.equal(noticeTask([task()], 'owner', event), undefined);
+  assert.equal(noticeTask([record], 'foreign', event), undefined);
+  assert.equal(noticeTask([record], 'owner', notice()), undefined);
+});
+
 test('reused native job IDs after restart cannot attach an older notice to a new task', () => {
   const old = task(), next = task({ id: 'ct-00000002', createdAt: 40, updatedAt: 50 });
   assert.equal(noticeTask([next, old], 'owner', notice()), old);

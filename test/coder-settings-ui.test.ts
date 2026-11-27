@@ -8,10 +8,11 @@ import type { CodersView } from '../src/coders/manager.js';
 
 const initial = (): CodersView => ({
   platform: 'linux',
-  settings: { revision: 0, defaultCoder: 'codex', codex: { source: 'managed', apiKeyConfigured: false }, claude: { source: 'managed', authHeader: 'auth-token', tokenConfigured: false } },
-  profileRoots: ['/home/dev/project'], effectiveRoots: ['/home/dev/project'], managedRoot: '/home/dev/.nexus/nexus-coders', claudeHome: '/home/dev/.nexus/nexus-coders/claude-home',
+  settings: { revision: 0, defaultCoder: 'codex', codex: { source: 'managed', apiKeyConfigured: false }, claude: { source: 'managed', authHeader: 'auth-token', tokenConfigured: false }, gemini: { source: 'managed', apiKeyConfigured: false } },
+  profileRoots: ['/home/dev/project'], effectiveRoots: ['/home/dev/project'], managedRoot: '/home/dev/.nexus/nexus-coders', claudeHome: '/home/dev/.nexus/nexus-coders/claude-home', geminiHome: '/home/dev/.nexus/nexus-coders/gemini-home',
   codex: { managed: { installed: false }, system: { installed: true, version: '0.155.0', path: '/usr/bin/codex' }, active: 'system', fallback: true, ready: true, login: 'Logged in using an API key - sk-a…' },
   claude: { managed: { installed: false }, system: { installed: false }, active: 'none', fallback: false, ready: false, problem: 'Claude Code 的 Agent SDK 尚未安装。' },
+  gemini: { managed: { installed: false }, system: { installed: false }, active: 'none', fallback: false, ready: false, problem: 'Gemini CLI 尚未安装。' },
   rules: [{ id: 'cr-1', source: 'user', text: 'cr-1 允许命令「npm test」（用户设定）' }],
   recentTasks: [{ id: 'ct-1', coder: 'codex', status: 'completed', description: '列目录', updatedAt: 1 }],
 });
@@ -30,7 +31,7 @@ test('full access and per-operation review rules save, reload, and explain the e
   await ui.enter('coders-review-commands', 'ask');
   await ui.enter('coders-review-instructions', '数据库迁移先询问');
   await ui.enter('coders-security', 'full');
-  assert.match(ui.text(), /可读写项目外文件.*关闭 Codex \/ Claude 执行沙箱/);
+  assert.match(ui.text(), /可读写项目外文件.*关闭编码工具执行沙箱/);
   assert.match(ui.text(), /保存后仅新任务采用/);
   assert.equal(ui.field('coders-review-commands').matches(':disabled'), true);
   assert.equal(ui.field('coders-network').disabled, true);
@@ -64,7 +65,7 @@ test('tool readiness needs no separate project choice and checks only the saved 
   assert.doesNotMatch(ui.text(), /当前生效：.*home\/dev\/project/);
   assert.doesNotMatch(ui.text(), /开始编码|完成以下准备|使用此项目|打开项目会话/);
   assert.match(ui.text(), /共用托管安装目录/);
-  assert.match(ui.text(), /另一工具未完成的安装需单独重试/);
+  assert.match(ui.text(), /未完成的安装需分别重试/);
   await ui.click('重新检查');
   assert.deepEqual(calls, ['list', 'refresh']);
   view.settings.defaultCoder = 'claude';
@@ -184,7 +185,7 @@ test('the coder settings page shows status, saves every field while clearing typ
     return structuredClone(view);
   };
   const ui = await page(t, api);
-  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['工具状态检查', '通用', 'Codex', 'Claude Code', '习惯规则', '最近任务']);
+  assert.deepEqual([...ui.dom.window.document.querySelectorAll('h3')].map(item => item.textContent), ['工具状态检查', '通用', 'Codex', 'Claude Code', 'Gemini CLI', '习惯规则', '最近任务']);
   assert.match(ui.text(), /可用（系统安装，首选的Nexus 托管不可用）/);
   assert.match(ui.text(), /Logged in using an API key - sk-a…/);
   assert.match(ui.text(), /Claude Code 的 Agent SDK 尚未安装/);
@@ -363,7 +364,7 @@ test('a settings revision changed elsewhere blocks saving until the page reloads
   assert.equal(save.disabled, false);
 });
 
-for (const coder of ['codex', 'claude'] as const) {
+for (const coder of ['codex', 'claude', 'gemini'] as const) {
   test(`${coder} version choice survives polling, requires save before install, and restores the recommendation`, async t => {
     let view = initial();
     view[coder].managed = { installed: true, version: '0.0.1' };
@@ -404,3 +405,31 @@ for (const coder of ['codex', 'claude'] as const) {
     assert.equal(calls.filter(call => call.method === 'install').length, 1, 'restoring the recommendation must not replace an install');
   });
 }
+
+test('Gemini configuration saves its default, source, model and gateway while clearing typed keys and using host login instructions', async t => {
+  let view = initial(); const calls: { method: string; payload: any }[] = [];
+  view.geminiLogin = { shell: 'Bash', command: "GEMINI_CLI_HOME='/home/dev/.nexus/nexus-coders/gemini-home' '/usr/bin/gemini'" };
+  const ui = await page(t, async (method, payload: any) => {
+    calls.push({ method, payload });
+    if (method === 'save') view.settings = { ...view.settings, revision: view.settings.revision + 1, defaultCoder: payload.config.defaultCoder,
+      gemini: { ...payload.config.gemini, apiKey: undefined, apiKeyConfigured: view.settings.gemini.apiKeyConfigured || !!payload.config.gemini.apiKey } };
+    if (method === 'clear-secret') view.settings = { ...view.settings, revision: view.settings.revision + 1, gemini: { ...view.settings.gemini, apiKeyConfigured: false } };
+    return structuredClone(view);
+  });
+  const card = () => ui.field('gemini-source').closest('article')!;
+  assert.equal(card().querySelector('pre code')?.textContent, view.geminiLogin!.command);
+  assert.match(card().textContent!, /严格沙箱暂不可用/);
+  await ui.enter('coders-default', 'gemini'); await ui.enter('gemini-source', 'system');
+  await ui.enter('gemini-model', 'gemini-model'); await ui.enter('gemini-endpoint', 'https://gateway.example');
+  await ui.enter('gemini-key', 'typed-gemini-secret'); await ui.submit();
+  const saved = calls.find(call => call.method === 'save')!.payload;
+  assert.equal(saved.config.defaultCoder, 'gemini');
+  assert.deepEqual(saved.config.gemini, { source: 'system', managedVersion: '', model: 'gemini-model', baseUrl: 'https://gateway.example', apiKey: 'typed-gemini-secret' });
+  assert.equal(ui.field('gemini-key').value, ''); assert.equal((ui.field('gemini-key') as HTMLInputElement).placeholder, '已保存，留空保留当前密钥');
+  assert.match(ui.dom.window.document.querySelector('[aria-label="工具状态检查"]')!.textContent!, /默认工具：Gemini CLI/);
+  await ui.submit();
+  assert.equal(Object.hasOwn(calls.filter(call => call.method === 'save').at(-1)!.payload.config.gemini, 'apiKey'), false);
+  await ui.click('清除 Gemini API key');
+  assert.deepEqual(calls.at(-1), { method: 'clear-secret', payload: { coder: 'gemini', revision: 2 } });
+  assert.equal((ui.field('gemini-key') as HTMLInputElement).placeholder, '输入 Gemini API key，或在下方登录 Google');
+});

@@ -123,7 +123,7 @@ export async function prepareReview(task: TaskRecord, request: CoderRequest, hos
       const sources = await commandEvidence(request.command, cwd, within, hostEnv, task.cwd);
       evidence.push(...sources.evidence);
       evidenceComplete = sources.complete;
-      scope = `仅本次命令，工作目录 ${cwd}；允许联网。${task.coder === 'claude' || request.raw.additionalPermissions || request.raw.sandboxPermissions === 'require_escalated' || request.raw.reason ? '可能以当前用户权限在沙箱外执行，可访问该用户有权访问的文件及网络。' : '保留 Codex 工作目录写入沙箱。'}不得据命令名称假定只读或不存在副作用；不授予后续命令或整个会话权限。`;
+      scope = `仅本次命令，工作目录 ${cwd}；允许联网。${task.coder !== 'codex' || request.raw.additionalPermissions || request.raw.sandboxPermissions === 'require_escalated' || request.raw.reason ? '可能以当前用户权限在沙箱外执行，可访问该用户有权访问的文件及网络。' : '保留 Codex 工作目录写入沙箱。'}不得据命令名称假定只读或不存在副作用；不授予后续命令或整个会话权限。`;
     } else if (standard && request.kind === 'file-write' && ['Write', 'Edit'].includes(request.tool) && typeof request.raw.file_path === 'string' && request.paths.length === 1) {
       const real = await within(request.paths[0]!);
       const exists = await lstat(real).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });

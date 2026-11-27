@@ -103,7 +103,7 @@ export class ChannelWork {
       const job = message.id && (this.notices.get(message.id) ?? this.domain.table('notices').get(message.id));
       if (job) return job.ownerSession === owner && job.jobId === this.noticeJobId(message) && job.remote;
       // Compatibility with coder origins saved before generic native jobs were tracked.
-      const match = /^background job (\S+) \(coder: (?:Codex|Claude Code) \[(ct-[0-9a-f]{8})\]: /.exec(body);
+      const match = /^background job (\S+) \(coder: (?:Codex|Claude Code|Gemini CLI) \[(ct-[0-9a-f]{8})\]: /.exec(body);
       const row = match && this.get(match[2]!);
       return !!row?.remote && row.ownerSession === owner && row.jobId === match![1];
     }

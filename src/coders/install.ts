@@ -26,10 +26,12 @@ export interface ManagedLayout {
   codexHome: string;
   /** `CLAUDE_CONFIG_DIR` for Claude Code run by Nexus, whichever SDK copy is used. */
   claudeHome: string;
+  /** Dedicated GEMINI_CLI_HOME; credentials and sessions live in its .gemini directory. */
+  geminiHome: string;
 }
 
 export function managedLayout(root: string): ManagedLayout {
-  return { root, nodeModules: join(root, 'node_modules'), markers: join(root, 'installed'), codexHome: join(root, 'codex-home'), claudeHome: join(root, 'claude-home') };
+  return { root, nodeModules: join(root, 'node_modules'), markers: join(root, 'installed'), codexHome: join(root, 'codex-home'), claudeHome: join(root, 'claude-home'), geminiHome: join(root, 'gemini-home') };
 }
 
 export interface HostPlatform { platform: NodeJS.Platform; arch: string; musl: boolean }
@@ -57,6 +59,8 @@ export function hostPlatform(): HostPlatform {
 export function platformPackage(coder: CoderKind, host: HostPlatform = hostPlatform(), version = MANAGED_PACKAGES[coder].version): { name: string; spec: string; binary: string } {
   if (!isManagedVersion(version)) throw new Error('invalid_managed_version');
   const { name } = MANAGED_PACKAGES[coder];
+  // Gemini's npm release bundles its JavaScript runtime; it has no coder-specific native package.
+  if (coder === 'gemini') return { name, spec: version, binary: 'bundle/gemini.js' };
   const suffix = `${host.platform}-${host.arch}`;
   if (coder === 'codex') {
     return { name: `${name}-${suffix}`, spec: `npm:${name}@${version}-${suffix}`, binary: '' };
@@ -256,6 +260,30 @@ export async function detectClaude(layout: ManagedLayout, options: DetectOptions
     else system = { installed: false, version: `SDK ${plugin.version}`, path: plugin.path, problem: cli && !executable ? 'windows_launcher_unsupported' : cli ? 'version_check_failed' : 'claude_cli_missing' };
   }
   return { managed, system };
+}
+
+export async function detectGemini(layout: ManagedLayout, options: DetectOptions = {}): Promise<CoderDetection> {
+  const host = options.host ?? hostPlatform();
+  const env = { ...(options.env ?? process.env), GEMINI_CLI_HOME: layout.geminiHome, GEMINI_CLI_NO_RELAUNCH: '1', ELECTRON_RUN_AS_NODE: '1' };
+  const run = options.probe ?? probe;
+  const directory = join(layout.nodeModules, '@google', 'gemini-cli');
+  const entry = join(directory, 'bundle', 'gemini.js');
+  const marker = await readMarker(layout, 'gemini');
+  const version = await packageVersion(directory);
+  const managed: InstallStatus = marker
+    ? marker.platformPackage === MANAGED_PACKAGES.gemini.name && version === marker.version && await exists(entry, constants.R_OK)
+      ? { installed: true, version, path: entry } : { installed: false, version: marker.version, problem: 'binary_missing' }
+    : { installed: false, ...(version ? { problem: 'install_incomplete' } : {}) };
+  let path = await onPath('gemini', env, host.platform);
+  if (path && host.platform === 'win32' && /\.(?:cmd|bat)$/i.test(path)) {
+    const script = join(dirname(path), 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
+    if (!await exists(script, constants.R_OK)) return { managed, system: { installed: false, path, problem: 'windows_launcher_unsupported' } };
+    path = script;
+  }
+  if (!path) return { managed, system: { installed: false } };
+  const result = /\.m?js$/i.test(path) ? await run(process.execPath, [path, '--version'], env) : await run(path, ['--version'], env);
+  const detectedVersion = result.output.match(/^(?:Gemini CLI\s+)?v?(\d+\.\d+\.\d+(?:-[\w.-]+)?)\s*$/m)?.[1];
+  return { managed, system: result.ok && detectedVersion ? { installed: true, path, version: detectedVersion } : { installed: false, path, problem: 'version_check_failed' } };
 }
 
 /**
@@ -460,8 +488,7 @@ export class CoderInstaller {
     // A failed attempt leaves its dependency entries behind. Retrying the other
     // tool must not silently resume that failed install through the shared npm root.
     // Completed installs stay in the manifest so npm does not prune their files.
-    const other = coder === 'codex' ? 'claude' : 'codex';
-    if (!await readMarker(this.layout, other)) {
+    for (const other of (Object.keys(MANAGED_PACKAGES) as CoderKind[]).filter(other => other !== coder)) if (!await readMarker(this.layout, other)) {
       const name = MANAGED_PACKAGES[other].name;
       for (const dependency of Object.keys(manifest.dependencies)) {
         if (dependency === name || dependency.startsWith(name + '-')) delete manifest.dependencies[dependency];
@@ -486,7 +513,7 @@ export class CoderInstaller {
     if (result.code !== 0) throw new Error(result.error ?? `npm exited with ${result.code}`);
     progress.stage = 'verifying';
     const binary = coder === 'codex' ? managedCodexBinary(this.layout, this.host) : join(this.layout.nodeModules, native.name, native.binary);
-    if (!await exists(binary, constants.X_OK)) throw new Error(`platform_package_missing: ${native.name}`);
+    if (!await exists(binary, coder === 'gemini' ? constants.R_OK : constants.X_OK)) throw new Error(`platform_package_missing: ${native.name}`);
     const nativeVersion = coder === 'codex' ? `${version}-${this.host.platform}-${this.host.arch}` : version;
     if (await packageVersion(join(this.layout.nodeModules, pkg.name)) !== version
       || await packageVersion(join(this.layout.nodeModules, native.name)) !== nativeVersion) throw new Error('installed_version_mismatch');

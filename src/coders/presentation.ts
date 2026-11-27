@@ -37,7 +37,7 @@ export function noticeTask(tasks: readonly TaskRecord[], owner: string, event: S
   const source = event.data.source as { kind: string; form?: string };
   if (source.kind !== 'tool-jobs' || source.form !== 'notice') return;
   const body = event.data.content.map(part => part.type === 'text' ? part.text : '').join('\n');
-  const match = /^background job (\S+) \(coder: (Codex|Claude Code)(?: \[(ct-[0-9a-f]{8})\])?: /.exec(body);
+  const match = /^background job (\S+) \(coder: (Codex|Claude Code|Gemini CLI)(?: \[(ct-[0-9a-f]{8})\])?: /.exec(body);
   if (!match) return; // Truncated/unknown formats stay in the dock; never guess identity.
   const candidates = tasks.filter(task => task.ownerSession === owner && task.jobId === match[1] && CODER_NAMES[task.coder] === match[2]);
   const stableId = match[3];

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { threadPolicyDrift } from '../src/coders/codex.js';
 import { CODEX_KEY_ENV, CoderInstaller, MANAGED_PACKAGES, codexConfigToml, createNpmRunner, detectClaude, detectCodex, managedLayout, parseClaudeVersion,
-  parseCodexVersion, platformPackage, readMarker, type HostPlatform, type NpmRunner } from '../src/coders/install.js';
+  parseCodexVersion, platformPackage, readMarker, detectGemini, type HostPlatform, type NpmRunner } from '../src/coders/install.js';
 import { CodersManager } from '../src/coders/manager.js';
 import { CoderSettingsStore, defaultSettings, redact, rootsInput, endpointUrl, coderConcurrency } from '../src/coders/settings.js';
 import type { CoderStore } from '../src/coders/store.js';
@@ -140,7 +140,7 @@ test('the managed Codex home config repeats the safe policies and names the key 
 const host: HostPlatform = { platform: 'linux', arch: 'x64', musl: false };
 
 /** Lay out what npm would leave behind; `complete` also writes the platform binary and the install marker. */
-async function fakeManaged(root: string, coder: 'codex' | 'claude', options: { version?: string; complete?: boolean } = {}) {
+async function fakeManaged(root: string, coder: 'codex' | 'claude' | 'gemini', options: { version?: string; complete?: boolean } = {}) {
   const version = options.version ?? MANAGED_PACKAGES[coder].version;
   const complete = options.complete ?? true;
   if (coder === 'codex') {
@@ -151,7 +151,7 @@ async function fakeManaged(root: string, coder: 'codex' | 'claude', options: { v
       await writeFile(join(root, 'node_modules', '.bin', 'codex'), `#!/bin/sh\necho "codex-cli ${version}"\n`);
       await chmod(join(root, 'node_modules', '.bin', 'codex'), 0o755);
     }
-  } else {
+  } else if (coder === 'claude') {
     await mkdir(join(root, 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true });
     await writeFile(join(root, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), JSON.stringify({ version }));
     await writeFile(join(root, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'sdk.mjs'), 'export const query = () => {};\n');
@@ -161,6 +161,11 @@ async function fakeManaged(root: string, coder: 'codex' | 'claude', options: { v
       await writeFile(join(native, 'claude'), '#!/bin/sh\necho "0.0.0 (Claude Code)"\n');
       await chmod(join(native, 'claude'), 0o755);
     }
+  } else {
+    const directory = join(root, 'node_modules', '@google', 'gemini-cli');
+    await mkdir(join(directory, 'bundle'), { recursive: true });
+    await writeFile(join(directory, 'package.json'), JSON.stringify({ version }));
+    if (complete) await writeFile(join(directory, 'bundle', 'gemini.js'), `console.log(${JSON.stringify(version)});\n`, { mode: 0o644 });
   }
   if (complete) {
     const native = platformPackage(coder, host, version);
@@ -401,19 +406,21 @@ test('the npm runner ends the whole process group on timeout even when npm ignor
   assert.match(timedOut.progress()!.error!, /install_timeout/);
 });
 
-async function manager(options: { codexOnPath?: boolean; claudeOnPath?: boolean; pluginSdk?: boolean; managedCodex?: boolean; managedClaude?: boolean; loginText?: string } = {}) {
+async function manager(options: { codexOnPath?: boolean; claudeOnPath?: boolean; geminiOnPath?: boolean; pluginSdk?: boolean; managedCodex?: boolean; managedClaude?: boolean; managedGemini?: boolean; loginText?: string; env?: NodeJS.ProcessEnv } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'nexus-manager-'));
   const layout = managedLayout(root);
   if (options.managedCodex) await fakeManaged(root, 'codex');
   if (options.managedClaude) await fakeManaged(root, 'claude');
+  if (options.managedGemini) await fakeManaged(root, 'gemini');
   const bin = await mkdtemp(join(tmpdir(), 'nexus-bin-'));
   if (options.codexOnPath) { await writeFile(join(bin, 'codex'), '#!/bin/sh\necho "codex-cli 0.154.0"\n'); await chmod(join(bin, 'codex'), 0o755); }
   if (options.claudeOnPath) { await writeFile(join(bin, 'claude'), '#!/bin/sh\necho "2.1.258 (Claude Code)"\n'); await chmod(join(bin, 'claude'), 0o755); }
+  if (options.geminiOnPath) { await writeFile(join(bin, 'gemini'), '#!/bin/sh\necho "0.71.1"\n'); await chmod(join(bin, 'gemini'), 0o755); }
   const npmCalls: string[] = [];
-  const npm: NpmRunner = async args => { npmCalls.push(args.join(' ')); const version = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies['@openai/codex']; await fakeManaged(root, 'codex', { version }); await rm(join(root, 'installed', 'codex.json')); return { code: 0 }; };
+  const npm: NpmRunner = async args => { npmCalls.push(args.join(' ')); const coder = installer.installing()!; const version = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies[MANAGED_PACKAGES[coder].name]; await fakeManaged(root, coder, { version }); await rm(join(root, 'installed', `${coder}.json`)); return { code: 0 }; };
   let instance!: CodersManager;
   const installer = new CoderInstaller(layout, npm, coder => instance.afterInstall(coder), Date.now, host);
-  const env = { PATH: bin, HOME: '/home/fixture' };
+  const env = { PATH: bin, HOME: '/home/fixture', ...options.env };
   instance = new CodersManager({ store: new CoderSettingsStore(new MemoryRecords()), layout, profileRoots: ['/srv/profile'], installer, env,
     detect: { host, pluginSdk: async () => options.pluginSdk ? { version: '0.3.273', path: '/plugin/sdk/sdk.mjs' } : undefined },
     loginStatus: async () => options.loginText ?? 'Logged in using an API key - sk-abc***xyz' });
@@ -627,4 +634,131 @@ test('active coder tasks block version replacement and an install excludes both 
     assert.match(view.codex.problem!, /托管安装正在进行/);
     assert.match(view.claude.problem!, /托管安装正在进行/);
   } finally { finish(); await running; }
+});
+
+test('Gemini settings migrate older records without changing secrets and survive partial saves by older clients', async () => {
+  const records = new MemoryRecords(), store = new CoderSettingsStore(records);
+  const legacy: any = { ...defaultSettings(), revision: 4, codex: { source: 'system', apiKey: 'old-codex-secret' },
+    claude: { source: 'managed', authHeader: 'auth-token', token: 'old-claude-secret' } };
+  delete legacy.gemini;
+  records.values.set('coders', legacy);
+  const migrated = await store.read();
+  assert.deepEqual(migrated.gemini, { source: 'managed', apiKey: '' });
+  assert.equal(migrated.revision, 4); assert.equal(migrated.codex.apiKey, 'old-codex-secret'); assert.equal(migrated.claude.token, 'old-claude-secret');
+  assert.equal(Object.hasOwn(legacy, 'gemini'), false, 'read migration must not mutate the stored object');
+  const configured = await store.save(4, { defaultCoder: 'gemini', gemini: { source: 'system', managedVersion: '0.71.1', model: ' gemini-model ', baseUrl: 'https://gateway.example/google/', apiKey: 'gemini-secret' } });
+  assert.equal(configured.gemini.model, 'gemini-model'); assert.equal(configured.gemini.baseUrl, 'https://gateway.example/google');
+  assert.equal(redact(configured).gemini.apiKeyConfigured, true);
+  assert.equal(JSON.stringify(redact(configured)).includes('secret'), false);
+  const kept = await new CoderSettingsStore(records).save(5, { maxConcurrent: 3, codex: { model: 'old-client' } });
+  assert.deepEqual(kept.gemini, configured.gemini); assert.equal(kept.defaultCoder, 'gemini');
+  await assert.rejects(store.save(5, { gemini: { apiKey: 'stale' } }), /configuration_changed/);
+  await assert.rejects(store.save(6, { gemini: { source: 'cloud' } }), /invalid_configuration/);
+  await assert.rejects(store.save(6, { gemini: { managedVersion: 'latest' } }), /invalid_managed_version/);
+  await assert.rejects(store.save(6, { gemini: { baseUrl: 'https://user:password@gateway.example' } }), /invalid_endpoint/);
+  const empty = await store.save(6, { gemini: { apiKey: '' } });
+  assert.equal(empty.gemini.apiKey, 'gemini-secret');
+  const cleared = await store.clearSecret(7, 'gemini');
+  assert.equal(cleared.gemini.apiKey, ''); assert.equal(cleared.claude.token, 'old-claude-secret'); assert.equal(cleared.codex.apiKey, 'old-codex-secret');
+  for (const malformed of [null, [], 'bad', { source: 'managed' }, { source: 'cloud', apiKey: '' }]) {
+    records.values.set('coders', { ...cleared, gemini: malformed });
+    await assert.rejects(store.read(), /invalid_saved_record/);
+  }
+});
+
+for (const completePeers of [false, true]) test(`Gemini installation ${completePeers ? 'preserves both completed tools' : 'does not retry either incomplete tool'} and checks its portable JS release`, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-install-gemini-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const layout = managedLayout(root), peerDependencies: Record<string, string> = {};
+  for (const peer of ['codex', 'claude'] as const) {
+    await fakeManaged(root, peer, { complete: completePeers });
+    const pkg = MANAGED_PACKAGES[peer], native = platformPackage(peer, host);
+    peerDependencies[pkg.name] = pkg.version; peerDependencies[native.name] = native.spec;
+  }
+  await writeFile(join(root, 'package.json'), JSON.stringify({ dependencies: peerDependencies }));
+  const version = '0.71.2', expected = { ...(completePeers ? peerDependencies : {}), '@google/gemini-cli': version };
+  let wrongVersion = false, configured = 0;
+  const installer = new CoderInstaller(layout, async () => {
+    assert.deepEqual(JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).dependencies, expected);
+    await fakeManaged(root, 'gemini', { version: wrongVersion ? '0.71.1' : version });
+    await rm(join(layout.markers, 'gemini.json'));
+    return { code: 0 };
+  }, async () => { configured++; }, Date.now, host);
+  await installer.start('gemini', version);
+  assert.equal(installer.progress()?.phase, 'installed'); assert.equal(configured, 1);
+  const detected = await detectGemini(layout, { host, env: { PATH: '' } });
+  assert.equal(detected.managed.installed, true); assert.equal(detected.managed.version, version);
+  assert.equal(detected.managed.path, join(layout.nodeModules, '@google/gemini-cli/bundle/gemini.js'));
+  assert.deepEqual(platformPackage('gemini', { platform: 'win32', arch: 'arm64', musl: false }, version), { name: '@google/gemini-cli', spec: version, binary: 'bundle/gemini.js' });
+  for (const peer of ['codex', 'claude'] as const) assert.equal(!!await readMarker(layout, peer), completePeers);
+  wrongVersion = true;
+  await installer.start('gemini', version);
+  assert.equal(installer.progress()?.error, 'installed_version_mismatch'); assert.equal(configured, 1);
+  assert.equal(await readMarker(layout, 'gemini'), undefined);
+  assert.equal((await detectGemini(layout, { host, env: { PATH: '' } })).managed.installed, false);
+});
+
+test('Gemini system detection probes the actual CLI and resolves the standard Windows npm shim without a shell', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-gemini-shim-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const layout = managedLayout(root), script = join(root, 'node_modules/@google/gemini-cli/bundle/gemini.js');
+  await mkdir(join(root, 'node_modules/@google/gemini-cli/bundle'), { recursive: true });
+  await writeFile(join(root, 'gemini.cmd'), 'fixture npm shim'); await chmod(join(root, 'gemini.cmd'), 0o755);
+  const windows: HostPlatform = { platform: 'win32', arch: 'x64', musl: false };
+  let probes = 0;
+  const options = { host: windows, env: { PATH: root }, probe: async (command: string, args: string[], env: NodeJS.ProcessEnv) => {
+    probes++; assert.equal(command, process.execPath); assert.deepEqual(args, [script, '--version']);
+    assert.equal(env.GEMINI_CLI_HOME, layout.geminiHome); return { ok: true, output: '0.71.1\n' };
+  } };
+  assert.equal((await detectGemini(layout, options)).system.problem, 'windows_launcher_unsupported');
+  assert.equal(probes, 0);
+  await writeFile(script, 'fixture portable JS');
+  const detected = await detectGemini(layout, options);
+  assert.equal(detected.system.installed, true); assert.equal(detected.system.path, script); assert.equal(probes, 1);
+});
+
+test('Gemini managed runtime uses only configured credentials and exposes OAuth login, source, model and strict-mode limits', async t => {
+  const m = await manager({ managedGemini: true, env: { GEMINI_API_KEY: 'unselected-env-key', GOOGLE_API_KEY: 'unselected-google-key', GEMINI_CLI_SYSTEM_SETTINGS_PATH: 'untrusted', GOOGLE_GEMINI_BASE_URL: 'https://unselected.example' } });
+  t.after(async () => { await rm(m.root, { recursive: true, force: true }); await rm(m.bin, { recursive: true, force: true }); });
+  const unconfigured = await m.manager.view();
+  assert.equal(unconfigured.gemini.active, 'managed'); assert.equal(unconfigured.gemini.ready, false);
+  assert.equal(unconfigured.gemini.credentialState, 'missing'); assert.ok(unconfigured.geminiLogin);
+  assert.match(unconfigured.geminiLogin!.command, /GEMINI_CLI_HOME/);
+  await m.manager.handle('save', { revision: 0, config: { defaultCoder: 'gemini', gemini: { apiKey: 'saved-gemini-key', model: 'gemini-model', baseUrl: 'https://gateway.example' } } });
+  const runtime = await m.manager.runtime();
+  assert.ok(runtime.gemini && !('error' in runtime.gemini));
+  assert.equal(runtime.defaultCoder, 'gemini'); assert.equal(runtime.gemini.command, process.execPath);
+  assert.deepEqual(runtime.gemini.args, [join(m.layout.nodeModules, '@google/gemini-cli/bundle/gemini.js')]);
+  assert.equal(runtime.gemini.env.GEMINI_API_KEY, 'saved-gemini-key'); assert.equal(runtime.gemini.env.GOOGLE_API_KEY, undefined);
+  assert.equal(runtime.gemini.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, undefined); assert.equal(runtime.gemini.env.GOOGLE_GEMINI_BASE_URL, 'https://gateway.example');
+  assert.equal(runtime.gemini.authMethod, 'gateway'); assert.equal(runtime.gemini.model, 'gemini-model');
+  assert.equal((await readFile(join(m.layout.geminiHome, '.gemini/settings.json'), 'utf8')).includes('saved-gemini-key'), false);
+  assert.equal('error' in (await m.manager.runtime('full')).gemini!, false);
+  const strict = (await m.manager.runtime('strict')).gemini!;
+  assert.ok('error' in strict); assert.match(strict.error, /严格沙箱/);
+  await m.manager.handle('clear-secret', { coder: 'gemini', revision: 1 });
+  assert.ok(m.manager.sessionHomes().gemini!.includes(join(m.layout.geminiHome, '.gemini')));
+  assert.ok(m.manager.sessionHomes().codex.includes(m.layout.codexHome));
+  assert.ok(m.manager.sessionHomes().claude.includes(m.layout.claudeHome));
+  assert.ok(!JSON.stringify(m.manager.sessionHomes()).includes('saved-gemini-key'), 'saved history does not require or expose model credentials');
+  await m.manager.handle('save', { revision: 2, config: { gemini: { baseUrl: '' } } });
+  await writeFile(join(m.layout.geminiHome, '.gemini/oauth_creds.json'), '{"access_token":"synthetic-oauth-token"}', { mode: 0o600 });
+  const oauth = (await m.manager.runtime()).gemini!;
+  assert.ok(!('error' in oauth)); assert.equal(oauth.authMethod, 'oauth-personal'); assert.equal(oauth.env.GEMINI_API_KEY, undefined);
+  assert.equal((await m.manager.view()).gemini.credentialState, 'configured');
+});
+
+test('Gemini system fallback uses the DSH environment key and installation RPC honors the saved version', async t => {
+  const m = await manager({ geminiOnPath: true, env: { GOOGLE_API_KEY: 'dsh-environment-key' } });
+  t.after(async () => { await rm(m.root, { recursive: true, force: true }); await rm(m.bin, { recursive: true, force: true }); });
+  let runtime = (await m.manager.runtime()).gemini!;
+  assert.ok(!('error' in runtime)); assert.equal(runtime.source, 'system'); assert.equal(runtime.env.GEMINI_API_KEY, 'dsh-environment-key');
+  assert.equal((await m.manager.view()).gemini.fallback, true);
+  await m.manager.handle('save', { revision: 0, config: { gemini: { managedVersion: '0.71.2', apiKey: 'configured-key' } } });
+  await assert.rejects(m.manager.handle('install', { coder: 'gemini', revision: 0 }), /configuration_changed/);
+  assert.equal(m.npmCalls.length, 0);
+  await m.manager.handle('install', { coder: 'gemini', revision: 1 }); await m.installer.whenDone();
+  assert.equal((await m.manager.view()).gemini.managed.version, '0.71.2');
+  runtime = (await m.manager.runtime()).gemini!;
+  assert.ok(!('error' in runtime)); assert.equal(runtime.source, 'managed'); assert.equal(runtime.env.GEMINI_API_KEY, 'configured-key');
 });

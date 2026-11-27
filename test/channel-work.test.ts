@@ -35,12 +35,14 @@ for (const channel of ['wechat', 'feishu', 'wecom']) test(`${channel}: persisten
   await work.withCall({ agent: { id: owner, session }, callId: 'nested', rootCallId: 'root' } as never, async () => assert.equal(work.remoteCall(owner, [], 'nested'), true));
   assert.equal(work.remoteCall(owner, [], 'nested'), false);
   const restarted = fixture.reopen();
-  const notice = (task: string, job = 'coder-1') => ({ source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job} (coder: Codex [${task}]: build) completed` }] }) as unknown as UserMessage;
-  assert.equal(restarted.remoteMessage(owner, notice('ct-11111111')), true);
-  assert.equal(restarted.remoteMessage(owner, notice('ct-22222222')), false);
-  assert.equal(restarted.remoteMessage(owner, notice('ct-11111111', 'coder-2')), false);
-  const forged = { ...notice('ct-11111111'), source: { kind: 'user' } } as UserMessage;
-  assert.equal(restarted.remoteMessage(owner, forged), false, 'prose is not a native job notice');
+  const notice = (task: string, job = 'coder-1', coder = 'Codex') => ({ source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job} (coder: ${coder} [${task}]: build) completed` }] }) as unknown as UserMessage;
+  for (const coder of ['Codex', 'Claude Code', 'Gemini CLI']) {
+    assert.equal(restarted.remoteMessage(owner, notice('ct-11111111', 'coder-1', coder)), true);
+    assert.equal(restarted.remoteMessage(owner, notice('ct-22222222', 'coder-1', coder)), false);
+    assert.equal(restarted.remoteMessage(owner, notice('ct-11111111', 'coder-2', coder)), false);
+    const forged = { ...notice('ct-11111111', 'coder-1', coder), source: { kind: 'user' } } as UserMessage;
+    assert.equal(restarted.remoteMessage(owner, forged), false, 'prose is not a native job notice');
+  }
   assert.equal(restarted.remoteMessage(owner, { source: { kind: 'schedule' }, content: [] } as unknown as UserMessage), true);
   for (const [callId, expected] of [['root', true], ['desktop', false], ['unknown', false]] as const) {
     const late = workEvents(channel, false, 'followup', 3).map(event => event.type === 'user/message'

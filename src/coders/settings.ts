@@ -35,6 +35,15 @@ export interface ClaudeSettings {
   token: string;
 }
 
+export interface GeminiSettings {
+  source: CoderSource;
+  managedVersion?: string;
+  model?: string;
+  /** A Google-protocol gateway; empty uses the official Gemini API or Google OAuth. */
+  baseUrl?: string;
+  apiKey: string;
+}
+
 /** One record in native credentials: coder preferences and their secrets, saved atomically with a revision. */
 export interface CoderSettingsRecord {
   version: 1;
@@ -52,6 +61,7 @@ export interface CoderSettingsRecord {
   allowedNetworkDomains?: string[];
   codex: CodexSettings;
   claude: ClaudeSettings;
+  gemini: GeminiSettings;
 }
 
 export interface CoderSettingsInput {
@@ -65,6 +75,7 @@ export interface CoderSettingsInput {
   allowedNetworkDomains?: unknown;
   codex?: unknown;
   claude?: unknown;
+  gemini?: unknown;
 }
 
 export const DEFAULT_NETWORK_DOMAINS = ['registry.npmjs.org'];
@@ -100,7 +111,7 @@ const WIRE_APIS: readonly CodexWireApi[] = ['responses', 'chat'];
 
 export function defaultSettings(): CoderSettingsRecord {
   return { version: 1, revision: 0, defaultCoder: 'codex', maxConcurrent: DEFAULT_CODER_CONCURRENCY,
-    codex: { source: 'managed', apiKey: '' }, claude: { source: 'managed', authHeader: 'auth-token', token: '' } };
+    codex: { source: 'managed', apiKey: '' }, claude: { source: 'managed', authHeader: 'auth-token', token: '' }, gemini: { source: 'managed', apiKey: '' } };
 }
 
 function text(value: unknown, max: number): string {
@@ -156,14 +167,17 @@ function record(value: unknown): Record<string, unknown> {
 function decode(raw: unknown): CoderSettingsRecord | undefined {
   if (raw === undefined) return undefined;
   if (!raw || typeof raw !== 'object') throw new ChannelError('invalid_saved_record');
-  const value = raw as CoderSettingsRecord;
-  if (value.version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || !['codex', 'claude'].includes(value.defaultCoder)
+  const value = structuredClone(raw) as CoderSettingsRecord;
+  // Existing v1 records predate Gemini; retain every preference and secret during the additive migration.
+  if (value.gemini === undefined) value.gemini = { source: 'managed', apiKey: '' };
+  if (value.version !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || !['codex', 'claude', 'gemini'].includes(value.defaultCoder)
     || !value.codex || !value.claude || typeof value.codex.apiKey !== 'string' || typeof value.claude.token !== 'string'
     || !SOURCES.includes(value.codex.source) || !SOURCES.includes(value.claude.source) || !HEADERS.includes(value.claude.authHeader)
+    || !value.gemini || Array.isArray(value.gemini) || typeof value.gemini.apiKey !== 'string' || !SOURCES.includes(value.gemini.source)
     || (value.roots !== undefined && (!Array.isArray(value.roots) || !value.roots.every(root => typeof root === 'string')))) {
     throw new ChannelError('invalid_saved_record');
   }
-  for (const coder of ['codex', 'claude'] as const) {
+  for (const coder of ['codex', 'claude', 'gemini'] as const) {
     if (value[coder].managedVersion !== undefined && !isManagedVersion(value[coder].managedVersion)) throw new ChannelError('invalid_saved_record');
   }
   if (value.securityMode !== undefined && !['standard', 'strict', 'full'].includes(value.securityMode)) throw new ChannelError('invalid_saved_record');
@@ -189,13 +203,15 @@ export interface CoderSettingsView {
   allowedNetworkDomains?: string[];
   codex: Omit<CodexSettings, 'apiKey'> & { apiKeyConfigured: boolean };
   claude: Omit<ClaudeSettings, 'token'> & { tokenConfigured: boolean };
+  gemini: Omit<GeminiSettings, 'apiKey'> & { apiKeyConfigured: boolean };
 }
 
 export function redact(settings: CoderSettingsRecord): CoderSettingsView {
   const { apiKey, ...codex } = settings.codex;
   const { token, ...claude } = settings.claude;
+  const { apiKey: geminiKey, ...gemini } = settings.gemini;
   return { reviewPolicy: reviewPolicy(settings.reviewPolicy), securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: coderConcurrency(settings.maxConcurrent), autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: networkDomains(settings.allowedNetworkDomains), ...(settings.roots ? { roots: [...settings.roots] } : {}),
-    codex: { ...codex, apiKeyConfigured: apiKey.length > 0 }, claude: { ...claude, tokenConfigured: token.length > 0 } };
+    codex: { ...codex, apiKeyConfigured: apiKey.length > 0 }, claude: { ...claude, tokenConfigured: token.length > 0 }, gemini: { ...gemini, apiKeyConfigured: geminiKey.length > 0 } };
 }
 
 /** Coder preferences and secrets in native credentials; revision-checked like the channel connections. */
@@ -212,9 +228,10 @@ export class CoderSettingsStore {
     if (input.autoApproveSafe !== undefined && typeof input.autoApproveSafe !== 'boolean') throw new ChannelError('invalid_configuration');
     const codexInput = record(input.codex);
     const claudeInput = record(input.claude);
+    const geminiInput = record(input.gemini);
     const next = (previous: CoderSettingsRecord): CoderSettingsRecord => ({
       version: 1, revision: previous.revision + 1, reviewPolicy: reviewPolicy(input.reviewPolicy === undefined ? previous.reviewPolicy : input.reviewPolicy), securityMode: oneOf(input.securityMode, ['standard', 'strict', 'full'] as const, previous.securityMode ?? 'standard'), autoApproveSafe: (input.autoApproveSafe as boolean | undefined) ?? previous.autoApproveSafe ?? true, maxTaskMinutes: taskMinutes(input.maxTaskMinutes ?? previous.maxTaskMinutes), allowedNetworkDomains: networkDomains(input.allowedNetworkDomains ?? previous.allowedNetworkDomains),
-      defaultCoder: oneOf(input.defaultCoder, ['codex', 'claude'] as const, previous.defaultCoder),
+      defaultCoder: oneOf(input.defaultCoder, ['codex', 'claude', 'gemini'] as const, previous.defaultCoder),
       ...(previous.projectRoot ? { projectRoot: previous.projectRoot } : {}),
       maxConcurrent: coderConcurrency(input.maxConcurrent === undefined ? previous.maxConcurrent : input.maxConcurrent),
       ...(rootsInput(input.roots) ? { roots: rootsInput(input.roots) } : {}),
@@ -234,6 +251,13 @@ export class CoderSettingsStore {
         authHeader: oneOf(claudeInput.authHeader, HEADERS, previous.claude.authHeader),
         token: text(claudeInput.token, 4096) || previous.claude.token,
       },
+      gemini: input.gemini === undefined ? previous.gemini : {
+        source: oneOf(geminiInput.source, SOURCES, previous.gemini.source),
+        ...managedVersion(geminiInput.managedVersion === undefined ? previous.gemini.managedVersion : geminiInput.managedVersion),
+        ...(optional(geminiInput.model, 128) ? { model: optional(geminiInput.model, 128) } : {}),
+        ...(endpointUrl(geminiInput.baseUrl) ? { baseUrl: endpointUrl(geminiInput.baseUrl) } : {}),
+        apiKey: text(geminiInput.apiKey, 4096) || previous.gemini.apiKey,
+      },
     });
     const result = await this.records.modify(SETTINGS_KEY, async current => {
       const previous = decode(current) ?? defaultSettings();
@@ -249,6 +273,7 @@ export class CoderSettingsStore {
       const previous = decode(current) ?? defaultSettings();
       if (previous.revision !== expectedRevision) throw new ChannelError('configuration_changed');
       return coder === 'codex' ? { ...previous, revision: previous.revision + 1, codex: { ...previous.codex, apiKey: '' } }
+        : coder === 'gemini' ? { ...previous, revision: previous.revision + 1, gemini: { ...previous.gemini, apiKey: '' } }
         : { ...previous, revision: previous.revision + 1, claude: { ...previous.claude, token: '' } };
     });
     return decode(result)!;

@@ -20,7 +20,8 @@ export interface CodexHooks extends CoderRun {
   /**
    * Put the user's words into the running task. Without `interrupt` they join the current turn (`turn/steer`) and Codex reads them at
    * its next step; a pending approval still waits for its answer. With `interrupt` the turn stops, its pending approvals are withdrawn,
-   * and the words start the next turn on the same thread. Rejects when no turn is in progress.
+   * and the words start the next turn on the same thread. When a completed turn asks for clarification, additions are queued with the
+   * answer for the next turn. Rejects when neither a turn nor a clarification is in progress.
    */
   steer(text: string, interrupt: boolean): Promise<void>;
 }
@@ -99,6 +100,8 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
   let turnItems: unknown[] = [];
   let questionRounds = 0;
   let turnActive = false;
+  /** A structured clarification ends its turn; additions wait here until its answer starts the next one. */
+  let clarification: { additions: string[] } | undefined;
   /** Aborts the requests of the current turn when the user interrupts it; the task's own controller stays live. */
   let turnAbort = new AbortController();
   /** What the user said when interrupting; it starts the next turn once the current one ends. */
@@ -247,15 +250,20 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
     if (result.status === 'needs_input') {
       if (questionRounds >= MAX_QUESTION_ROUNDS) return finish({ status: 'failed', detail: '澄清次数达到上限，仍有问题未解决；请核对目标后续接。', result: text });
       questionRounds++;
+      const waiting = { additions: [] as string[] };
+      clarification = waiting;
       try {
         const decision = await deps.decide(codexTextQuestion(text), controller.signal);
         const answer = decision.behavior === 'allow' ? String((decision.updatedInput?.answers as Record<string, string> | undefined)?.[text.trim()] ?? '') : '';
         if (controller.signal.aborted) return;
         if (!answer) return finish({ status: 'failed', detail: 'Codex 的提问没有得到回答', result: text });
-        await startTurn(answer);
+        clarification = undefined;
+        await startTurn(waiting.additions.length ? `${answer}\n\n用户在等待期间补充：\n${waiting.additions.join('\n\n')}` : answer);
         return;
       } catch (error) {
         return finish({ status: 'failed', detail: safeFailureDetail((error as Error)?.message ?? String(error)), result: text });
+      } finally {
+        if (clarification === waiting) clarification = undefined;
       }
     }
     finish({ status: 'completed', result: text });
@@ -339,7 +347,12 @@ export function runCodexTask(task: TaskRecord, deps: CodexRunDeps): CodexHooks {
 
   return {
     async steer(text, interrupt) {
-      if (controller.signal.aborted || !threadId || !turnId || !turnActive || redirect !== undefined) throw new Error('Codex 当前没有进行中的回合。');
+      if (controller.signal.aborted || !threadId || redirect !== undefined) throw new Error('Codex 当前没有进行中的回合。');
+      if (!interrupt && clarification) {
+        clarification.additions.push(text);
+        return;
+      }
+      if (!turnId || !turnActive) throw new Error('Codex 当前没有进行中的回合。');
       if (!interrupt) {
         await send('turn/steer', { threadId, expectedTurnId: turnId, input: [{ type: 'text', text }] });
         return;

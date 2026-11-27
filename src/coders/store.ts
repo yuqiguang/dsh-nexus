@@ -44,7 +44,7 @@ export const taskSchema: ZodType<TaskRecord> = z.object({
   reviewDepth: z.number().int().nonnegative().optional(),
   verificationOnly: z.boolean().optional(),
   id: z.string(),
-  coder: z.enum(['claude', 'codex']),
+  coder: z.enum(['claude', 'codex', 'gemini']),
   description: z.string(),
   continuation: z.string().optional(),
   preflight: z.string().optional(),

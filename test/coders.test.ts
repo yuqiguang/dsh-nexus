@@ -21,6 +21,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_REVIEW_POLICY, type CoderReviewPolicy } from '../src/coders/review-policy.js';
 import { dependencyPassed } from '../src/coders/dependencies.js';
+import { fakeGemini, geminiLaunch, geminiToolsClient } from './gemini-fixture.js';
+import { geminiSessionWorkspace } from '../src/coders/gemini-config.js';
+import { createHash } from 'node:crypto';
+import type { CodersConfig } from '../src/coders/index.js';
 
 // The confined pipeline these tests drive shells out to `unshare --user`; a kernel that refuses
 // unprivileged user namespaces fails them with a raw `unshare: Operation not permitted` instead
@@ -1468,6 +1472,80 @@ test('coder_steer reaches the running Codex task, records what the user added, a
   await assert.rejects(harness.run('coder_steer', { message: '改', task_id: 'ct-claude' }), /Claude Code 任务不支持运行中插话/);
 });
 
+test('coder_steer preserves additions across a structured clarification without answering or interrupting it', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-clarification-steer-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  const answers: (() => void)[] = [];
+  Object.assign(harness.ctx.userQuestions, { ask: async (request: { questions: AskUserQuestionItem[] }) => {
+    harness.asked.push(request.questions);
+    return new Promise(resolve => answers.push(() => resolve({ answers: request.questions.map(q => ({
+      id: q.id, selected: [], custom: harness.asked.length === 1 ? 'SQLite' : 'local',
+    })) })));
+  } });
+  const turns: string[] = [];
+  const fake = fakeCodex(io => io.onWrite(message => {
+    if (message.method === 'initialize') io.reply(message.id, {});
+    if (message.method === 'thread/start') io.reply(message.id, { thread: { id: 'clarification-thread' } });
+    if (message.method === 'turn/start') {
+      turns.push((message.params as { input: { text: string }[] }).input[0]!.text);
+      io.reply(message.id, { turn: { id: `clarification-${turns.length}` } });
+      io.push({ method: 'turn/completed', params: { turn: { status: 'completed', items: [{
+        type: 'agentMessage', id: `result-${turns.length}`, text: JSON.stringify(turns.length < 3
+          ? { status: 'needs_input', text: turns.length === 1 ? 'Which database?' : 'Where should it run?' }
+          : { status: 'completed', text: 'done' }),
+      }] } } });
+    }
+  }));
+  await installCoders(harness.ctx, { roots: [root], spawnCodex: () => fake.process });
+  const id = (await harness.run('coder_task', { description: 'implement the database feature' })).task_id!;
+  try {
+    await until(() => answers.length === 1 && harness.tasks.get(id)?.status === 'waiting-user', 'first clarification');
+    await assert.rejects(harness.run('coder_steer', { task_id: id, message: 'change course', interrupt: true }), /正在等用户回答/);
+    for (const message of ['Also add unit tests.', 'Use TypeScript.']) {
+      assert.match((await harness.run('coder_steer', { task_id: id, message })).text!, /答完之后会看到/);
+    }
+    assert.equal(harness.tasks.get(id)!.status, 'waiting-user');
+    assert.equal(turns.length, 1, 'additions cannot answer the pending question');
+    assert.equal(fake.sent.some(message => message.method === 'turn/steer'), false, 'the completed turn cannot be steered');
+    answers[0]!();
+    await until(() => answers.length === 2 && harness.tasks.get(id)?.status === 'waiting-user', 'second clarification');
+    answers[1]!();
+    await harness.jobs[0]!.done;
+    assert.equal(harness.tasks.get(id)!.status, 'completed');
+    assert.match(turns[1]!, /^SQLite\n/);
+    assert.match(turns[1]!, /Also add unit tests\.[\s\S]*Use TypeScript\./);
+    assert.equal(turns[2], 'local', 'queued additions belong only to their clarification');
+  } finally {
+    harness.jobs[0]!.cancel('test cleanup');
+    for (const answer of answers) answer();
+    await harness.jobs[0]!.done;
+  }
+});
+
+test('cancelling a structured clarification never starts another turn with queued additions', async () => {
+  let release: (() => void) | undefined;
+  const fake = fakeCodex(io => io.onWrite(message => {
+    if (message.method === 'initialize') io.reply(message.id, {});
+    if (message.method === 'thread/start') io.reply(message.id, { thread: { id: 'cancel-clarification' } });
+    if (message.method === 'turn/start') {
+      io.reply(message.id, { turn: { id: 'question-turn' } });
+      io.push({ method: 'turn/completed', params: { turn: { status: 'completed', items: [{ type: 'agentMessage', id: 'question',
+        text: JSON.stringify({ status: 'needs_input', text: 'Which database?' }) }] } } });
+    }
+  }));
+  const hooks = runCodexTask(codexTask(), { spawn: () => fake.process, decide: (_request, signal) => new Promise(resolve => {
+    release = () => resolve({ behavior: 'allow', updatedInput: { answers: { 'Which database?': 'SQLite' } } });
+    signal.addEventListener('abort', release, { once: true });
+  }) });
+  await until(() => !!release, 'clarification pending');
+  await hooks.steer('Also add tests.', false);
+  hooks.cancel('user cancelled');
+  assert.equal((await hooks.done).status, 'killed');
+  assert.equal(fake.sent.filter(message => message.method === 'turn/start').length, 1);
+  await assert.rejects(hooks.steer('late addition', false), /没有进行中的回合/);
+});
+
 test('implicit steering refuses two live Codex candidates and explicit selection reaches only the chosen task', async t => {
   const root = await mkdtemp(join(tmpdir(), 'nexus-steer-choice-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -2646,6 +2724,35 @@ test('automatic Claude recovery refuses a replacement native session', async () 
   assert.equal(result.status, 'failed'); assert.match(result.detail!, /未恢复原会话/); assert.equal(registered, false);
 });
 
+test('manual Claude continuation rejects a replacement session before accepting its tools or result', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-manual-session-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = coderHarness(undefined, root);
+  let resumedWork = false;
+  const query: ClaudeQuery = async function* ({ options }) {
+    if (!options.resume) {
+      yield { type: 'system', subtype: 'init', session_id: 'original-manual-session' };
+      yield { type: 'result', subtype: 'success', result: 'first task done' };
+      return;
+    }
+    assert.equal(options.resume, 'original-manual-session');
+    yield { type: 'system', subtype: 'init', session_id: 'replacement-session' };
+    resumedWork = true;
+    await options.canUseTool('Write', { file_path: join(root, 'replacement.txt'), content: 'wrong session' }, { signal: options.abortController.signal });
+    yield { type: 'result', subtype: 'success', result: 'must not be accepted' };
+  };
+  await installCoders(harness.ctx, { roots: [root], defaultCoder: 'claude', query });
+  const first = (await harness.run('coder_task', { description: 'first task' })).task_id!;
+  await harness.jobs[0]!.done;
+  const next = (await harness.run('coder_task', { resume_task_id: first, continuation: 'continue the original task' })).task_id!;
+  await harness.jobs[1]!.done;
+  const record = harness.tasks.get(next)!;
+  assert.equal(record.status, 'failed');
+  assert.match(record.result!.detail!, /未恢复原会话/);
+  assert.equal(record.coderSessionId, 'original-manual-session');
+  assert.equal(resumedWork, false);
+});
+
 
 test('the original runtime budget expires during retry backoff without starting another coder', async t => {
   const workdir = await mkdtemp(join(tmpdir(), 'nexus-retry-budget-')); t.after(() => rm(workdir, { recursive: true, force: true }));
@@ -3116,6 +3223,131 @@ test('denied or cancelled preflight never launches its command or the coder', as
     assert.equal(codingRuns, 0);
     await assert.rejects(readFile(join(root, 'executed.txt')), { code: 'ENOENT' });
   });
+});
+
+test('Gemini dispatch carries native owner questions, command approval and independent verification into exact-session continuation', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-gemini-dispatch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project'); await mkdir(cwd);
+  await writeFile(join(cwd, 'check.cjs'), 'require("node:assert/strict").match(require("node:fs").readFileSync("notes.txt", "utf8"), /SQLite/); console.log("independent check passed");');
+  const harness = coderHarness(questions => questions.map(question => ({ id: question.id, selected: [question.id === 'approve' ? '允许' : 'SQLite'] })), cwd);
+  const fakes: ReturnType<typeof fakeGemini>[] = []; let starts = 0;
+  const config: CodersConfig = { roots: [cwd], defaultCoder: 'gemini', securityMode: 'standard', geminiLaunch: geminiLaunch(root),
+    reviewPolicy: { ...DEFAULT_REVIEW_POLICY, commands: 'ask' }, spawnGemini: (_startup, launch) => {
+      assert.ok(launch.env.GEMINI_CLI_HOME); const attempt = ++starts; let connection: any;
+      const fake = fakeGemini(async (message, io) => {
+        if (message.method === 'initialize') io.reply(message, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+        if (message.method === 'session/new' || message.method === 'session/load') {
+          connection = message.params; assert.equal(connection.cwd, geminiSessionWorkspace(config.geminiLaunch!.home, cwd));
+          if (attempt > 1) { assert.equal(message.method, 'session/load'); assert.equal(connection.sessionId, 'gemini-dispatched'); }
+          io.reply(message, attempt === 1 ? { sessionId: 'gemini-dispatched' } : {});
+        }
+        if (message.method === 'session/prompt') {
+          assert.equal(message.params.sessionId, 'gemini-dispatched');
+          const client = await geminiToolsClient(connection);
+          try {
+            if (attempt === 1) assert.match(JSON.stringify(await client.callTool({ name: 'ask_question', arguments: { question: 'Choose the database', options: [{ label: 'SQLite' }, { label: 'PostgreSQL' }] } })), /SQLite/);
+            else assert.match(message.params.prompt[0].text, /continue using SQLite/);
+            assert.equal((await client.callTool({ name: 'write_file', arguments: { path: 'notes.txt', content: `SQLite ${attempt === 1 ? 'initialized' : 'continued'}` } })).isError, undefined);
+            assert.match(JSON.stringify(await client.callTool({ name: 'command', arguments: { command: 'node check.cjs' } })), /命令执行成功/);
+            await client.callTool({ name: 'report_result', arguments: { status: 'completed', text: 'SQLite work completed' } });
+            io.reply(message, { stopReason: 'end_turn' });
+          } finally { await client.close(); }
+        }
+      });
+      fakes.push(fake); return fake.transport;
+    } };
+  await installCoders(harness.ctx, config);
+  const first = (await harness.run('coder_task', { description: 'Implement SQLite notes', verify: 'node check.cjs', verify_network: 'ask', outputs: ['notes.txt'] })).task_id!;
+  await harness.jobs[0]!.done;
+  const original = harness.tasks.get(first)!;
+  assert.equal(original.coder, 'gemini'); assert.equal(original.coderSessionId, 'gemini-dispatched');
+  assert.equal(original.status, 'completed'); assert.equal(original.result?.verifyOk, true);
+  assert.match(original.result!.verifyOutput!, /independent check passed/);
+  assert.equal(harness.asked.length, 3, 'the owner question and each command have their own native interaction');
+  assert.ok(harness.panels[0]!.progress.some(text => text.includes('Gemini')));
+  config.securityMode = 'full'; config.defaultCoder = 'codex';
+  const second = (await harness.run('coder_task', { resume_task_id: first, continuation: 'continue using SQLite' })).task_id!;
+  const continued = harness.tasks.get(second)!;
+  assert.equal(continued.coder, 'gemini'); assert.equal(continued.resumedFrom, first); assert.equal(continued.cwd, cwd);
+  assert.deepEqual(continued.permissions, original.permissions, 'new settings cannot upgrade the original task permissions');
+  assert.equal(continued.verify, original.verify);
+  await harness.jobs[1]!.done;
+  assert.equal(harness.tasks.get(second)!.status, 'completed'); assert.equal(harness.tasks.get(second)!.result?.verifyOk, true);
+  assert.equal(await readFile(join(cwd, 'notes.txt'), 'utf8'), 'SQLite continued');
+  assert.equal(fakes.every(fake => fake.closed), true);
+  await assert.rejects(harness.run('coder_task', { resume_task_id: second, coder: 'claude', description: 'switch' }), /续接不能换工具/);
+});
+
+test('saved Gemini task history remains readable when current runtime settings cannot launch a coder', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-gemini-saved-history-')); t.after(() => rm(root, { recursive: true, force: true }));
+  const home = geminiLaunch(root).home, chats = join(home, '.gemini/tmp/project/chats'), sessionId = 'gemini-saved-history';
+  await mkdir(chats, { recursive: true });
+  const when = Date.now();
+  await writeFile(join(chats, `session-fixture-${sessionId.slice(0, 8)}.jsonl`), [
+    { sessionId, projectHash: createHash('sha256').update(geminiSessionWorkspace(home, root)).digest('hex') },
+    { id: 'saved-message', type: 'gemini', timestamp: new Date(when).toISOString(), content: 'saved process is still visible' },
+  ].map(record => JSON.stringify(record)).join('\n') + '\n');
+  const settings = { ...defaultSettings(), securityMode: 'strict' as const };
+  const manager = { load: async () => settings, current: () => settings, attach() {}, onConcurrencyChange: () => () => {},
+    sessionHomes: () => ({ codex: [], claude: [], gemini: [join(home, '.gemini')] }),
+    runtime: async () => { throw new Error('reading saved history must not require a runnable tool'); },
+  } as unknown as CodersManager;
+  const harness = coderHarness(undefined, root);
+  let rpc!: (method: string, payload: unknown) => Promise<unknown>;
+  await installCoders(harness.ctx, { roots: [root], manager, registerRpc: (_family, _methods, handle) => { rpc = handle; } });
+  const saved = task({ coder: 'gemini', coderSessionId: sessionId, cwd: root, status: 'completed', createdAt: when - 1000, updatedAt: when + 1000 });
+  harness.tasks.set(saved.id, saved);
+  const detail = await rpc('get', { id: saved.id }) as { transcript: { entries: { body: string }[] } };
+  assert.ok(detail.transcript.entries.some(entry => entry.body === 'saved process is still visible'));
+  assert.deepEqual((await rpc('get', { id: saved.id, brief: true }) as { transcript: { entries: unknown[] } }).transcript.entries, []);
+});
+
+test('Gemini transient recovery cleans the old process and bridge before loading its original session without repeating writes', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nexus-gemini-recovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cwd = join(root, 'project'); await mkdir(cwd);
+  await writeFile(join(cwd, 'check.cjs'), 'require("node:assert/strict").equal(require("node:fs").readFileSync("work.txt", "utf8"), "write once"); console.log("recovered work verified");');
+  const harness = coderHarness(questions => questions.map(question => ({ id: question.id, selected: ['允许'] })), cwd);
+  const fakes: ReturnType<typeof fakeGemini>[] = [], methods: string[] = []; let oldUrl = '', writes = 0, starts = 0, waits = 0;
+  await installCoders(harness.ctx, { roots: [cwd], defaultCoder: 'gemini', geminiLaunch: geminiLaunch(root), securityMode: 'standard', reviewPolicy: { ...DEFAULT_REVIEW_POLICY, commands: 'ask' },
+    spawnGemini: () => {
+      const attempt = ++starts; let connection: any;
+      if (attempt > 1) assert.equal(fakes[0]!.closed, true);
+      const fake = fakeGemini(async (message, io) => {
+        if (message.method) methods.push(message.method);
+        if (message.method === 'initialize') io.reply(message, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+        if (message.method === 'session/new' || message.method === 'session/load') {
+          connection = message.params;
+          if (attempt > 1) { assert.equal(message.method, 'session/load'); assert.equal(connection.sessionId, 'gemini-recovered'); }
+          else oldUrl = connection.mcpServers.find((server: any) => server.name === 'nexus_coder').url;
+          io.reply(message, attempt === 1 ? { sessionId: 'gemini-recovered' } : {});
+        }
+        if (message.method === 'session/prompt') {
+          const client = await geminiToolsClient(connection);
+          try {
+            if (attempt === 1) { writes++; await client.callTool({ name: 'write_file', arguments: { path: 'work.txt', content: 'write once' } }); }
+            else {
+              assert.match(message.params.prompt[0].text, /不要重复已成功/);
+              assert.match(JSON.stringify(await client.callTool({ name: 'read_file', arguments: { path: 'work.txt' } })), /write once/);
+              await client.callTool({ name: 'report_result', arguments: { status: 'completed', text: 'Original work recovered' } });
+            }
+          } finally { await client.close(); }
+          if (attempt === 1) io.push({ id: message.id, error: { message: 'ECONNRESET' } });
+          else io.reply(message, { stopReason: 'end_turn' });
+        }
+      });
+      fakes.push(fake); return fake.transport;
+    }, retryWait: async () => { waits++; assert.equal(starts, 1); assert.equal(fakes[0]!.closed, true); await assert.rejects(fetch(oldUrl)); },
+  });
+  const id = (await harness.run('coder_task', { description: 'Write work once', verify: 'node check.cjs', verify_network: 'ask', outputs: ['work.txt'] })).task_id!;
+  await harness.jobs[0]!.done;
+  const record = harness.tasks.get(id)!;
+  assert.equal(record.status, 'completed'); assert.equal(record.retry?.phase, 'recovered'); assert.equal(record.coderSessionId, 'gemini-recovered');
+  assert.equal(record.result?.verifyOk, true); assert.equal(writes, 1); assert.equal(starts, 2); assert.equal(waits, 1);
+  assert.deepEqual(methods.filter(method => ['session/new', 'session/load'].includes(method)), ['session/new', 'session/load']);
+  assert.equal(harness.jobs.length, 1); assert.equal(harness.tasks.size, 1);
+  assert.equal(fakes.every(fake => fake.closed), true);
 });
 
 

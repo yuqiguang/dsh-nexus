@@ -6,6 +6,7 @@ export const MANAGED_PACKAGES: Record<CoderKind, { name: string; version: string
   // 0.155.0-alpha and 0.155.0 fail to build the bubblewrap sandbox when Docker leaves `net:[…]` nsfs mounts in mountinfo (WSL, 2026-09-20); 0.155.1 handles them.
   codex: { name: '@openai/codex', version: '0.155.1' },
   claude: { name: '@anthropic-ai/claude-agent-sdk', version: '0.3.273' },
+  gemini: { name: '@google/gemini-cli', version: '0.71.1' },
 };
 
 /** Exact releases only: no tags, ranges, URLs, or build metadata (Codex adds a platform suffix). */

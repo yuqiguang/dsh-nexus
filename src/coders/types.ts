@@ -7,9 +7,9 @@ import type { ApprovalProvenance } from './approval-provenance.js';
 import type { AcceptanceCheck, ArtifactCheck } from './acceptance-checks.js';
 /** Coder-agnostic request, decision, and task shapes. Adapters normalize into these; the decider only sees these. */
 
-export type CoderKind = 'claude' | 'codex';
+export type CoderKind = 'claude' | 'codex' | 'gemini';
 
-export const CODER_NAMES: Record<CoderKind, string> = { claude: 'Claude Code', codex: 'Codex' };
+export const CODER_NAMES: Record<CoderKind, string> = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI' };
 
 export type CoderRequestKind = 'command' | 'file-write' | 'file-read' | 'network' | 'question' | 'other';
 

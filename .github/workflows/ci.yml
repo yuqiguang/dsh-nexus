@@ -42,4 +42,11 @@ jobs:
       # finish before `test` starts. See CONTRIBUTING.
       - run: npm run check
       - run: npm run build
+      - name: Prepare official Gemini CLI for local protocol checks
+        run: |
+          gemini_test_dir=$(mktemp -d "$RUNNER_TEMP/nexus-gemini-XXXXXX")
+          gemini_test_version=$(node --input-type=module -e 'import { MANAGED_PACKAGES } from "./dist/src/coders/install-shared.js"; console.log(MANAGED_PACKAGES.gemini.version)')
+          npm pack "@google/gemini-cli@$gemini_test_version" --ignore-scripts --pack-destination "$gemini_test_dir" --registry=https://registry.npmjs.org/
+          tar -xzf "$gemini_test_dir/google-gemini-cli-$gemini_test_version.tgz" -C "$gemini_test_dir"
+          echo "NEXUS_GEMINI_CLI=$gemini_test_dir/package/bundle/gemini.js" >> "$GITHUB_ENV"
       - run: npm test

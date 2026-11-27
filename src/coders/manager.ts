@@ -2,16 +2,18 @@ import type { CoderReviewPolicy } from './review-policy.js';
 import { requireWindowsFirewall } from './windows-firewall.js';
 import { taskStatusLabel } from './status.js';
 import { windowsSandbox, type WindowsSandboxStatus } from './windows-sandbox.js';
-import { access, constants, mkdir } from 'node:fs/promises';
+import { access, constants, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ChannelError } from '../channels/types.js';
-import { CODEX_KEY_ENV, CoderInstaller, codexConfigToml, detectClaude, detectCodex, ensureClaudeHome, writeCodexHome, type CoderDetection, type DetectOptions,
+import { CODEX_KEY_ENV, CoderInstaller, codexConfigToml, detectClaude, detectCodex, detectGemini, ensureClaudeHome, writeCodexHome, type CoderDetection, type DetectOptions,
   type InstallProgress, type InstallStatus, type ManagedLayout, platformPackage, probe } from './install.js';
-import { claudeLoginInstructions, type ClaudeLoginInstructions } from './login.js';
+import { claudeLoginInstructions, geminiLoginInstructions, type ClaudeLoginInstructions } from './login.js';
+import { GEMINI_STRICT_PROBLEM, type GeminiLaunch } from './gemini-config.js';
 import { describeRule } from './habits.js';
 import { CoderSettingsStore, coderConcurrency, redact, type CoderSettingsRecord, type CoderSettingsView, type CoderSource, type CoderSecurityMode } from './settings.js';
 import type { CoderStore } from './store.js';
 import type { CoderKind, HabitRule, TaskRecord } from './types.js';
+import { coderHomes, type CoderHomes } from './transcript.js';
 
 export interface CoderStatusView {
   windowsSandbox?: WindowsSandboxStatus | 'checking' | 'failed';
@@ -42,8 +44,11 @@ export interface CodersView {
   managedRoot: string;
   claudeHome: string;
   claudeLogin?: ClaudeLoginInstructions;
+  geminiHome: string;
+  geminiLogin?: ClaudeLoginInstructions;
   codex: CoderStatusView;
   claude: CoderStatusView;
+  gemini: CoderStatusView;
   install?: InstallProgress;
   rules: { id: string; source: HabitRule['source']; text: string }[];
   recentTasks: { id: string; coder: CoderKind; status: TaskRecord['status']; statusLabel?: string; description: string; updatedAt: number; cwd?: string; ownerSession?: string; objective?: string }[];
@@ -51,6 +56,7 @@ export interface CodersView {
 
 export type CodexRuntime = { command: string; env: NodeJS.ProcessEnv; source: CoderSource; model?: string };
 export type ClaudeRuntime = { sdkPath?: string; executable?: string; env: NodeJS.ProcessEnv; source: CoderSource; model?: string };
+export type GeminiRuntime = GeminiLaunch & { source: CoderSource };
 
 /** Everything the supervisor needs at dispatch time; `error` carries a user-facing reason a coder cannot run. */
 export interface EffectiveRuntime {
@@ -65,6 +71,8 @@ export interface EffectiveRuntime {
   defaultCoder: CoderKind;
   codex: CodexRuntime | { error: string };
   claude: ClaudeRuntime | { error: string };
+  /** Optional only for older embedded hosts that inject their own runtime. */
+  gemini?: GeminiRuntime | { error: string };
 }
 
 export interface ManagerDeps {
@@ -88,6 +96,7 @@ const SLOW_MS = 2_000;
 
 /** Do not advertise an installed tool as safe to dispatch before its isolation is supported. */
 export function coderPlatformProblem(coder: CoderKind, platform: NodeJS.Platform, securityMode: CoderSecurityMode = 'strict'): string | undefined {
+  if (coder === 'gemini' && securityMode === 'strict') return GEMINI_STRICT_PROBLEM;
   if (platform !== 'win32' || securityMode !== 'strict') return undefined;
   return coder === 'claude'
     ? 'Claude Code 可以安装，但其命令沙箱不支持原生 Windows。严格模式不能派发；可选择标准模式由 DSH 审核命令，或在 WSL2 / Linux 实例使用严格模式。'
@@ -140,14 +149,15 @@ export class CodersManager {
   }
   private settings?: CoderSettingsRecord;
   private readonly concurrencyListeners = new Set<(limit: number) => void>();
-  private detection?: { at: number; codex: CoderDetection; claude: CoderDetection };
-  private detecting?: Promise<{ codex: CoderDetection; claude: CoderDetection }>;
+  private detection?: { at: number; codex: CoderDetection; claude: CoderDetection; gemini: CoderDetection };
+  private detecting?: Promise<{ codex: CoderDetection; claude: CoderDetection; gemini: CoderDetection }>;
   private login?: { at: number; key: string; value: CoderLoginStatus };
   private loggingIn?: Promise<CoderLoginStatus>;
   private tasks?: CoderStore;
   /** config.toml content last written to the managed Codex home; rewritten only when the settings change it. */
   private codexToml?: string;
   private claudeHomeReady = false;
+  private geminiSettingsJson?: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly now: () => number;
 
@@ -161,6 +171,14 @@ export class CodersManager {
 
   /** Last loaded settings, for synchronous readers such as the prompt section. */
   current(): CoderSettingsRecord | undefined { return this.settings; }
+
+  /** Saved process history is available even when a tool is uninstalled, logged out or unsupported in the new mode. */
+  sessionHomes(): CoderHomes {
+    const homes = coderHomes({ codex: this.env, claude: this.env, gemini: this.env });
+    const unique = (values: string[]) => [...new Set(values)];
+    return { codex: unique([this.deps.layout.codexHome, ...homes.codex]), claude: unique([this.deps.layout.claudeHome, ...homes.claude]),
+      gemini: unique([join(this.deps.layout.geminiHome, '.gemini'), ...(homes.gemini ?? [])]) };
+  }
 
   busyWithInstallation(): boolean { return !!this.deps.installer.installing() || this.settingUpSandbox; }
 
@@ -187,18 +205,19 @@ export class CodersManager {
    * gets the cached result at once and only the first request ever waits; a
    * stale cache is refreshed in the background, one refresh at a time.
    */
-  private async detected(force = false): Promise<{ codex: CoderDetection; claude: CoderDetection }> {
+  private async detected(force = false): Promise<{ codex: CoderDetection; claude: CoderDetection; gemini: CoderDetection }> {
     const fresh = this.detection && this.now() - this.detection.at < DETECT_TTL_MS;
     if (this.detection && (fresh && !force)) return this.detection;
     const refresh = this.detecting ??= (async () => {
       await Promise.resolve();
       const options = { env: this.env, ...this.deps.detect };
       try {
-        const [codex, claude] = await Promise.all([
+        const [codex, claude, gemini] = await Promise.all([
           timed('detect codex', () => detectCodex(this.deps.layout, options)),
           timed('detect claude', () => detectClaude(this.deps.layout, options)),
+          timed('detect gemini', () => detectGemini(this.deps.layout, options)),
         ]);
-        this.detection = { at: this.now(), codex, claude };
+        this.detection = { at: this.now(), codex, claude, gemini };
         return this.detection;
       } finally { this.detecting = undefined; }
     })();
@@ -217,6 +236,33 @@ export class CodersManager {
     if (this.claudeHomeReady) return;
     await ensureClaudeHome(this.deps.layout);
     this.claudeHomeReady = true;
+  }
+
+  private geminiKey(settings: CoderSettingsRecord, source: CoderSource): string {
+    return settings.gemini.apiKey || (source === 'system' ? this.env.GEMINI_API_KEY || this.env.GOOGLE_API_KEY || '' : '');
+  }
+
+  private async ensureGeminiHome(settings: CoderSettingsRecord, source: CoderSource = settings.gemini.source): Promise<void> {
+    const auth = settings.gemini.baseUrl ? 'gateway' : this.geminiKey(settings, source) ? 'gemini-api-key' : 'oauth-personal';
+    const json = JSON.stringify({ security: { auth: { selectedType: auth } }, advanced: { autoConfigureMemory: false, ignoreLocalEnv: true } });
+    if (this.geminiSettingsJson === json) return;
+    await mkdir(join(this.deps.layout.geminiHome, '.gemini'), { recursive: true, mode: 0o700 });
+    await writeFile(join(this.deps.layout.geminiHome, '.gemini', 'settings.json'), json, { mode: 0o600 });
+    this.geminiSettingsJson = json;
+  }
+
+  private geminiEnv(settings: CoderSettingsRecord, source: CoderSource): NodeJS.ProcessEnv {
+    const key = this.geminiKey(settings, source);
+    return { ...Object.fromEntries(Object.entries(this.env).filter(([name]) => !/^GEMINI_|^GOOGLE_(?:API_KEY|GEMINI_BASE_URL)$/i.test(name))),
+      GEMINI_CLI_HOME: this.deps.layout.geminiHome, ...(key ? { GEMINI_API_KEY: key } : {}),
+      ...(settings.gemini.baseUrl ? { GOOGLE_GEMINI_BASE_URL: settings.gemini.baseUrl } : {}) };
+  }
+
+  private geminiLogin(detection: CoderDetection, source: CoderSource | 'none'): ClaudeLoginInstructions | undefined {
+    if (source === 'none' || !detection[source].path) return undefined;
+    const path = detection[source].path!;
+    return geminiLoginInstructions(this.deps.detect?.host?.platform ?? process.platform, this.deps.layout.geminiHome,
+      /\.m?js$/i.test(path) ? process.execPath : path, /\.m?js$/i.test(path) ? [path] : []);
   }
 
   private effectiveRoots(settings: CoderSettingsRecord): string[] {
@@ -298,7 +344,23 @@ export class CodersManager {
         ...(claudePick.active === 'system' && detection.claude.system.executable ? { executable: detection.claude.system.executable } : {}),
         env: this.claudeEnv(settings), source: claudePick.active, ...(settings.claude.model ? { model: settings.claude.model } : {}) };
     }
-    return { securityMode, reviewPolicy: settings.reviewPolicy, roots, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: settings.allowedNetworkDomains, codex, claude };
+    const geminiPick = this.pick('gemini', settings.gemini.source, detection.gemini);
+    let gemini: NonNullable<EffectiveRuntime['gemini']>;
+    if (geminiPick.active === 'none') gemini = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。' : 'Gemini CLI 尚未安装，请在编码工具设置中安装，或在本机安装 gemini 命令。' };
+    else if (coderPlatformProblem('gemini', platform, securityMode)) gemini = { error: GEMINI_STRICT_PROBLEM };
+    else {
+      await this.ensureGeminiHome(settings, geminiPick.active);
+      const key = this.geminiKey(settings, geminiPick.active);
+      const oauth = await access(join(this.deps.layout.geminiHome, '.gemini', 'oauth_creds.json'), constants.R_OK).then(() => true, () => false);
+      if (!key && (!oauth || settings.gemini.baseUrl)) gemini = { error: 'Gemini CLI 还没有凭据，请填写 Gemini API key，或按设置页指引在 Nexus 专用目录登录 Google。网关需要 API key。' };
+      else {
+        const path = detection.gemini[geminiPick.active].path!;
+        gemini = { command: /\.m?js$/i.test(path) ? process.execPath : path, ...(/\.m?js$/i.test(path) ? { args: [path] } : {}),
+          env: this.geminiEnv(settings, geminiPick.active), home: this.deps.layout.geminiHome, source: geminiPick.active,
+          authMethod: settings.gemini.baseUrl ? 'gateway' : key ? 'gemini-api-key' : 'oauth-personal', ...(settings.gemini.model ? { model: settings.gemini.model } : {}) };
+      }
+    }
+    return { securityMode, reviewPolicy: settings.reviewPolicy, roots, defaultCoder: settings.defaultCoder, maxTaskMinutes: settings.maxTaskMinutes ?? 60, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: settings.allowedNetworkDomains, codex, claude, gemini };
   }
 
   private lastTask(coder: CoderKind): CoderStatusView['lastTask'] {
@@ -332,7 +394,8 @@ export class CodersManager {
     const runtime = await timed('resolve runtime', () => this.runtime());
     const codexPick = this.pick('codex', settings.codex.source, detection.codex);
     const claudePick = this.pick('claude', settings.claude.source, detection.claude);
-    const status = (kind: CoderKind, pick: ReturnType<CodersManager['pick']>, detected: CoderDetection, resolved: EffectiveRuntime['codex' | 'claude']): CoderStatusView => ({
+    const geminiPick = this.pick('gemini', settings.gemini.source, detection.gemini);
+    const status = (kind: CoderKind, pick: ReturnType<CodersManager['pick']>, detected: CoderDetection, resolved: NonNullable<EffectiveRuntime['codex' | 'claude' | 'gemini']>): CoderStatusView => ({
       managed: detected.managed, system: detected.system, active: pick.active, fallback: pick.fallback,
       ...(coderPlatformProblem(kind, this.deps.detect?.host?.platform ?? process.platform, settings.securityMode ?? 'standard') ? { platformProblem: coderPlatformProblem(kind, this.deps.detect?.host?.platform ?? process.platform, settings.securityMode ?? 'standard') } : {}),
       ready: !('error' in resolved), ...('error' in resolved ? { problem: resolved.error } : {}),
@@ -347,13 +410,19 @@ export class CodersManager {
     claude.credentialState = settings.claude.token || claudeOauth ? 'configured' : 'missing';
     claude.login = settings.claude.token ? `使用设置里的 token${settings.claude.baseUrl ? `，端点 ${settings.claude.baseUrl}` : '，官方端点'}`
       : claudeOauth ? 'OAuth 登录（Nexus 专用配置目录）' : '未配置凭据';
+    const gemini = status('gemini', geminiPick, detection.gemini, runtime.gemini!);
+    const geminiOauth = await access(join(this.deps.layout.geminiHome, '.gemini', 'oauth_creds.json'), constants.R_OK).then(() => true, () => false);
+    const geminiKey = this.geminiKey(settings, geminiPick.active === 'system' ? 'system' : 'managed');
+    gemini.credentialState = geminiKey || geminiOauth && !settings.gemini.baseUrl ? 'configured' : 'missing';
+    gemini.login = geminiKey ? `使用 Gemini API key${settings.gemini.baseUrl ? `，网关 ${settings.gemini.baseUrl}` : '，官方端点'}` : geminiOauth ? 'Google OAuth（Nexus 专用配置目录）' : '未配置凭据';
     const progress = this.deps.installer.progress();
     return {
       platform: this.deps.detect?.host?.platform ?? process.platform,
       settings: redact(settings), profileRoots: [...this.deps.profileRoots], effectiveRoots: runtime.roots,
       restrictRoots: !!settings.roots?.length || this.deps.restrictRoots === true,
-      managedRoot: this.deps.layout.root, claudeHome: this.deps.layout.claudeHome, codex, claude,
+      managedRoot: this.deps.layout.root, claudeHome: this.deps.layout.claudeHome, geminiHome: this.deps.layout.geminiHome, codex, claude, gemini,
       claudeLogin: this.claudeLogin(detection.claude, claudePick.active),
+      geminiLogin: this.geminiLogin(detection.gemini, geminiPick.active),
       ...(progress ? { install: progress } : {}),
       rules: (this.tasks?.rules() ?? []).map(rule => ({ id: rule.id, source: rule.source, text: describeRule(rule) })),
       recentTasks: (this.tasks?.list() ?? []).slice(0, 10).map(task => ({ id: task.id, coder: task.coder, status: task.status, statusLabel: taskStatusLabel(task),
@@ -380,12 +449,12 @@ export class CodersManager {
       this.login = undefined;
     } else if (method === 'clear-secret') {
       const coder = input.coder;
-      if (coder !== 'codex' && coder !== 'claude') throw new ChannelError('invalid_configuration');
+      if (coder !== 'codex' && coder !== 'claude' && coder !== 'gemini') throw new ChannelError('invalid_configuration');
       this.settings = await this.deps.store.clearSecret(input.revision as number, coder);
       this.login = undefined;
     } else if (method === 'install') {
       const coder = input.coder;
-      if (coder !== 'codex' && coder !== 'claude') throw new ChannelError('invalid_configuration');
+      if (coder !== 'codex' && coder !== 'claude' && coder !== 'gemini') throw new ChannelError('invalid_configuration');
       if (!Number.isSafeInteger(input.revision) || (input.revision as number) < 0) throw new ChannelError('invalid_revision');
       const settings = await this.load();
       if (input.revision !== settings.revision) throw new ChannelError('configuration_changed');
@@ -423,6 +492,7 @@ export class CodersManager {
     this.detection = undefined;
     const settings = this.settings ?? await this.load();
     if (coder === 'codex') { this.codexToml = undefined; await this.ensureCodexHome(settings); }
-    else await this.ensureClaudeHome();
+    else if (coder === 'claude') await this.ensureClaudeHome();
+    else await this.ensureGeminiHome(settings);
   }
 }

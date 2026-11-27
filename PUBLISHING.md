@@ -2,7 +2,7 @@
 
 本仓库是公开源码目录。产品名为 **Nexus 个人编码助理 / Nexus for DSH**，GitHub 仓库为 `yuqiguang/dsh-nexus`，npm 包标识为 `dsh-nexus`。旧包 `nexus-next` 的迁移方式见 [RENAME.md](RENAME.md)。组件 ID 和数据存储标识保持不变。
 
-公开发行包从 0.2.41 起同时通过 npm 和 GitHub Release 分发。`publishConfig` 固定 npm 官方源、公开访问和正式版 `latest` 标签；只从经过检查的公开源码目录发布。私有开发目录继续保留 `private: true`，不从那里发布 npm 包。
+公开发行包从 0.2.41 起提供 npm 和 GitHub Release 两种分发方式。**0.2.71 按发布要求仅更新 GitHub Release 与固定安装入口，暂不发布 npm，也不移动 npm dist-tag。** 后续是否发布 npm 由该次发布要求决定。`publishConfig` 固定 npm 官方源、公开访问和正式版 `latest` 标签；只从经过检查的公开源码目录发布。私有开发目录继续保留 `private: true`，不从那里发布 npm 包。
 
 ## 验证和打包
 

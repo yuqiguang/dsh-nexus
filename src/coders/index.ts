@@ -49,6 +49,9 @@ import { ChannelError } from '../channels/types.js';
 import { loadClaudeQuery, runClaudeTask, type ClaudeQuery } from './claude.js';
 import { runCodexTask, type CodexHooks, type CodexSpawn } from './codex.js';
 import type { CodersManager, EffectiveRuntime } from './manager.js';
+import { runGeminiTask } from './gemini.js';
+import type { GeminiSpawn } from './gemini-process.js';
+import type { GeminiLaunch } from './gemini-config.js';
 import { decideLayers } from './decide.js';
 import { escalateToUser } from './escalate.js';
 import { DECISION_LABEL, HABIT_KINDS, KIND_LABEL, describeRule, isOpaque, projectRules, tokens } from './habits.js';
@@ -102,6 +105,9 @@ export interface CodersConfig {
   query?: ClaudeQuery;
   /** Test seam: replaces spawning `codex app-server`. */
   spawnCodex?: CodexSpawn;
+  /** Embedded-host/test launch; normal installations resolve Gemini through the manager. */
+  geminiLaunch?: GeminiLaunch;
+  spawnGemini?: GeminiSpawn;
   /** Pushes to the chat that dispatched a task without waiting for the user to write first. */
   notifier?: ChannelNotifier;
   /** Registers the `/api/nexus-coder-tasks/*` routes the task panel reads; the plugin passes its authenticated RPC carrier. */
@@ -316,7 +322,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
   });
   /** Roots and default coder as configured right now; settings from the page win over the profile. */
   const runtime = async (mode?: CoderSecurityMode): Promise<EffectiveRuntime> => config.manager ? config.manager.runtime(mode)
-    : { reviewPolicy: config.reviewPolicy, securityMode: mode ?? config.securityMode ?? 'standard', roots: fallbackRoots, defaultCoder: config.defaultCoder ?? 'codex', codex: { command: 'codex', env: process.env, source: 'system' }, claude: { env: { ...process.env, DISABLE_AUTOUPDATER: '1' }, source: 'system' } };
+    : { reviewPolicy: config.reviewPolicy, securityMode: mode ?? config.securityMode ?? 'standard', roots: fallbackRoots, defaultCoder: config.defaultCoder ?? 'codex', codex: { command: 'codex', env: process.env, source: 'system' }, claude: { env: { ...process.env, DISABLE_AUTOUPDATER: '1' }, source: 'system' }, gemini: config.geminiLaunch ? { ...config.geminiLaunch, source: 'system' } : { error: 'Gemini CLI 需要在编码工具设置中完成安装和凭据配置。' } };
   const currentRoots = (): string[] => {
     const settings = config.manager?.current();
     return settings?.roots?.length ? settings.roots : fallbackRoots;
@@ -717,7 +723,8 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
     };
     const codex = 'error' in effective.codex ? undefined : effective.codex;
     const claude = 'error' in effective.claude ? undefined : effective.claude;
-    const executionEnv = (task.coder === 'codex' ? codex : claude)?.env ?? process.env;
+    const gemini = effective.gemini && !('error' in effective.gemini) ? effective.gemini : undefined;
+    const executionEnv = (task.coder === 'codex' ? codex : task.coder === 'gemini' ? gemini : claude)?.env ?? process.env;
     const authorizeCheck = async (argv: string[], command: string): Promise<string[]> => {
       const windows = process.platform === 'win32';
       // Explicit offline/loopback verification retains its requested confinement, even in full mode.
@@ -732,7 +739,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         if (!codex || await windowsSandbox(codex, task.cwd) !== 'ready') throw new Error('Windows 增强沙箱未就绪，验证未执行。');
         if (task.verifyNetwork !== 'ask') await requireWindowsFirewall();
       }
-      if (windows && !nativeCodex && !supervised) throw new Error('Windows Claude 独立验证不能强制断网；请为标准模式验证显式申请联网，或使用 Linux / WSL2。');
+      if (windows && !nativeCodex && !supervised) throw new Error(`Windows ${CODER_NAMES[task.coder]} 独立验证不能强制断网；请为标准模式验证显式申请联网，或使用 Linux / WSL2。`);
       if (task.verifyNetwork === 'ask') {
         const reviewCommand = await verificationReviewCommand(command, argv, effective.runtimeExecutables);
         const decision = await decide(task.id, { kind: 'command', tool: 'verify.command', command: reviewCommand,
@@ -801,8 +808,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
               const codexHooks = task.coder === 'codex' ? runCodexTask(continued, { instructions, continuation: attempt > 0, ...shared, research,
                 ...(config.spawnCodex ? { spawn: config.spawnCodex } : {}),
                 ...(codex ? { launch: { command: codex.command, env: codex.env }, ...(codex.model ? { model: codex.model } : {}) } : {}) }) : undefined;
-              runner = codexHooks ?? runClaudeTask(continued, { instructions, continuation: attempt > 0, ...shared, research, query: query!, ...(claude ? { env: claude.env,
-                ...(claude.model ? { model: claude.model } : {}), ...(claude.executable ? { executable: claude.executable } : {}) } : {}) });
+              runner = codexHooks ?? (task.coder === 'gemini'
+                ? runGeminiTask(continued, { instructions, continuation: attempt > 0, ...shared, research, launch: gemini!, ...(config.spawnGemini ? { spawn: config.spawnGemini } : {}) })
+                : runClaudeTask(continued, { instructions, continuation: attempt > 0, ...shared, research, query: query!, ...(claude ? { env: claude.env,
+                  ...(claude.model ? { model: claude.model } : {}), ...(claude.executable ? { executable: claude.executable } : {}) } : {}) }));
               liveOf.set(task.id, { record: text => activity.record(text), ...(codexHooks ? { steer: codexHooks.steer } : {}) });
               return { cancel: reason => runner?.cancel(reason), done: runner.done.finally(() => { liveOf.delete(task.id); }) };
             },
@@ -918,9 +927,9 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_task',
-    description: '将需深入调查、跨模块协调或持续执行的完整编码工作交给 Codex 或 Claude Code，在原生后台 job 中执行；用户指定编码工具、后台跟进或宿主独立验收时也使用。范围明确、低风险且当前会话工具可短步骤完成并验证的局部改动直接处理，遵循当前会话权限与审批；相关已有任务优先插话或续接，不与活动任务同时修改同一工作树。派发后报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。同一工作树串行，独立工作区按设置并行，依赖须成功且独立验证通过。工具自身重试后，短暂网络故障最多自动续接原会话两次、限流最多四次（间隔递增至 2 分钟）；模型服务拒绝请求（如 400）不要原样重试，先缩短说明或检查配置；额度、认证失败或等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。结束后用 resume_task_id 续接，失败恢复用 retry_task_id，仅复验用 verification_only。',
+    description: '将需深入调查、跨模块协调或持续执行的完整编码工作交给 Codex、Claude Code 或 Gemini CLI，在原生后台 job 中执行；用户指定编码工具、后台跟进或宿主独立验收时也使用。范围明确、低风险且当前会话工具可短步骤完成并验证的局部改动直接处理，遵循当前会话权限与审批；相关已有任务优先插话或续接，不与活动任务同时修改同一工作树。派发后报告受理状态，完成通知后读 job_output。权限和预算取自设置并固定，续接不扩大；完全权限关闭执行审批，其他模式按具体操作审核。Gemini 支持标准和完全权限，尚不支持严格沙箱或运行中插话。同一工作树串行，独立工作区按设置并行，依赖须成功且独立验证通过。工具自身重试后，短暂网络故障最多自动续接原会话两次、限流最多四次（间隔递增至 2 分钟）；模型服务拒绝请求（如 400）不要原样重试，先缩短说明或检查配置；额度、认证失败或等待用户超时则暂停，不重新派发绕过限制。重启不自动重放。结束后用 resume_task_id 续接，失败恢复用 retry_task_id，仅复验用 verification_only。',
     parameters: {
-      coder: { type: 'string', enum: ['codex', 'claude'], description: '执行任务的工具：codex 或 claude（Claude Code）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
+      coder: { type: 'string', enum: ['codex', 'claude', 'gemini'], description: '执行任务的工具：codex、claude（Claude Code）或 gemini（Gemini CLI）。省略时用设置里的默认工具；续接时沿用原任务的工具。' },
       description: { type: 'string', description: '无计划的新任务必填完整说明。有 plan_step 时省略，系统采用已保存的步骤说明；续接补充内容用 continuation，不重复抄写或修改计划。' },
       continuation: { type: 'string', description: '仅续接或重试时使用，说明剩余工作和停止原因的处理；保留原计划、约束和验收，不代表修改目标或扩大权限。' },
       preflight: { type: 'string', description: '可选的执行前环境自检命令，使用已有脚本；在同样审批和沙箱中运行。失败时不启动编码工具，不代替最终 verify。计划任务从步骤自动取得。' },
@@ -932,7 +941,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       acceptance_checks: acceptanceChecksParameter,
       outputs: { type: 'array', items: { type: 'string' }, description: '声明预期交付文件（最多 100 个，相对任务 cwd）；结束后核验存在性和内容身份。续接保留既有声明；不会凭文件名自动发送文件。' },
       depends_on: { type: 'array', items: { type: 'string' }, description: '前置任务 ID 列表（最多 10 个，必须已派发且属于同一聊天会话，含该会话更早的各代）。全部执行成功且独立验证通过才启动；失败、取消、中断或未验证都会阻止本任务。等待依赖不占执行名额。续接默认沿用原依赖；修复前置任务后须填新的任务 ID。' },
-      verification_only: { type: 'boolean', description: '仅对已完成编码的原任务重新运行监工独立验证，不启动 Codex/Claude。须带 retry_task_id 或 resume_task_id；核实 verify_cwd，并用 verify_commands 登记所有需要的检查。原权限、工作区和审批边界不变。' },
+      verification_only: { type: 'boolean', description: '仅对已完成编码的原任务重新运行监工独立验证，不启动编码工具。须带 retry_task_id 或 resume_task_id；核实 verify_cwd，并用 verify_commands 登记所有需要的检查。原权限、工作区和审批边界不变。' },
       retry_task_id: { type: 'string', description: '失败、取消或中断后的最新任务 ID；显式重试同一步骤。保留权限边界，有原生会话则续接，没有则重新启动。与 resume_task_id 互斥；不能重做已验证通过的步骤。' },
       resume_task_id: { type: 'string', description: '要续接的任务 ID（ct-xxxx），它必须已经停下、结束或因重启中断。用于用户叫停后要调整方向，或结束后要接着改：在原任务的编码工具会话里继续，而不是从头开始。' },
       verify_commands: { type: 'array', items: { type: 'string' }, description: '完整的独立验证命令列表（1 到 10 条），按顺序执行，每条单独审核，任一失败则停止；与 verify 二选一。覆盖验收所需的语法、逻辑和集成测试。' },
@@ -1006,9 +1015,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         if (sameVersion && previous.brief!.acceptance.some(item => !brief!.acceptance.some(next => next.id === item.id))) throw new Error('续接不能缩小本版本的验收范围；要求变化请先修改说明单。');
         const dependsOn = dependencyIds(planned ? [...planned.dependsOn, ...(args.depends_on ?? previous?.dependsOn?.filter(id => { const prior = store.get(id); return !args.retry_task_id || prior?.brief?.id !== briefId || prior?.brief?.revision !== brief?.revision || !planned.step.depends_on.includes(prior?.planStep ?? ''); }) ?? [])] : args.depends_on ?? previous?.dependsOn ?? [], exec.agent.id, id => store.get(id));
         if (dependsOn.some(id => isActive(store.get(id)!) && !completions.has(id))) throw new Error('前置任务尚未受理完成，请稍后重试。');
-        const coder: CoderKind = previous ? previous.coder : args.coder === 'claude' || args.coder === 'codex' ? args.coder : effective.defaultCoder;
+        const coder: CoderKind = previous ? previous.coder : args.coder === 'claude' || args.coder === 'codex' || args.coder === 'gemini' ? args.coder : effective.defaultCoder;
         if (previous && (previous.permissions?.securityMode ?? 'strict') !== effective.securityMode) effective = await runtime(previous.permissions?.securityMode ?? 'strict');
         const chosen = effective[coder];
+        if (!chosen) throw new Error(`${CODER_NAMES[coder]} 尚未配置。`);
         if ('error' in chosen) throw new Error(chosen.error);
         const prepared = await loadCoderRuntime(ctx, exec, chosen.env);
         effective = { ...effective, runtimeExecutables: prepared.executables, [coder]: { ...chosen, env: prepared.env } };
@@ -1122,7 +1132,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_steer',
-    description: '在 Codex 任务运行中补充执行细节，不改变已保存目标、约束和验收；关联说明单的实质变更必须先 coder_brief impact/amend，不能用本工具绕过版本。转交补充时不停下任务：默认并入当前这一回合，Codex 下一步就会看到；interrupt 为 true 时先打断正在做的事（包括正在跑的命令），再以这段话开始下一回合，上下文都保留。先区分执行细节与目标变更。Claude Code 任务不支持，改用 job_kill 停下再用 coder_task 带 resume_task_id 续接。',
+    description: '在 Codex 任务运行中补充执行细节，不改变已保存目标、约束和验收；关联说明单的实质变更必须先 coder_brief impact/amend，不能用本工具绕过版本。转交补充时不停下任务：默认并入当前这一回合，Codex 下一步就会看到；等待结构化澄清回答时按顺序暂存补充，用户回答后进入下一回合。interrupt 为 true 时先打断正在做的事（包括正在跑的命令），再以这段话开始下一回合，上下文都保留。先区分执行细节与目标变更。Claude Code 和 Gemini CLI 任务不支持，改用 job_kill 停下再用 coder_task 带 resume_task_id 续接。',
     parameters: {
       message: { type: 'string', required: true, description: '转给编码工具的话，写清楚要改什么，按用户原意，不要扩大。' },
       task_id: { type: 'string', description: '任务 ID；省略时仅在当前会话恰有一个可插话的 Codex 任务时自动选择；历史任务须明确指定 ID。' },
@@ -1142,7 +1152,7 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
       const task = args.task_id ? store.get(args.task_id) : candidates[0];
       if (!task || !sameChat(task.ownerSession, exec.agent.id)) throw new Error(args.task_id ? `没有编码任务 ${args.task_id}。` : '现在没有运行中的编码任务。');
       if (task.status === 'queued') throw new Error('任务仍在排队；要修改任务说明，请先用 job_kill 取消，再重新派发。');
-      if (task.coder === 'claude') throw new Error('Claude Code 任务不支持运行中插话。用 job_kill 停下，再用 coder_task 带 resume_task_id 续接，Claude Code 会接着原来的会话。');
+      if (task.coder !== 'codex') throw new Error(`${CODER_NAMES[task.coder]} 任务不支持运行中插话。用 job_kill 停下，再用 coder_task 带 resume_task_id 续接，${CODER_NAMES[task.coder]} 会接着原来的会话。`);
       const live = liveOf.get(task.id);
       if (!live?.steer || task.status === 'verifying' || !isActive(task)) throw new Error(`任务 ${task.id} 现在是“${STATUS_LABEL[task.status]}”，编码工具已经停下。要接着改，用 coder_task 带 resume_task_id 续接。`);
       const interrupt = args.interrupt === true;
@@ -1247,8 +1257,10 @@ export async function installCoders(ctx: Context, config: CodersConfig): Promise
         goal = { id: current.id, revision: current.revision, report: deliveryReport(current, store.list()), recovery: recoveryReport(current, store.list(), true) };
       } catch { /* No goal evidence to present. */ }
     }
-    const effective = brief === true ? undefined : await runtime();
-    const homes = !effective ? { codex: [], claude: [] } : coderHomes({ ...('error' in effective.codex ? {} : { codex: effective.codex.env }), ...('error' in effective.claude ? {} : { claude: effective.claude.env }) });
+    const savedHomes = brief === true ? undefined : config.manager?.sessionHomes?.();
+    const effective = brief === true || savedHomes ? undefined : await runtime(task.permissions?.securityMode);
+    const homes = savedHomes ?? (!effective ? { codex: [], claude: [], gemini: [] } : coderHomes({ ...('error' in effective.codex ? {} : { codex: effective.codex.env }), ...('error' in effective.claude ? {} : { claude: effective.claude.env }),
+      ...(effective.gemini && !('error' in effective.gemini) ? { gemini: effective.gemini.env } : {}) }));
     return {
       ...(task.status === 'waiting-user' ? { channelWarning: config.notifier?.interactionWarning?.(task.ownerSession) } : {}),
       id: task.id, ownerSession: task.ownerSession, ...(goal ? { goal } : {}), coder: task.coder, coderName: CODER_NAMES[task.coder], status: task.status, statusLabel: taskStatusLabel(task), active: isActive(task),

@@ -4,6 +4,7 @@ import type { InstallProgress, InstallStatus } from '../coders/install.js';
 import { MANAGED_PACKAGES, isManagedVersion } from '../coders/install-shared.js';
 import { explain } from './ChannelSettings.js';
 import { DEFAULT_REVIEW_POLICY, type CoderReviewPolicy } from '../coders/review-policy.js';
+import { CODER_NAMES, type CoderKind } from '../coders/types.js';
 
 export interface CoderNavigation { openTask(id: string): void }
 
@@ -24,7 +25,7 @@ export const coderApi: CoderApi = async (method, payload = {}, signal) => {
 };
 
 type Action = (method: string, payload?: unknown) => Promise<boolean>;
-const names = { codex: 'Codex', claude: 'Claude Code' };
+const names = CODER_NAMES;
 const sources = { managed: 'Nexus 托管', system: '系统安装', none: '未安装' };
 const taskStatus: Record<string, string> = { queued: '排队中', running: '运行中', 'waiting-user': '等待回答', verifying: '验证中',
   completed: '已完成', failed: '失败', cancelled: '已取消', interrupted: '已中断' };
@@ -35,21 +36,23 @@ const problems: Record<string, string> = { binary_missing: '缺少可执行文�
 interface VersionDraft { managedVersion: string; versionChoice: 'recommended' | 'custom' }
 
 interface Draft {
-  revision: number; defaultCoder: 'codex' | 'claude'; roots: string; maxTaskMinutes: number; maxConcurrent: number; autoApproveSafe: boolean; securityMode: 'standard' | 'strict' | 'full'; allowedNetworkDomains: string;
+  revision: number; defaultCoder: CoderKind; roots: string; maxTaskMinutes: number; maxConcurrent: number; autoApproveSafe: boolean; securityMode: 'standard' | 'strict' | 'full'; allowedNetworkDomains: string;
   reviewPolicy: CoderReviewPolicy;
   codex: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; wireApi: 'responses' | 'chat'; apiKey: string };
   claude: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; authHeader: 'auth-token' | 'api-key'; token: string };
+  gemini: VersionDraft & { source: 'managed' | 'system'; model: string; baseUrl: string; apiKey: string };
 }
 
 function fromView(view: CodersView): Draft {
   const { settings } = view;
   return { reviewPolicy: { ...DEFAULT_REVIEW_POLICY, ...settings.reviewPolicy }, securityMode: settings.securityMode ?? 'standard', revision: settings.revision, defaultCoder: settings.defaultCoder, roots: (settings.roots ?? []).join('\n'), maxTaskMinutes: settings.maxTaskMinutes ?? 60, maxConcurrent: settings.maxConcurrent ?? 2, autoApproveSafe: settings.autoApproveSafe ?? true, allowedNetworkDomains: (settings.allowedNetworkDomains ?? ['registry.npmjs.org']).join('\n'),
     codex: { managedVersion: settings.codex.managedVersion ?? '', versionChoice: settings.codex.managedVersion ? 'custom' : 'recommended', source: settings.codex.source, model: settings.codex.model ?? '', baseUrl: settings.codex.baseUrl ?? '', wireApi: settings.codex.wireApi ?? 'responses', apiKey: '' },
-    claude: { managedVersion: settings.claude.managedVersion ?? '', versionChoice: settings.claude.managedVersion ? 'custom' : 'recommended', source: settings.claude.source, model: settings.claude.model ?? '', baseUrl: settings.claude.baseUrl ?? '', authHeader: settings.claude.authHeader, token: '' } };
+    claude: { managedVersion: settings.claude.managedVersion ?? '', versionChoice: settings.claude.managedVersion ? 'custom' : 'recommended', source: settings.claude.source, model: settings.claude.model ?? '', baseUrl: settings.claude.baseUrl ?? '', authHeader: settings.claude.authHeader, token: '' },
+    gemini: { managedVersion: settings.gemini.managedVersion ?? '', versionChoice: settings.gemini.managedVersion ? 'custom' : 'recommended', source: settings.gemini.source, model: settings.gemini.model ?? '', baseUrl: settings.gemini.baseUrl ?? '', apiKey: '' } };
 }
 
 function ManagedVersion({ coder, value, disabled, change }: {
-  coder: 'codex' | 'claude'; value: VersionDraft; disabled: boolean; change(value: VersionDraft): void;
+  coder: CoderKind; value: VersionDraft; disabled: boolean; change(value: VersionDraft): void;
 }) {
   const recommended = MANAGED_PACKAGES[coder].version;
   const custom = value.versionChoice === 'custom';
@@ -171,8 +174,8 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [readError, setReadError] = useState<string>();
-  const [startingInstall, setStartingInstall] = useState<'codex' | 'claude'>();
-  const [installRequestFailed, setInstallRequestFailed] = useState<{ coder: 'codex' | 'claude'; previousStart?: number }>();
+  const [startingInstall, setStartingInstall] = useState<CoderKind>();
+  const [installRequestFailed, setInstallRequestFailed] = useState<{ coder: CoderKind; previousStart?: number }>();
   const generation = useRef(0);
   const writing = useRef(false);
   useEffect(() => {
@@ -207,30 +210,31 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
     return <section className="nexus-channel-settings" aria-label="编码工具"><h2>编码工具</h2>
       {readError ? <p role="alert" className="nexus-channel-error">{readError}</p> : <p role="status">正在读取编码工具设置…</p>}</section>;
   }
-  const invalidVersion = [draft.codex, draft.claude].some(value => value.versionChoice === 'custom' && !isManagedVersion(value.managedVersion.trim()));
+  const invalidVersion = [draft.codex, draft.claude, draft.gemini].some(value => value.versionChoice === 'custom' && !isManagedVersion(value.managedVersion.trim()));
   const stale = dirty && draft.revision !== view.settings.revision;
   const edit = (change: (draft: Draft) => Draft) => { setDirty(true); setDraft(previous => previous && change(previous)); };
   const reload = () => { setDraft(fromView(view)); setDirty(false); };
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (invalidVersion || stale) return;
-    const { codex, claude } = draft;
+    const { codex, claude, gemini } = draft;
     if (await action('save', { revision: draft.revision, config: { defaultCoder: draft.defaultCoder, securityMode: draft.securityMode, reviewPolicy: draft.reviewPolicy, roots: draft.roots, maxTaskMinutes: draft.maxTaskMinutes, maxConcurrent: draft.maxConcurrent, autoApproveSafe: draft.autoApproveSafe, allowedNetworkDomains: draft.allowedNetworkDomains,
       codex: { managedVersion: codex.versionChoice === 'custom' ? codex.managedVersion.trim() : '', source: codex.source, model: codex.model, baseUrl: codex.baseUrl, wireApi: codex.wireApi, ...(codex.apiKey ? { apiKey: codex.apiKey } : {}) },
-      claude: { managedVersion: claude.versionChoice === 'custom' ? claude.managedVersion.trim() : '', source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) } } })) setDirty(false);
+      claude: { managedVersion: claude.versionChoice === 'custom' ? claude.managedVersion.trim() : '', source: claude.source, model: claude.model, baseUrl: claude.baseUrl, authHeader: claude.authHeader, ...(claude.token ? { token: claude.token } : {}) },
+      gemini: { managedVersion: gemini.versionChoice === 'custom' ? gemini.managedVersion.trim() : '', source: gemini.source, model: gemini.model, baseUrl: gemini.baseUrl, ...(gemini.apiKey ? { apiKey: gemini.apiKey } : {}) } } })) setDirty(false);
   };
   const installing = view.install?.phase === 'installing';
   const activeInstall = startingInstall ?? (installing ? view.install?.coder : undefined);
-  const startInstall = async (coder: 'codex' | 'claude') => {
+  const startInstall = async (coder: CoderKind) => {
     setStartingInstall(coder); setInstallRequestFailed(undefined);
     const confirmed = await action('install', { coder, revision: view.settings.revision });
     setStartingInstall(undefined);
     if (!confirmed) setInstallRequestFailed({ coder, previousStart: view.install?.startedAt });
   };
-  const installButton = (coder: 'codex' | 'claude', status: CoderStatusView) =>
+  const installButton = (coder: CoderKind, status: CoderStatusView) =>
     <button type="button" disabled={busy || installing || dirty || stale} onClick={() => void startInstall(coder)}>
       {startingInstall === coder ? '正在启动安装…' : installing && view.install?.coder === coder ? '正在安装…' : activeInstall ? `请先等待 ${names[activeInstall]} 安装结束` : status.managed.installed ? '重新安装托管版本' : '安装托管版本'}</button>;
-  const installActivity = (coder: 'codex' | 'claude') => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
+  const installActivity = (coder: CoderKind) => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
     : <>
       {dirty && <p className="nexus-channel-hint">请先保存设置，再安装所选版本。</p>}
       {activeInstall && activeInstall !== coder && <p className="nexus-channel-hint" role="status">正在安装 {names[activeInstall]}，一次只能安装一个工具。结束后请再点击安装 {names[coder]}，不会自动排队。</p>}
@@ -240,19 +244,19 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   return <section className="nexus-channel-settings" aria-label="编码工具">
     <h2>编码工具</h2>
     <ToolReadiness view={view} disabled={busy || dirty} refresh={() => void action('refresh')} />
-    <p>把编码任务派给本机的 Codex 或 Claude Code。Nexus 可以自己安装一份（托管）并用这里的端点和密钥运行，也可以使用系统里已有的安装。密钥保存在本机，不会回填到页面。</p>
+    <p>把编码任务派给本机的 Codex、Claude Code 或 Gemini CLI。Nexus 可以安装托管版本，也可以使用系统已有安装。密钥保存在本机，页面只显示配置状态。</p>
     {(error || readError) && <p role="alert" className="nexus-channel-error">{error || readError}</p>}
-    <p className="nexus-channel-hint">Codex 和 Claude Code 共用托管安装目录，一次安装一个工具。npm 会检查已成功安装的另一工具的依赖；另一工具未完成的安装需单独重试。</p>
+    <p className="nexus-channel-hint">三个工具共用托管安装目录，一次安装一个工具。npm 会保留已完成的其他工具；未完成的安装需分别重试。</p>
     <form onSubmit={event => { void submit(event); }}>
       <article className="nexus-channel-card">
         <header><h3>通用</h3></header>
         <label htmlFor="coders-default">默认工具</label>
         <select id="coders-default" value={draft.defaultCoder} disabled={busy} onChange={event => edit(d => ({ ...d, defaultCoder: event.target.value as Draft['defaultCoder'] }))}>
-          <option value="codex">Codex</option><option value="claude">Claude Code</option></select>
+          <option value="codex">Codex</option><option value="claude">Claude Code</option><option value="gemini">Gemini CLI</option></select>
         <label htmlFor="coders-concurrency">同时执行任务数</label>
         <select id="coders-concurrency" value={draft.maxConcurrent} disabled={busy} onChange={event => edit(d => ({ ...d, maxConcurrent: Number(event.target.value) }))}>
           {[1, 2, 3, 4].map(limit => <option key={limit} value={limit}>{limit}{limit === 2 ? '（推荐）' : ''}</option>)}</select>
-        <p className="nexus-channel-hint">Codex 和 Claude Code 共用此上限。独立工作区可并行，同一目录或同一 Git 工作树仍排队；有依赖的任务等待前置验证。保存后立即生效，调低上限不终止正在执行的任务。</p>
+        <p className="nexus-channel-hint">所有编码工具共用此上限。独立工作区可并行，同一目录或同一 Git 工作树仍排队；有依赖的任务等待前置验证。保存后立即生效，调低上限不终止正在执行的任务。</p>
         <label htmlFor="coders-security">派发模式（新任务生效）</label>
         <select id="coders-security" value={draft.securityMode === 'standard' && !draft.autoApproveSafe ? 'manual' : draft.securityMode} disabled={busy} onChange={event => {
           const mode = event.target.value;
@@ -263,8 +267,8 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           <option value="strict">严格模式：要求原生沙箱隔离</option>
           <option value="full">完全权限：关闭沙箱和执行审批</option></select>
         {draft.securityMode === 'full'
-          ? <p className="nexus-channel-hint">完全权限以当前系统用户权限执行：可读写项目外文件、访问网络、运行发布和系统命令；关闭 Codex / Claude 执行沙箱、DSH 执行审批及拦截规则，不自动提升为管理员。目标澄清、任务取消、运行时限和渠道身份绑定仍生效。保存后仅新任务采用，已有任务续接保持原权限。</p>
-          : <p className="nexus-channel-hint">自动审核和手动确认均使用标准模式，允许命令联网；Claude 命令没有操作系统文件隔离。严格模式要求沙箱可用，Claude 在原生 Windows 下不可用。已有任务续接保持原模式及审核规则。</p>}
+          ? <p className="nexus-channel-hint">完全权限以当前系统用户权限执行：可读写项目外文件、访问网络、运行发布和系统命令；关闭编码工具执行沙箱、DSH 执行审批及拦截规则，不自动提升为管理员。目标澄清、任务取消、运行时限和渠道身份绑定仍生效。保存后仅新任务采用，已有任务续接保持原权限。</p>
+          : <p className="nexus-channel-hint">自动审核和手动确认均使用标准模式，允许命令联网；Claude 和 Gemini 的命令没有操作系统文件隔离。严格模式要求沙箱可用，Claude 在原生 Windows 下不可用，Gemini 暂不支持。已有任务续接保持原模式及审核规则。</p>}
         <label htmlFor="coders-roots">限制可用的工作目录（每行一个绝对路径，留空跟随当前会话工作区）</label>
         <textarea id="coders-roots" rows={3} value={draft.roots} disabled={busy} placeholder="留空即可使用新建会话时选择的工作区"
           onChange={event => edit(d => ({ ...d, roots: event.target.value }))} />
@@ -360,6 +364,39 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
           {view.settings.claude.tokenConfigured && <button type="button" disabled={busy || stale} onClick={() => void action('clear-secret', { coder: 'claude', revision: view.settings.revision })}>清除 token</button>}
         </footer>
         {installActivity('claude')}
+      </article>
+      <article className="nexus-channel-card">
+        <header><h3>Gemini CLI</h3><Status status={view.gemini} /></header>
+        <p><Install label="托管安装" status={view.gemini.managed} />；<Install label="系统安装" status={view.gemini.system} /></p>
+        {view.gemini.login && <p className="nexus-channel-account">凭据：{view.gemini.login}</p>}
+        {view.gemini.problem && <p role="alert">{view.gemini.problem}</p>}
+        {view.gemini.platformProblem && view.gemini.platformProblem !== view.gemini.problem && <p className="nexus-channel-hint">{view.gemini.platformProblem}</p>}
+        <label htmlFor="gemini-source">来源</label>
+        <select id="gemini-source" value={draft.gemini.source} disabled={busy} onChange={event => edit(d => ({ ...d, gemini: { ...d.gemini, source: event.target.value as 'managed' | 'system' } }))}>
+          <option value="managed">Nexus 托管的 Gemini CLI</option><option value="system">系统安装（使用本机 gemini 命令）</option></select>
+        <p className="nexus-channel-hint">Google 登录需要在下方 Nexus 专用目录完成；系统安装也可以使用 DSH 启动环境中的 GEMINI_API_KEY。</p>
+        <ManagedVersion coder="gemini" value={draft.gemini} disabled={busy || installing}
+          change={value => edit(d => ({ ...d, gemini: { ...d.gemini, ...value } }))} />
+        <label htmlFor="gemini-model">模型（可选）</label>
+        <input id="gemini-model" maxLength={128} value={draft.gemini.model} disabled={busy} autoComplete="off" placeholder="留空使用 Gemini CLI 默认模型"
+          onChange={event => edit(d => ({ ...d, gemini: { ...d.gemini, model: event.target.value } }))} />
+        <label htmlFor="gemini-endpoint">Gemini 兼容网关（可选）</label>
+        <input id="gemini-endpoint" maxLength={512} value={draft.gemini.baseUrl} disabled={busy} autoComplete="off" placeholder="留空使用 Google 官方服务"
+          onChange={event => edit(d => ({ ...d, gemini: { ...d.gemini, baseUrl: event.target.value } }))} />
+        <p className="nexus-channel-hint">自定义网关需要提供 Google Gemini 接口协议与 API key。</p>
+        <label htmlFor="gemini-key">Gemini API key</label>
+        <input id="gemini-key" type="password" maxLength={4096} value={draft.gemini.apiKey} disabled={busy} autoComplete="new-password"
+          placeholder={view.settings.gemini.apiKeyConfigured ? '已保存，留空保留当前密钥' : '输入 Gemini API key，或在下方登录 Google'}
+          onChange={event => edit(d => ({ ...d, gemini: { ...d.gemini, apiKey: event.target.value } }))} />
+        <p className="nexus-channel-hint">Google 登录目录：<code>{view.geminiHome}</code>。{view.geminiLogin ? <>在 DSH 所在电脑的 {view.geminiLogin.shell} 中执行以下命令，选择「Log in with Google」，并将 API key 留空：</> : '安装后将显示 Google 登录命令。'}</p>
+        {view.geminiLogin && <pre className="nexus-channel-hint"><code>{view.geminiLogin.command}</code></pre>}
+        <p className="nexus-channel-hint">支持标准、完全权限与原会话续接。运行中调整需先取消再续接；严格沙箱暂不可用。</p>
+        {view.gemini.lastTask && <p className="nexus-channel-hint">最近任务 {view.gemini.lastTask.id}：{view.gemini.lastTask.statusLabel ?? taskStatus[view.gemini.lastTask.status] ?? view.gemini.lastTask.status}{view.gemini.lastTask.detail ? `（${view.gemini.lastTask.detail}）` : ''}，{when(view.gemini.lastTask.updatedAt)}</p>}
+        <footer>
+          {installButton('gemini', view.gemini)}
+          {view.settings.gemini.apiKeyConfigured && <button type="button" disabled={busy || stale} onClick={() => void action('clear-secret', { coder: 'gemini', revision: view.settings.revision })}>清除 Gemini API key</button>}
+        </footer>
+        {installActivity('gemini')}
       </article>
       {stale && <p role="alert">{explain('configuration_changed')} <button type="button" onClick={reload}>重新载入</button></p>}
       <footer className="nexus-channel-card" style={{ borderStyle: 'none', paddingTop: 0 }}>

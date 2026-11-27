@@ -25,7 +25,7 @@ export type HardVerdict = {
  * tokens — `~/.npmrc`, `/etc/npmrc` — stay protected, so nothing new becomes readable.
  */
 const PACKAGE_CONFIG = /^\.(npmrc|netrc)$/;
-const PROTECTED_BASENAMES = [/^\.env(\..+)?$/, /credentials/i, /^id_rsa/, /^id_ed25519/, /^id_ecdsa/, /\.pem$/];
+const PROTECTED_BASENAMES = [/^\.env(\..+)?$/, /credentials/i, /^oauth_creds\.json$/, /^google_accounts\.json$/, /^id_rsa/, /^id_ed25519/, /^id_ecdsa/, /\.pem$/];
 const PROTECTED_DIRS = ['.ssh', '.dsh', '.nexus', '.gnupg', '.aws', '.config/gh'];
 
 export function isEnvironmentFile(path: string): boolean { return /^\.env(?:\..+)?$/i.test(baseName(path)); }
