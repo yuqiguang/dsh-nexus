@@ -12,6 +12,7 @@ import { CoderSettingsStore, defaultSettings, redact, rootsInput, endpointUrl, c
 import type { CoderStore } from '../src/coders/store.js';
 import { MemoryRecords } from './helpers.js';
 import { DEFAULT_REVIEW_POLICY } from '../src/coders/review-policy.js';
+import { CODER_NAMES } from '../src/coders/types.js';
 
 test('full access and review rules require settings saves and survive reopening without changing defaults', async () => {
   const records = new MemoryRecords(), store = new CoderSettingsStore(records);
@@ -631,8 +632,101 @@ test('active coder tasks block version replacement and an install excludes both 
   try {
     const view = await instance.view();
     assert.equal(view.codex.active, 'none'); assert.equal(view.claude.active, 'none');
-    assert.match(view.codex.problem!, /托管安装正在进行/);
-    assert.match(view.claude.problem!, /托管安装正在进行/);
+    assert.equal(view.codex.waitingForInstall, 'codex'); assert.equal(view.claude.waitingForInstall, 'codex');
+    assert.match(view.codex.problem!, /Codex 正在进行托管安装/);
+    assert.match(view.claude.problem!, /Claude Code 已完成托管安装；Codex 安装中/);
+  } finally { finish(); await running; }
+});
+
+for (const selected of ['codex', 'claude', 'gemini'] as const) for (const failed of [false, true]) {
+  test(`${selected} installation preserves installed peers and clears their wait after ${failed ? 'failure' : 'success'}`, async t => {
+    const m = await manager({ managedCodex: true, managedClaude: true, managedGemini: true });
+    t.after(() => rm(m.root, { recursive: true, force: true }));
+    t.after(() => rm(m.bin, { recursive: true, force: true }));
+    const kinds = ['codex', 'claude', 'gemini'] as const;
+    const dependencies = Object.fromEntries(kinds.flatMap(kind => [[MANAGED_PACKAGES[kind].name, MANAGED_PACKAGES[kind].version],
+      [platformPackage(kind, host).name, platformPackage(kind, host).spec]]));
+    await writeFile(join(m.root, 'package.json'), JSON.stringify({ name: 'nexus-coders', private: true, dependencies }));
+    const store = new CoderSettingsStore(new MemoryRecords());
+    const saved = await store.save(0, { defaultCoder: 'claude', codex: { apiKey: 'fixture-codex-key' },
+      claude: { token: 'fixture-claude-token' }, gemini: { apiKey: 'fixture-gemini-key' } });
+    let finish!: () => void, npmCalls = 0;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    let instance!: CodersManager;
+    const installer = new CoderInstaller(m.layout, async () => {
+      npmCalls++;
+      await pending;
+      assert.deepEqual(JSON.parse(await readFile(join(m.root, 'package.json'), 'utf8')).dependencies, dependencies);
+      if (failed) return { code: 1, error: 'fixture install failure' };
+      await fakeManaged(m.root, selected);
+      await rm(join(m.layout.markers, `${selected}.json`));
+      return { code: 0 };
+    }, coder => instance.afterInstall(coder), Date.now, host);
+    instance = new CodersManager({ store, layout: m.layout, profileRoots: [m.root], installer,
+      env: { PATH: '' }, detect: { host, pluginSdk: async () => undefined } });
+    await instance.load();
+    const before = await instance.view();
+    for (const kind of kinds) assert.equal(before[kind].ready, true);
+    const peers = kinds.filter(kind => kind !== selected);
+    const markers = await Promise.all(peers.map(kind => readFile(join(m.layout.markers, `${kind}.json`), 'utf8')));
+    try {
+      const waiting = await instance.handle('install', { coder: selected, revision: saved.revision });
+      assert.equal(waiting.install?.coder, selected);
+      for (const kind of kinds) {
+        assert.equal(waiting[kind].active, 'none'); assert.equal(waiting[kind].ready, false);
+        assert.equal(waiting[kind].waitingForInstall, selected);
+        assert.ok(waiting[kind].problem?.includes(CODER_NAMES[selected]));
+      }
+      for (const kind of peers) {
+        assert.equal(waiting[kind].managed.installed, true);
+        assert.equal(waiting[kind].managed.version, before[kind].managed.version);
+        assert.match(waiting[kind].problem!, /已完成托管安装/);
+        assert.equal(waiting[kind].credentialState, 'configured');
+      }
+      assert.doesNotMatch(waiting[selected].problem!, /已完成托管安装/);
+      if (selected === 'gemini') {
+        const runtime = await instance.runtime();
+        assert.ok('error' in runtime.claude);
+        assert.equal(runtime.claude.waitingForInstall, 'gemini');
+        assert.match(runtime.claude.error, /Claude Code 已完成托管安装；Gemini CLI 安装中/);
+      }
+    } finally { finish(); await installer.whenDone(); }
+    const completed = await instance.view();
+    assert.equal(completed.install?.phase, failed ? 'failed' : 'installed');
+    for (const [index, kind] of peers.entries()) {
+      assert.equal(completed[kind].ready, true);
+      assert.equal(completed[kind].active, 'managed');
+      assert.equal(completed[kind].waitingForInstall, undefined);
+      assert.equal(completed[kind].problem, undefined);
+      assert.equal(await readFile(join(m.layout.markers, `${kind}.json`), 'utf8'), markers[index]);
+    }
+    assert.equal(completed[selected].waitingForInstall, undefined);
+    assert.equal(completed[selected].ready, !failed);
+    assert.equal(npmCalls, 1, 'waiting peers must not start another installation');
+    assert.deepEqual(await store.read(), saved, 'waiting must not modify credentials or preferences');
+  });
+}
+
+test('a usable system source keeps its readiness while another tool owns the managed directory', async t => {
+  const m = await manager({ managedCodex: true, codexOnPath: true });
+  t.after(() => rm(m.root, { recursive: true, force: true }));
+  t.after(() => rm(m.bin, { recursive: true, force: true }));
+  let finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  const installer = new CoderInstaller(m.layout, async () => { await pending; return { code: 1 }; }, undefined, Date.now, host);
+  const instance = new CodersManager({ store: new CoderSettingsStore(new MemoryRecords()), layout: m.layout,
+    profileRoots: [m.root], installer, env: { PATH: m.bin }, detect: { host, pluginSdk: async () => undefined },
+    loginStatus: async () => ({ state: 'configured', text: 'fixture login' }) });
+  await instance.load();
+  const running = installer.start('gemini');
+  try {
+    const view = await instance.view();
+    assert.equal(view.codex.active, 'system'); assert.equal(view.codex.fallback, true);
+    assert.equal(view.codex.ready, true); assert.equal(view.codex.waitingForInstall, undefined);
+    assert.equal(view.codex.problem, undefined);
+    assert.equal(view.claude.managed.installed, false);
+    assert.equal(view.claude.waitingForInstall, 'gemini');
+    assert.doesNotMatch(view.claude.problem!, /已完成托管安装/);
   } finally { finish(); await running; }
 });
 

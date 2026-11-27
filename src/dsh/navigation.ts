@@ -51,7 +51,9 @@ export class ChannelNavigation {
         if (!rows.length) return '当前聊天还没有可切换的会话。发送文字开始对话。';
         return '当前聊天的近期会话（仅同一身份、同一目录且未归档）：\n' + rows.slice(0, 20).map(row => {
           const number = row.sessionId === base ? '0' : row.sessionId.slice(base.length + 1);
-          return `${number}${row.sessionId === current ? ' [当前]' : ''}${row.running ? ' [执行中]' : ''} ${safe(String(row.projections?.values.title ?? '未命名'))} · ${new Date(row.updatedAt).toISOString().replace('T', ' ').slice(0, 16)} UTC`;
+          // Title is an optional projection extension, absent from some hosts' core types.
+          const title = (row.projections?.values as { title?: unknown } | undefined)?.title;
+          return `${number}${row.sessionId === current ? ' [当前]' : ''}${row.running ? ' [执行中]' : ''} ${safe(typeof title === 'string' && title.trim() ? title : '未命名')} · ${new Date(row.updatedAt).toISOString().replace('T', ' ').slice(0, 16)} UTC`;
         }).join('\n') + '\n回复“/s 编号”。编号固定，切换沿用原生历史，不自动恢复旧任务。';
       }
       if (!/^(0|[1-9]\d{0,8})$/.test(command.value)) return '请先发送“/s”，再回复“/s 编号”。';

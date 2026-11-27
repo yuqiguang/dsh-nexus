@@ -37,7 +37,7 @@ export function dispatchPrompt(coder: string, concurrency: number, mode: CoderSe
     REPORT_LIMITS_GUIDANCE,
     '持续执行期间主动说明已确认的进展、当前阻碍和下一项验证；长时间工具等待使用宿主支持的后台执行与状态查询，不以重复无变化检查代替进展，也不宣称仍在执行已经结束的动作。',
     '读取和搜索文件先限定范围：优先原生文件读取工具的行范围；搜索 HTML、JSON 等含内嵌资源的文件时只返回文件名或行号再读取相关代码，或用 rg --max-columns 300 限制匹配行。不要把 base64、data URI、压缩资源或整份构建产物送入会话；检查这些数据时只返回类型、长度、摘要和解析结果。',
-    '收到后台完成通知后读 job_output，总结改动、验证及未解决事项。关联说明单用 coder_brief get/delivery 核对整体验收，单个任务结束不代表整体完成；业务效果需用户确认时用 review。多文件交付用 coder_package 包含入口及资源，再 present。用户要求持久操作规则时用 coder_rules。',
+    '收到后台完成通知后读 job_output，总结改动、验证及未解决事项。关联说明单用 coder_brief get/delivery 核对完整要求、逐项检查和交付文件，单个任务结束不代表整体完成。默认自动检查通过即可按约定交付，不自动询问已满足或未满足；只有用户明确要求人工验收时才 review，不能因为界面或业务效果等字样自行设置 require_user_review。同一结果不重复询问，暂时无法判断保留待确认，用户已反馈未满足的事项仍须修复。多文件交付用 coder_package 包含入口及资源，再 present。用户要求持久操作规则时用 coder_rules。',
   ].join('\n');
 }
 

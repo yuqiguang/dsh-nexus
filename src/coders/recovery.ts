@@ -96,7 +96,7 @@ export function recoveryReport(brief: CoderBrief, records: TaskRecord[], forDisp
     if (recovery.blockers.length) lines.push(...recovery.blockers);
     if (recovery.action && !forDisplay) lines.push(`明确续接后调用 ${recovery.action.tool}：${JSON.stringify(recovery.action.arguments)}；其余目录、权限、验收和验证约定沿用原记录。`);
   }
-  lines.push('重试保留原任务与审批历史，不继承一次性授权；中断执行不能通过仅验证模式改写为编码完成。下游步骤须显式重新派发并绑定最新执行；交付前核对逐项检查、声明文件和业务验收。');
+  lines.push('重试保留原任务与审批历史，不继承一次性授权；中断执行不能通过仅验证模式改写为编码完成。下游步骤须显式重新派发并绑定最新执行；交付前核对逐项检查、声明文件和用户反馈，人工验收仅按用户明确要求进行。');
   return lines.join('\n');
 }
 

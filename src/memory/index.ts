@@ -1,11 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-agent';
-import type {} from '@deepseek-ai/dsh-compaction';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import type {} from '@deepseek-ai/dsh-tools';
 import { createUserMessage, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { Session } from '@deepseek-ai/dsh-session';
 import { ChannelError } from '../channels/types.js';
 import { formatLocal } from '../assistant/clock.js';
 import { rank } from './search.js';
@@ -172,7 +171,8 @@ export class MemoryService {
     return createUserMessage({ content: [{ type: 'text', text: parts.join('\n\n') }], source: { kind: MEMORY_PLUGIN, form: 'recall' } });
   }
 
-  onSessionEvent(session: Session, event: SessionEvent): void {
+  // Lifecycle extensions add event names beyond the host's core SessionEvent union.
+  onSessionEvent(session: Session, event: { readonly type: string }): void {
     if (event.type === 'compaction/end') this.sessions.delete(session.id);
   }
   forgetSession(sessionId: string): void { this.sessions.delete(sessionId); }

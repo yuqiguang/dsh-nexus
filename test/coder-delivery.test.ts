@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { criterionEvidence, deliveryReport } from '../src/coders/delivery.js';
+import { acceptanceDeferralKey, criterionEvidence, deliveryReport } from '../src/coders/delivery.js';
 import { briefReport, type CoderBrief } from '../src/coders/brief.js';
 import { taskReport } from '../src/coders/index.js';
 import type { TaskRecord } from '../src/coders/types.js';
@@ -9,15 +9,53 @@ const brief: CoderBrief = { id: 'b', revision: 1, objective: 'goal', constraints
 const record: TaskRecord = { id: 't', ownerSession: 'owner', brief, description: 'work', coder: 'claude', cwd: '/work', verify: 'node check.cjs', status: 'completed', createdAt: 1, updatedAt: 2,
   escalations: 0, decisions: [], result: { summary: 'done', changedFiles: ['/work/out'], commits: ['a'.repeat(40)], outsideRoots: [], execution: 'completed', verification: 'passed', verifyOk: true,
     verifyChecks: [{ command: 'node check.cjs', ok: true, executed: true, output: 'observed pass' }] } };
-test('delivery separates command checks from user acceptance and invalidates changed evidence', () => {
-  assert.match(deliveryReport(brief, [record]), /业务验收待确认/);
-  const accepted = { ...brief, reviews: [{ criterion: 'a1', evidence: criterionEvidence(brief, [record], 'a1').evidence, accepted: true, note: 'tested actual flow', at: 3 }] };
-  assert.match(deliveryReport(accepted, [record]), /检查与业务验收均通过/);
+test('explicitly required user acceptance stays separate from checks and invalidates changed evidence', () => {
+  const required = { ...brief, requireUserReview: true };
+  assert.match(deliveryReport(required, [record]), /自动检查通过，等待用户要求的人工验收/);
+  const accepted = { ...required, reviews: [{ criterion: 'a1', evidence: criterionEvidence(required, [record], 'a1').evidence, accepted: true, note: 'tested actual flow', at: 3 }] };
+  assert.match(deliveryReport(accepted, [record]), /自动检查与人工验收均通过/);
   assert.match(deliveryReport(accepted, [record]), /\/work\/out/);
   assert.match(deliveryReport(accepted, [record]), new RegExp('a'.repeat(40)));
-  assert.match(deliveryReport(accepted, [{ ...record, updatedAt: 4 }]), /业务验收待确认/);
+  assert.match(deliveryReport(accepted, [{ ...record, updatedAt: 4 }]), /人工验收待确认/);
   assert.match(deliveryReport(accepted, [{ ...record, ownerSession: 'foreign' }]), /任务 未安排/);
-  assert.match(deliveryReport({ ...accepted, revision: 2 }, [record]), /尚未完成全部验收/);
+  assert.match(deliveryReport({ ...accepted, revision: 2 }, [record]), /尚未完成全部检查/);
+});
+
+test('default delivery passes automatic checks without inventing user approval or bypassing failed evidence', () => {
+  const report = deliveryReport(brief, [record]);
+  assert.match(report, /自动检查通过，可以交付/);
+  assert.match(report, /人工验收可选，用户已确认 0\/1/);
+  for (const incomplete of [
+    { ...record, status: 'running' as const },
+    { ...record, verify: undefined },
+    { ...record, status: 'failed' as const },
+    { ...record, result: { ...record.result!, outsideRoots: ['/outside/changed'] } },
+    { ...record, result: { ...record.result!, verifyChecks: [{ command: record.verify!, ok: false, executed: false, output: 'not run' }] } },
+  ]) assert.doesNotMatch(deliveryReport(brief, [incomplete]), /可以交付/);
+});
+
+test('existing unresolved negative feedback blocks default delivery and changed evidence requires a fresh verdict', () => {
+  const rejected = { ...brief, reviews: [{ criterion: 'a1', evidence: criterionEvidence(brief, [record], 'a1').evidence, accepted: false, note: 'actual flow is broken', at: 3 }] };
+  const report = deliveryReport(rejected, [record]);
+  assert.match(report, /用户反馈未满足，需继续处理/);
+  assert.match(report, /actual flow is broken/);
+  assert.doesNotMatch(report, /可以交付/);
+  assert.match(deliveryReport(rejected, [{ ...record, updatedAt: 4 }]), /自动检查通过，可以交付/);
+  assert.doesNotMatch(deliveryReport(rejected, [{ ...record, updatedAt: 4 }]), /用户反馈未满足/);
+});
+
+test('unable to judge stays pending instead of counting as acceptance or rejection', () => {
+  const key = acceptanceDeferralKey('a1', criterionEvidence(brief, [record], 'a1').evidence);
+  const deferred = { ...brief, answers: [{ key, answers: { accept: '暂时无法判断' } }] };
+  const optional = deliveryReport(deferred, [record]);
+  assert.match(optional, /自动检查通过，可以交付/);
+  assert.match(optional, /暂时无法判断，待确认/);
+  assert.match(optional, /用户已确认 0\/1/);
+  assert.doesNotMatch(optional, /用户反馈未满足/);
+  const required = deliveryReport({ ...deferred, requireUserReview: true }, [record]);
+  assert.match(required, /等待用户要求的人工验收/);
+  assert.doesNotMatch(required, /可以交付/);
+  assert.doesNotMatch(deliveryReport({ ...deferred, requireUserReview: true }, [{ ...record, updatedAt: 4 }]), /人工验收暂时无法判断，待确认/);
 });
 
 test('multiple criteria do not inherit one task-wide pass, and individual failed or skipped checks remain visible', () => {

@@ -8,6 +8,28 @@ import { executeNativeTool } from '../src/dsh/tools.js';
 import { inspectSession } from '../src/dsh/history.js';
 import { scheduleCatalog } from '../src/dsh/schedule.js';
 import { automationRevision, manageAutomation } from '../src/dsh/automation.js';
+import { ChannelNavigation } from '../src/dsh/navigation.js';
+import type { SessionRosterView } from '../src/sessions/index.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('channel session menus accept optional title projections without rendering malformed values', async t => {
+  const cwd = await mkdtemp(join(tmpdir(), 'nexus-title-projection-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const base = 'nexus-wechat-' + 'a'.repeat(32);
+  const items = ['旧会话标题', undefined, { text: 'unexpected title shape' }, ''].map((title, index) => ({
+    sessionId: SessionId(index ? `${base}-${index}` : base), cwd, updatedAt: index, running: false, blank: false, agentAvailable: false,
+    ...(title === undefined ? {} : { projections: { values: { title } } }),
+  }));
+  const ctx = { sessionController: { list: async () => ({ items }) } } as unknown as Context;
+  const roster = { activeFor: () => base } as unknown as SessionRosterView;
+  const navigation = new ChannelNavigation(ctx, cwd, roster, new AbortController().signal, Date.now, async () => false, () => {});
+  const menu = await navigation.run(base, 'chat', { kind: 'sessions' });
+  assert.match(menu, /0 \[当前\] 旧会话标题/);
+  assert.equal(menu.match(/未命名/g)?.length, 3);
+  assert.doesNotMatch(menu, /\[object Object\]|unexpected title shape/);
+});
 
 test('single-call and batch native tools preserve call identity, scope, errors and deferred context', async () => {
   const callId = ToolCallId('runtime-call');

@@ -124,7 +124,7 @@ export function runGeminiTask(task: TaskRecord, deps: GeminiRunDeps): CoderRun {
       })();
       void reading.catch(() => finish({ status: 'failed', providerFailure: { kind: 'network' }, detail: 'Gemini ACP 输出连接中断。', result: lastText }));
       session = (async (): Promise<CoderOutcome> => {
-        const initialized = await send('initialize', { protocolVersion: 1, clientInfo: { name: 'dsh-nexus', version: '0.2.71' }, clientCapabilities: {} }, 60_000);
+        const initialized = await send('initialize', { protocolVersion: 1, clientInfo: { name: 'dsh-nexus', version: '0.2.72' }, clientCapabilities: {} }, 60_000);
         if (initialized?.protocolVersion !== 1) throw new Error('Gemini 未确认支持 ACP 协议版本 1。');
         if (task.coderSessionId && initialized.agentCapabilities?.loadSession !== true) throw new Error('此 Gemini 版本不支持原会话恢复。');
         const mcpServers = [{ name: 'nexus_coder', type: 'http', url: tools!.url, headers: [{ name: 'Authorization', value: `Bearer ${tools!.token}` }] },

@@ -2,14 +2,14 @@ import { channelWorkFixture } from './channel-work-fixture.js';
 import { CODEX_RESULT_SCHEMA, parseTurnResult } from '../src/coders/turn-result.js';
 import assert from 'node:assert/strict';
 import type { RetryNotice } from '../src/coders/retry.js';
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import { hasUserNamespaces } from './helpers.js';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions';
 import { runClaudeTask, type ClaudeQuery, type ClaudeStreamMessage } from '../src/coders/claude.js';
 import { escalateToUser, type EscalationHost } from '../src/coders/escalate.js';
 import { normalizeClaudeRequest } from '../src/coders/normalize.js';
-import { coderPrompt } from '../src/coders/brief.js';
+import { coderPrompt, installBriefs, type CoderBrief } from '../src/coders/brief.js';
 import { commandPathTokens, hardRule, isInside, isProtectedPath } from '../src/coders/rules.js';
 import { CoderStore, taskSchema, type CoderDomain, type DomainOpener } from '../src/coders/store.js';
 import type { CoderRequest, TaskRecord } from '../src/coders/types.js';
@@ -847,7 +847,7 @@ function coderHarness(reachUser?: (questions: AskUserQuestionItem[]) => { id: st
     } },
   } as unknown as Context;
   const run = (name: string, args: unknown, owner = task().ownerSession) => tools.get(name)!.execute(args, { agent: { id: owner, session }, callId: 'harness-call', rootCallId: 'harness-call' });
-  return { ctx, run, jobs, panels, asked, session, tasks: tables.tasks as Map<string, TaskRecord>, rules: tables.rules as Map<string, HabitRule> };
+  return { ctx, run, jobs, panels, asked, session, tasks: tables.tasks as Map<string, TaskRecord>, rules: tables.rules as Map<string, HabitRule>, briefs: tables.briefs as Map<string, CoderBrief> };
 }
 
 test('dispatch defaults to its native session, reports the directory, and resumes in the original subdirectory', async t => {
@@ -2216,7 +2216,7 @@ test('briefs keep shared constraints, distinguish uncovered acceptance, and reje
     assert.match(seen, /a1\. 新流程测试通过/);
     assert.doesNotMatch(seen, /a2\. 旧流程兼容/);
     const report = (await harness.run('coder_brief', { action: 'get', brief_id: id })).text!;
-    assert.match(report, /a1：新流程测试通过 — 本项独立检查通过，待需求验收/);
+    assert.match(report, /a1：新流程测试通过 — 本项独立检查通过，人工验收可选/);
     assert.match(report, /a2：旧流程兼容 — 尚未安排/);
     await harness.run('coder_brief', { action: 'save', brief_id: id, revision: 1, objective: '修订目标', acceptance: ['新的标准'] });
     await assert.rejects(harness.run('coder_brief', { action: 'save', brief_id: id, revision: 1, objective: '覆盖新目标', acceptance: ['旧标准'] }), /版本已变化/);
@@ -2299,16 +2299,161 @@ test('business acceptance is recorded only through the owner native question and
   const harness = coderHarness(questions => questions.map(question => ({ id: question.id!, selected: ['已满足'] })));
   try {
     await installCoders(harness.ctx, { securityMode: 'strict', roots: [workdir], query: scriptedQuery(async function* () { yield { type: 'result', subtype: 'success', result: 'done' }; }), defaultCoder: 'claude' });
-    const saved = await harness.run('coder_brief', { action: 'save', objective: 'goal', acceptance: ['actual user flow'] });
+    const saved = await harness.run('coder_brief', { action: 'save', objective: 'goal', acceptance: ['actual user flow'], require_user_review: true });
     const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
     await assert.rejects(harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1' }), /尚未关联/);
     await harness.run('coder_task', { cwd: workdir, description: 'work', brief_id: id, brief_revision: 1, acceptance_ids: ['a1'], verify: 'true' });
     await harness.jobs[0]!.done;
-    assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: id })).text!, /业务验收待确认/);
-    assert.match((await harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1' })).text!, /检查与业务验收均通过/);
+    assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: id })).text!, /人工验收待确认/);
+    assert.match((await harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1' })).text!, /自动检查与人工验收均通过/);
     assert.equal(harness.asked.length, 1);
+    const question = harness.asked[0]![0]!;
+    assert.match(question.question, /查看结果后.*actual user flow/);
+    assert.match(question.detail!, /目标：goal[\s\S]*查看方法：[\s\S]*结果摘要/);
+    assert.deepEqual(question.options?.map(option => option.label), ['已满足', '未满足', '暂时无法判断']);
+    assert.ok(question.options?.every(option => option.description));
+    await harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1' });
+    await harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1', reconfirm: true });
+    assert.equal(harness.asked.length, 1, 'repeat confirmation requires a new explicit user request');
     await assert.rejects(harness.run('coder_brief', { action: 'review', brief_id: id, revision: 1, criterion: 'a1' }, 'foreign'), /不属于/);
   } finally { await rm(workdir, { recursive: true, force: true }); }
+});
+
+test('automatic delivery and unsolicited review do not ask the owner, while an explicit request shows checked files', async t => {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-auto-delivery-'));
+  t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(questions => questions.map(question => ({ id: question.id, selected: ['已满足'] })), workdir);
+  await writeFile(join(workdir, 'check.cjs'), 'if (require("fs").readFileSync("result.txt", "utf8") !== "expected output") process.exit(3);');
+  await installCoders(harness.ctx, { securityMode: 'full', roots: [workdir], defaultCoder: 'claude',
+    query: async function* () {
+      await writeFile(join(workdir, 'result.txt'), 'expected output');
+      yield { type: 'result', subtype: 'success', result: 'result.txt contains the expected output' };
+    } });
+  const saved = await harness.run('coder_brief', { action: 'save', objective: '交付业务效果与界面测试结果', acceptance: ['结果符合预期'] });
+  const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  const review = { action: 'review', brief_id: id, revision: 1, criterion: 'a1' };
+  assert.match((await harness.run('coder_brief', review)).text!, /尚未完成全部检查/);
+  await harness.run('coder_task', { description: 'prepare the output', brief_id: id, brief_revision: 1, acceptance_ids: ['a1'], verify: 'node check.cjs', outputs: ['result.txt'] });
+  await harness.jobs.at(-1)!.done;
+  assert.equal(harness.tasks.values().next().value?.result?.verification, 'passed');
+  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: id })).text!, /自动检查通过，可以交付/);
+  assert.match((await harness.run('coder_brief', review)).text!, /人工验收可选，用户已确认 0\/1/);
+  assert.equal(harness.asked.length, 0);
+  assert.notEqual(harness.briefs.get(id)!.requireUserReview, true, 'business words do not opt a goal into manual review');
+  assert.match((await harness.run('coder_brief', { ...review, user_requested: true, note: '打开 result.txt，检查内容是否为 expected output。' })).text!, /自动检查与人工验收均通过/);
+  assert.match(harness.asked[0]![0]!.detail!, /查看方法与结果：打开 result.txt[\s\S]*已核验交付文件：[\s\S]*result.txt/);
+  await harness.run('coder_brief', { ...review, user_requested: true });
+  assert.equal(harness.asked.length, 1, 'the same explicit request does not repeat an answered question');
+});
+
+async function reviewFixture(t: TestContext, required: boolean, reachUser?: Parameters<typeof coderHarness>[0]) {
+  const workdir = await mkdtemp(join(tmpdir(), 'nexus-review-'));
+  t.after(() => rm(workdir, { recursive: true, force: true }));
+  const harness = coderHarness(reachUser, workdir);
+  const store = await installBriefs(harness.ctx, () => [...harness.tasks.values()]);
+  const saved = await harness.run('coder_brief', { action: 'save', objective: '查看交付结果', acceptance: ['实际结果符合要求'], ...(required ? { require_user_review: true } : {}) });
+  const id = /cb-[a-f0-9]+/.exec(saved.text!)![0];
+  const output = join(workdir, 'result.txt'), content = 'checked output';
+  await writeFile(output, content);
+  const record = task({ id: 'ct-review', cwd: workdir, brief: harness.briefs.get(id)!, status: 'completed', verify: 'node check.cjs', outputs: ['result.txt'],
+    result: { summary: '交付文件 result.txt 已准备', changedFiles: [output], commits: [], outsideRoots: [], execution: 'completed', verification: 'passed', verifyOk: true,
+      verifyChecks: [{ command: 'node check.cjs', ok: true, executed: true, output: 'independent fixture check passed' }],
+      artifactChecks: [{ path: output, ok: true, detail: 'fixture file checked', sha256: createHash('sha256').update(content).digest('hex'), size: Buffer.byteLength(content) }] } });
+  harness.tasks.set(record.id, record);
+  return { ...harness, store, id, output, record, review: { action: 'review', brief_id: id, revision: 1, criterion: 'a1' } };
+}
+
+test('uncertain review survives reload, never accepts a goal, and retains unresolved negative feedback', async t => {
+  let choice = '暂时无法判断';
+  const fixture = await reviewFixture(t, true, questions => questions.map(question => ({ id: question.id, selected: [choice], custom: choice === '未满足' ? '实际效果还有问题' : undefined })));
+  const first = (await fixture.run('coder_brief', fixture.review)).text!;
+  assert.match(first, /暂时无法判断，待确认/);
+  assert.match(first, /用户已确认 0\/1/);
+  assert.doesNotMatch(first, /可以交付|用户反馈未满足/);
+  assert.equal(fixture.briefs.get(fixture.id)!.reviews?.length ?? 0, 0);
+  await installBriefs(fixture.ctx, () => [...fixture.tasks.values()]);
+  await fixture.run('coder_brief', { ...fixture.review, user_requested: true });
+  assert.equal(fixture.asked.length, 1, 'persisted deferral suppresses repeated questions after reopening the service');
+  const again = { ...fixture.review, user_requested: true, reconfirm: true };
+  choice = '未满足';
+  assert.match((await fixture.run('coder_brief', again)).text!, /用户反馈未满足，需继续处理/);
+  assert.equal(fixture.briefs.get(fixture.id)!.answers?.length ?? 0, 0);
+  await fixture.run('coder_brief', fixture.review);
+  assert.equal(fixture.asked.length, 2);
+  choice = '暂时无法判断';
+  const uncertain = (await fixture.run('coder_brief', again)).text!;
+  assert.match(uncertain, /用户反馈未满足[\s\S]*本次暂时无法判断，待确认/);
+  assert.doesNotMatch(uncertain, /可以交付/);
+  assert.equal(fixture.briefs.get(fixture.id)!.reviews?.[0]?.accepted, false);
+  choice = '已满足';
+  assert.match((await fixture.run('coder_brief', again)).text!, /自动检查与人工验收均通过/);
+  assert.equal(fixture.briefs.get(fixture.id)!.answers?.length ?? 0, 0);
+  choice = '暂时无法判断';
+  const withdrawn = (await fixture.run('coder_brief', again)).text!;
+  assert.match(withdrawn, /用户已确认 0\/1/);
+  assert.doesNotMatch(withdrawn, /可以交付|用户反馈未满足/);
+});
+
+test('manual review preference is optional for old briefs and persists through edits, plans, amendments and snapshots', async t => {
+  const fixture = await reviewFixture(t, false);
+  assert.equal(fixture.store.snapshot(fixture.id, fixture.record.ownerSession, 1, ['a1']).requireUserReview, undefined);
+  const fields = { objective: '查看交付结果', acceptance: ['实际结果符合要求'] };
+  await fixture.run('coder_brief', { action: 'save', brief_id: fixture.id, revision: 1, ...fields, require_user_review: true });
+  await fixture.run('coder_brief', { action: 'save', brief_id: fixture.id, revision: 2, ...fields });
+  await fixture.run('coder_brief', { action: 'plan', brief_id: fixture.id, revision: 3,
+    steps: [{ id: 'work', description: '完成全部工作', acceptance_ids: ['a1'], depends_on: [], verify: 'node check.cjs' }] });
+  await fixture.run('coder_brief', { action: 'amend', brief_id: fixture.id, revision: 4, objective: '查看更新后的结果' });
+  assert.equal(fixture.store.snapshot(fixture.id, fixture.record.ownerSession, 5, ['a1']).requireUserReview, true);
+  await fixture.run('coder_brief', { action: 'save', brief_id: fixture.id, revision: 5, ...fields, require_user_review: false });
+  await fixture.run('coder_brief', { action: 'save', brief_id: fixture.id, revision: 6, ...fields });
+  assert.equal(fixture.store.snapshot(fixture.id, fixture.record.ownerSession, 7, ['a1']).requireUserReview, false);
+});
+
+test('concurrent reviews share one pending owner question and a completed answer is not asked again', async t => {
+  const fixture = await reviewFixture(t, true);
+  let finish!: () => void;
+  const answer = new Promise<{ answers: { id: string; selected: string[] }[] }>(resolve => { finish = () => resolve({ answers: [{ id: 'accept', selected: ['已满足'] }] }); });
+  fixture.ctx.userQuestions.ask = async request => { fixture.asked.push(request.questions); return answer; };
+  const pending = fixture.run('coder_brief', fixture.review);
+  t.after(async () => { finish(); await pending.catch(() => {}); });
+  await until(() => fixture.asked.length === 1, 'first review is waiting');
+  assert.match((await fixture.run('coder_brief', fixture.review)).text!, /本项正在等待用户反馈，请在原问题回答/);
+  assert.equal(fixture.asked.length, 1);
+  finish();
+  assert.match((await pending).text!, /自动检查与人工验收均通过/);
+  await fixture.run('coder_brief', fixture.review);
+  assert.equal(fixture.asked.length, 1);
+});
+
+for (const changed of ['file', 'task', 'goal'] as const) test(`review rejects a ${changed} change during the owner question without saving stale feedback`, async t => {
+  const fixture = await reviewFixture(t, true);
+  fixture.ctx.userQuestions.ask = async request => {
+    fixture.asked.push(request.questions);
+    if (changed === 'file') await writeFile(fixture.output, 'edited after checking');
+    if (changed === 'task') fixture.tasks.set(fixture.record.id, { ...fixture.record, updatedAt: fixture.record.updatedAt + 1 });
+    if (changed === 'goal') await fixture.store.save(fixture.record.ownerSession, { objective: 'new goal', acceptance: ['new criterion'] }, fixture.id, 1);
+    return { answers: [{ id: 'accept', selected: ['已满足'] }] };
+  };
+  await assert.rejects(fixture.run('coder_brief', fixture.review), changed === 'goal' ? /目标已变化/ : /任务证据已变化/);
+  assert.equal(fixture.briefs.get(fixture.id)!.reviews?.length ?? 0, 0);
+  assert.equal(fixture.briefs.get(fixture.id)!.answers?.length ?? 0, 0);
+  assert.doesNotMatch((await fixture.run('coder_brief', { action: 'delivery', brief_id: fixture.id })).text!, /可以交付/);
+});
+
+test('invalid review answers release the question guard and unfinished or foreign tasks never ask', async t => {
+  let choice = 'invalid';
+  const fixture = await reviewFixture(t, true, questions => questions.map(question => ({ id: question.id, selected: [choice] })));
+  await assert.rejects(fixture.run('coder_brief', fixture.review), /未取得有效的人工验收回答/);
+  choice = '暂时无法判断';
+  assert.match((await fixture.run('coder_brief', fixture.review)).text!, /暂时无法判断，待确认/);
+  assert.equal(fixture.asked.length, 2, 'a failed question does not leave the criterion locked');
+  fixture.tasks.set(fixture.record.id, { ...fixture.record, status: 'running' });
+  await assert.rejects(fixture.run('coder_brief', fixture.review), /任务仍在执行/);
+  await assert.rejects(fixture.run('coder_brief', fixture.review, 'foreign'), /不属于当前会话/);
+  await assert.rejects(fixture.run('coder_brief', { ...fixture.review, revision: 99 }), /当前 revision/);
+  Object.assign(fixture.ctx, { sandboxPolicy: { resolve: () => ({ mode: 'read-only' }) } });
+  await assert.rejects(fixture.run('coder_brief', fixture.review), /只读会话不能修改/);
+  assert.equal(fixture.asked.length, 2);
 });
 
 test('recovery retries only failed steps and redirects descendants to the new attempt without rerunning success', { skip: noNamespaces }, async () => {
@@ -2816,7 +2961,7 @@ test('local dispatch carries scoped approvals through interruption, original-ses
     }
     return input.operation.includes('narrate.py') ? { safe: false, reason: 'fixture external operation requires this scope to be answered by owner' } : { safe: true, reason: 'local verification fixture' };
   } });
-  const saved = await harness.run('coder_brief', { action: 'save', objective: 'deliver complete reproducible project', acceptance: ['output', 'current documentation and declared status', 'changed input reproduction'] });
+  const saved = await harness.run('coder_brief', { action: 'save', objective: 'deliver complete reproducible project', acceptance: ['output', 'current documentation and declared status', 'changed input reproduction'], require_user_review: true });
   const briefId = /cb-[a-f0-9]+/.exec(saved.text!)![0];
   const commands = ['node output.cjs', 'node docs.cjs', 'node reproduce.cjs changed-text', 'node reproduce.cjs changed-rate'];
   const first = (await harness.run('coder_task', { cwd, description: 'complete project', brief_id: briefId, brief_revision: 1, acceptance_ids: ['a1', 'a2', 'a3'], verify_commands: commands,
@@ -2853,7 +2998,7 @@ test('local dispatch carries scoped approvals through interruption, original-ses
   assert.equal(harness.tasks.get(verified)!.result?.verification, 'passed');
   assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /已核验声明文件[\s\S]*status.json/);
   for (const criterion of ['a1', 'a2', 'a3']) await harness.run('coder_brief', { action: 'review', brief_id: briefId, revision: 1, criterion });
-  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /检查与业务验收均通过/);
+  assert.match((await harness.run('coder_brief', { action: 'delivery', brief_id: briefId })).text!, /自动检查与人工验收均通过/);
   assert.deepEqual(harness.tasks.get(first), interrupted, 'old interruption and approval history remain immutable');
   await assert.rejects(harness.run('coder_task', { resume_task_id: first }), /已有后续执行/);
 });

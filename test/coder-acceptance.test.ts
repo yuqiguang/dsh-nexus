@@ -56,21 +56,25 @@ test('stale documentation, a claimed but absent file and an unrun reproduction b
   assert.equal(first.verifyChecks?.[0]?.ok, false); assert.equal(first.verifyChecks?.[1]?.executed, false);
   assert.match(deliveryReport(brief, [task]), /检查通过 0\/2/);
   assert.match(deliveryReport(brief, [task]), /status.json.*不存在/);
+  assert.doesNotMatch(deliveryReport(brief, [task]), /可以交付/);
   await writeFile(join(cwd, 'README.md'), 'version 2');
   const second = await check();
   assert.equal(second.verifyChecks?.every(check => check.ok && check.executed), true);
   assert.equal(second.verifyOk, false, 'passing commands cannot prove an absent declared artifact exists');
   assert.match(deliveryReport(brief, [task]), /检查通过 1\/2/);
+  assert.doesNotMatch(deliveryReport(brief, [task]), /可以交付/);
   await writeFile(join(cwd, 'status.json'), '{"complete":true}');
   assert.equal((await check()).verifyOk, true);
   assert.equal(await readFile(join(cwd, 'changed-rate.txt'), 'utf8'), 'verified changed-rate');
-  assert.match(deliveryReport(brief, [task]), /检查通过 2\/2，用户验收 0\/2/);
+  assert.match(deliveryReport(brief, [task]), /自动检查通过 2\/2，人工验收可选，用户已确认 0\/2/);
+  assert.match(deliveryReport(brief, [task]), /自动检查通过，可以交付/);
   const saved = structuredClone(task);
   const original = await stat(join(cwd, 'README.md'));
   await writeFile(join(cwd, 'README.md'), 'version 1'); await utimes(join(cwd, 'README.md'), original.atime, original.mtime);
   const view = await currentArtifactEvidence([task]);
   assert.match(deliveryReport(brief, view), /独立验证后已变化/);
   assert.match(deliveryReport(brief, view), /检查通过 1\/2/);
+  assert.doesNotMatch(deliveryReport(brief, view), /可以交付/);
   assert.deepEqual(task, saved, 'delivery inspection must not rewrite the persisted task');
 });
 

@@ -12,7 +12,7 @@ import { GEMINI_STRICT_PROBLEM, type GeminiLaunch } from './gemini-config.js';
 import { describeRule } from './habits.js';
 import { CoderSettingsStore, coderConcurrency, redact, type CoderSettingsRecord, type CoderSettingsView, type CoderSource, type CoderSecurityMode } from './settings.js';
 import type { CoderStore } from './store.js';
-import type { CoderKind, HabitRule, TaskRecord } from './types.js';
+import { CODER_NAMES, type CoderKind, type HabitRule, type TaskRecord } from './types.js';
 import { coderHomes, type CoderHomes } from './transcript.js';
 
 export interface CoderStatusView {
@@ -27,6 +27,8 @@ export interface CoderStatusView {
   fallback: boolean;
   ready: boolean;
   problem?: string;
+  /** The installation currently holding the shared managed directory. */
+  waitingForInstall?: CoderKind;
   /** Codex system install: `codex login status` output with keys masked. Managed: derived from the settings. */
   login?: string;
   /** Configuration/login evidence only, not a successful model request. */
@@ -57,6 +59,7 @@ export interface CodersView {
 export type CodexRuntime = { command: string; env: NodeJS.ProcessEnv; source: CoderSource; model?: string };
 export type ClaudeRuntime = { sdkPath?: string; executable?: string; env: NodeJS.ProcessEnv; source: CoderSource; model?: string };
 export type GeminiRuntime = GeminiLaunch & { source: CoderSource };
+type UnavailableRuntime = { error: string; waitingForInstall?: CoderKind };
 
 /** Everything the supervisor needs at dispatch time; `error` carries a user-facing reason a coder cannot run. */
 export interface EffectiveRuntime {
@@ -69,10 +72,10 @@ export interface EffectiveRuntime {
   allowedNetworkDomains?: string[];
   roots: string[];
   defaultCoder: CoderKind;
-  codex: CodexRuntime | { error: string };
-  claude: ClaudeRuntime | { error: string };
+  codex: CodexRuntime | UnavailableRuntime;
+  claude: ClaudeRuntime | UnavailableRuntime;
   /** Optional only for older embedded hosts that inject their own runtime. */
-  gemini?: GeminiRuntime | { error: string };
+  gemini?: GeminiRuntime | UnavailableRuntime;
 }
 
 export interface ManagerDeps {
@@ -269,12 +272,22 @@ export class CodersManager {
     return settings.roots?.length ? settings.roots : this.deps.profileRoots;
   }
 
-  /** A source counts only when its install is complete and no install of that coder is running right now. */
+  /** Complete managed sources wait while any installation owns the shared directory. */
   private pick(coder: CoderKind, preferred: CoderSource, detection: CoderDetection): { active: CoderSource | 'none'; fallback: boolean } {
     const usable = (source: CoderSource) => detection[source].installed && !(source === 'managed' && this.deps.installer.installing() !== undefined);
     if (usable(preferred)) return { active: preferred, fallback: false };
     const other: CoderSource = preferred === 'managed' ? 'system' : 'managed';
     return usable(other) ? { active: other, fallback: true } : { active: 'none', fallback: false };
+  }
+
+  private unavailable(coder: CoderKind, detection: CoderDetection, missing: string): UnavailableRuntime {
+    const installing = this.deps.installer.installing();
+    if (!installing) return { error: missing };
+    const name = CODER_NAMES[coder], installerName = CODER_NAMES[installing];
+    const error = installing === coder ? `${name} 正在进行托管安装，请等待安装结束。`
+      : detection.managed.installed ? `${name} 已完成托管安装；${installerName} 安装中，暂时等待共用目录释放。`
+      : `${installerName} 正在进行托管安装，请在本次安装结束后检查 ${name} 的安装状态。`;
+    return { error, waitingForInstall: installing };
   }
 
   private codexEnv(settings: CoderSettingsRecord, source: CoderSource): NodeJS.ProcessEnv {
@@ -316,7 +329,7 @@ export class CodersManager {
     const claudePlatformProblem = coderPlatformProblem('claude', platform, securityMode);
     const codexPick = this.pick('codex', settings.codex.source, detection.codex);
     let codex: EffectiveRuntime['codex'];
-    if (codexPick.active === 'none') codex = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。' : 'Codex 尚未安装。请在设置页的“编码工具”里安装，或在本机安装 codex 命令。' };
+    if (codexPick.active === 'none') codex = this.unavailable('codex', detection.codex, 'Codex 尚未安装。请在设置页的“编码工具”里安装，或在本机安装 codex 命令。');
     else if (codexPlatformProblem) codex = { error: codexPlatformProblem };
     else {
       if (codexPick.active === 'managed') await this.ensureCodexHome(settings);
@@ -330,8 +343,8 @@ export class CodersManager {
     }
     const claudePick = this.pick('claude', settings.claude.source, detection.claude);
     let claude: EffectiveRuntime['claude'];
-    if (claudePick.active === 'none') claude = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。'
-      : 'Claude Code 不可用：既没有完成的托管安装，插件自带的 SDK 也没有可用的 claude 命令或匹配本机的二进制。请在设置页的“编码工具”里安装。' };
+    if (claudePick.active === 'none') claude = this.unavailable('claude', detection.claude,
+      'Claude Code 不可用：既没有完成的托管安装，插件自带的 SDK 也没有可用的 claude 命令或匹配本机的二进制。请在设置页的“编码工具”里安装。');
     else if (claudePlatformProblem) claude = { error: claudePlatformProblem };
     else {
       await this.ensureClaudeHome();
@@ -346,7 +359,7 @@ export class CodersManager {
     }
     const geminiPick = this.pick('gemini', settings.gemini.source, detection.gemini);
     let gemini: NonNullable<EffectiveRuntime['gemini']>;
-    if (geminiPick.active === 'none') gemini = { error: this.deps.installer.installing() ? '托管安装正在进行，请等它完成。' : 'Gemini CLI 尚未安装，请在编码工具设置中安装，或在本机安装 gemini 命令。' };
+    if (geminiPick.active === 'none') gemini = this.unavailable('gemini', detection.gemini, 'Gemini CLI 尚未安装，请在编码工具设置中安装，或在本机安装 gemini 命令。');
     else if (coderPlatformProblem('gemini', platform, securityMode)) gemini = { error: GEMINI_STRICT_PROBLEM };
     else {
       await this.ensureGeminiHome(settings, geminiPick.active);
@@ -398,12 +411,15 @@ export class CodersManager {
     const status = (kind: CoderKind, pick: ReturnType<CodersManager['pick']>, detected: CoderDetection, resolved: NonNullable<EffectiveRuntime['codex' | 'claude' | 'gemini']>): CoderStatusView => ({
       managed: detected.managed, system: detected.system, active: pick.active, fallback: pick.fallback,
       ...(coderPlatformProblem(kind, this.deps.detect?.host?.platform ?? process.platform, settings.securityMode ?? 'standard') ? { platformProblem: coderPlatformProblem(kind, this.deps.detect?.host?.platform ?? process.platform, settings.securityMode ?? 'standard') } : {}),
-      ready: !('error' in resolved), ...('error' in resolved ? { problem: resolved.error } : {}),
+      ready: !('error' in resolved), ...('error' in resolved ? { problem: resolved.error,
+        ...(resolved.waitingForInstall ? { waitingForInstall: resolved.waitingForInstall } : {}) } : {}),
       ...(this.lastTask(kind) ? { lastTask: this.lastTask(kind) } : {}),
     });
     const codex = status('codex', codexPick, detection.codex, runtime.codex);
     if ((this.deps.detect?.host?.platform ?? process.platform) === 'win32' && settings.securityMode !== 'full' && codexPick.active !== 'none') codex.windowsSandbox = this.settingUpSandbox ? 'checking' : this.sandbox?.status ?? 'failed';
-    const login = await this.codexLogin(settings, codexPick.active, detection.codex);
+    // The shared installation lock blocks execution, but does not remove saved managed credentials.
+    const loginSource = codexPick.active === 'none' && codex.waitingForInstall && detection.codex.managed.installed ? 'managed' : codexPick.active;
+    const login = await this.codexLogin(settings, loginSource, detection.codex);
     if (login) { codex.login = login.text; codex.credentialState = login.state; }
     const claude = status('claude', claudePick, detection.claude, runtime.claude);
     const claudeOauth = await access(join(this.deps.layout.claudeHome, '.credentials.json'), constants.R_OK).then(() => true, () => false);

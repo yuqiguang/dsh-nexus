@@ -79,20 +79,25 @@ function Install({ label, status }: { label: string; status: InstallStatus }) {
   return <span>{label}：{status.installed ? `${status.version ?? '已安装'}` : status.problem ? `${status.version ?? ''} ${problems[status.problem] ?? status.problem}`.trim() : '未安装'}</span>;
 }
 
-function Status({ status }: { status: CoderStatusView }) {
-  return <span className={`nexus-channel-state ${status.ready ? 'connected' : status.active === 'none' ? '' : 'error'}`}>
-    {status.ready ? `可用（${sources[status.active]}${status.fallback ? `，首选的${sources[status.active === 'managed' ? 'system' : 'managed']}不可用` : ''}）` : status.active === 'none' ? '未安装' : '未就绪'}</span>;
+function Status({ coder, status }: { coder: CoderKind; status: CoderStatusView }) {
+  const installed = status.managed.installed || status.system.installed;
+  return <span className={`nexus-channel-state ${status.ready ? 'connected' : status.waitingForInstall || !installed ? '' : 'error'}`}>
+    {status.ready ? `可用（${sources[status.active]}${status.fallback ? `，首选的${sources[status.active === 'managed' ? 'system' : 'managed']}不可用` : ''}）`
+      : status.waitingForInstall === coder ? '托管安装中'
+      : status.waitingForInstall && installed ? '已安装，暂时等待' : installed ? '未就绪' : '未安装'}</span>;
 }
 
 function ToolReadiness({ view, disabled, refresh }: { view: CodersView; disabled: boolean; refresh(): void }) {
   const coder = view[view.settings.defaultCoder];
   const prepared = coder.ready && coder.credentialState === 'configured';
+  const installing = coder.waitingForInstall === view.settings.defaultCoder;
+  const detectedSource = coder.active !== 'none' ? coder.active : coder.managed.installed ? 'managed' : coder.system.installed ? 'system' : undefined;
   return <article className="nexus-channel-card" aria-label="工具状态检查">
-    <header><h3>工具状态检查</h3><span className="nexus-channel-state">{prepared ? '默认工具配置已准备' : '默认工具待配置'}</span></header>
+    <header><h3>工具状态检查</h3><span className="nexus-channel-state">{prepared ? '默认工具配置已准备' : installing ? '默认工具安装中' : coder.waitingForInstall ? '默认工具暂时等待' : '默认工具待配置'}</span></header>
     <p>项目在 DSH 新建会话时选择，无需在此重复选择。这里检查已保存的默认编码工具配置。</p>
     <ul className="nexus-readiness">
       <li>默认工具：{names[view.settings.defaultCoder]}</li>
-      <li>安装：{coder.active === 'none' ? '尚未安装，请在下方安装或选择已有工具' : `已检测到${coder.active === 'managed' ? '托管' : '系统'}安装`}</li>
+      <li>安装：{installing ? '托管安装进行中，请等待程序文件检查完成' : detectedSource ? `已检测到${detectedSource === 'managed' ? '托管' : '系统'}安装` : '尚未安装，请在下方安装或选择已有工具'}</li>
       <li>凭据：{coder.credentialState === 'configured' ? '已检测到配置，实际可用性以任务结果为准' : coder.credentialState === 'missing' ? '尚未配置，请在下方登录或填写凭据' : '尚未确认，请检查下方登录状态'}</li>
       <li>运行配置：{coder.ready ? '检查通过' : coder.problem ?? '请先完成安装与平台配置'}</li>
     </ul>
@@ -237,7 +242,9 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
   const installActivity = (coder: CoderKind) => startingInstall === coder ? <p role="status">正在启动 {names[coder]} 托管安装…</p>
     : <>
       {dirty && <p className="nexus-channel-hint">请先保存设置，再安装所选版本。</p>}
-      {activeInstall && activeInstall !== coder && <p className="nexus-channel-hint" role="status">正在安装 {names[activeInstall]}，一次只能安装一个工具。结束后请再点击安装 {names[coder]}，不会自动排队。</p>}
+      {activeInstall && activeInstall !== coder && <p className="nexus-channel-hint" role="status">正在安装 {names[activeInstall]}，一次只能安装一个工具。
+        {view[coder].managed.installed ? `${names[coder]} 的托管版本已安装，本次安装结束后自动重新检查。`
+          : `如需安装 ${names[coder]}，请在本次安装结束后再点击安装，不会自动排队。`}</p>}
       {installRequestFailed?.coder === coder && error && <p role="alert">安装请求未能确认：{error}。请等待状态刷新后再决定是否重试。</p>}
       {view.install?.coder === coder && <InstallActivity progress={view.install} readError={readError} />}
     </>;
@@ -296,10 +303,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
         <p className="nexus-channel-hint">运行时限和连续失败暂停适用于所有模式。续接沿用原任务权限；切换模式后请新建任务。显式指定的离线或回环验证仍需相应隔离环境，完全权限不会取消该验证约定。</p>
       </article>
       <article className="nexus-channel-card">
-        <header><h3>Codex</h3><Status status={view.codex} /></header>
+        <header><h3>Codex</h3><Status coder="codex" status={view.codex} /></header>
         <p><Install label="托管安装" status={view.codex.managed} />；<Install label="系统安装" status={view.codex.system} />{view.codex.system.path ? `（${view.codex.system.path}）` : ''}</p>
         {view.codex.login && <p className="nexus-channel-account">登录：{view.codex.login}</p>}
-        {view.codex.problem && <p role="alert">{view.codex.problem}</p>}
+        {view.codex.problem && <p role={view.codex.waitingForInstall ? 'status' : 'alert'}>{view.codex.problem}</p>}
         {view.codex.platformProblem && view.codex.platformProblem !== view.codex.problem && <p className="nexus-channel-hint">{view.codex.platformProblem}</p>}
         {view.codex.windowsSandbox && <p className="nexus-channel-hint">Windows 增强沙箱：{view.codex.windowsSandbox === 'ready' ? '已就绪' : view.codex.windowsSandbox === 'checking' ? '配置中…' : '未就绪'}。
           {view.codex.windowsSandbox !== 'ready' && view.codex.windowsSandbox !== 'firewallDisabled' && <button type="button" disabled={busy || view.codex.windowsSandbox === 'checking'} onClick={() => void action('windows-sandbox/setup')}>
@@ -332,10 +339,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
         {installActivity('codex')}
       </article>
       <article className="nexus-channel-card">
-        <header><h3>Claude Code</h3><Status status={view.claude} /></header>
+        <header><h3>Claude Code</h3><Status coder="claude" status={view.claude} /></header>
         <p><Install label="托管安装" status={view.claude.managed} />；<Install label="系统安装" status={view.claude.system} />{view.claude.system.executable ? `（${view.claude.system.executable}）` : ''}</p>
         {view.claude.login && <p className="nexus-channel-account">凭据：{view.claude.login}</p>}
-        {view.claude.problem && <p role="alert">{view.claude.problem}</p>}
+        {view.claude.problem && <p role={view.claude.waitingForInstall ? 'status' : 'alert'}>{view.claude.problem}</p>}
         {view.claude.platformProblem && view.claude.platformProblem !== view.claude.problem && <p className="nexus-channel-hint">{view.claude.platformProblem}</p>}
         <label htmlFor="claude-source">来源</label>
         <select id="claude-source" value={draft.claude.source} disabled={busy} onChange={event => edit(d => ({ ...d, claude: { ...d.claude, source: event.target.value as 'managed' | 'system' } }))}>
@@ -366,10 +373,10 @@ export function CoderSettings({ api = coderApi, navigation, close }: { api?: Cod
         {installActivity('claude')}
       </article>
       <article className="nexus-channel-card">
-        <header><h3>Gemini CLI</h3><Status status={view.gemini} /></header>
+        <header><h3>Gemini CLI</h3><Status coder="gemini" status={view.gemini} /></header>
         <p><Install label="托管安装" status={view.gemini.managed} />；<Install label="系统安装" status={view.gemini.system} /></p>
         {view.gemini.login && <p className="nexus-channel-account">凭据：{view.gemini.login}</p>}
-        {view.gemini.problem && <p role="alert">{view.gemini.problem}</p>}
+        {view.gemini.problem && <p role={view.gemini.waitingForInstall ? 'status' : 'alert'}>{view.gemini.problem}</p>}
         {view.gemini.platformProblem && view.gemini.platformProblem !== view.gemini.problem && <p className="nexus-channel-hint">{view.gemini.platformProblem}</p>}
         <label htmlFor="gemini-source">来源</label>
         <select id="gemini-source" value={draft.gemini.source} disabled={busy} onChange={event => edit(d => ({ ...d, gemini: { ...d.gemini, source: event.target.value as 'managed' | 'system' } }))}>

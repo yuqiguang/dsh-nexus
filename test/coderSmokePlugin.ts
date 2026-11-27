@@ -111,10 +111,9 @@ class FixtureModel extends LlmAdapter {
       yield* this.toolCall('read', 'job_output', { job_id: this.jobId });
     } else if (step === 5) {
       yield* this.toolCall('brief-report', 'coder_brief', { action: 'get', brief_id: this.briefId });
-    } else {
-      assert.equal(step, 6);
+    } else if (step === 6) {
       const coverage = toolResultText(options, 'brief-report');
-      assert.match(coverage, /a1：目录检查通过 — 本项独立检查通过，待需求验收/);
+      assert.match(coverage, /a1：目录检查通过 — 本项独立检查通过，人工验收可选/);
       assert.match(coverage, /a2：后续业务验收 — 尚未安排/);
       const report = toolResultText(options, 'read');
       assert.match(report, /编码任务 ct-[0-9a-f]{8} 执行结束/);
@@ -125,6 +124,13 @@ class FixtureModel extends LlmAdapter {
       assert.match(report, /\[用户·允许\] Claude wants to run git push — git push/);
       assert.match(report, /\[DSH 审核·允许\] Claude wants to run ls -la/, 'standard command review must be recorded');
       assert.match(report, /\[status: completed\]/);
+      yield* this.toolCall('optional-review', 'coder_brief', { action: 'review', brief_id: this.briefId, revision: 2, criterion: 'a1' });
+    } else {
+      assert.equal(step, 7);
+      const delivery = toolResultText(options, 'optional-review');
+      assert.match(delivery, /人工验收可选，未要求/);
+      assert.match(delivery, /尚未完成全部检查/);
+      assert.doesNotMatch(delivery, /等待用户要求的人工验收/);
       yield* this.text('Claude Code 已完成：目录里有 1 个文件，验证通过。它想读取 SSH 私钥被监工拒绝，ls 自动放行，git push 由你批准。');
     }
   }
@@ -263,7 +269,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     await bridge.receive(inbound('answer', '回答 1'));
     await until(() => claude.decisions.length === 3, 'allow did not reach the fake Claude', 10_000);
     assert.deepEqual(store.rules(), []);
-    await until(() => model.calls === 7, 'job completion did not wake the idle agent', 20_000);
+    await until(() => model.calls === 8, 'job completion did not wake the idle agent', 20_000);
     await agent.whenIdle();
     await bridge.drain();
     const done = store.get(task.id)!;
@@ -294,8 +300,9 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     const detail = await readTask('get', { id: done.id }) as TaskDetailView;
     assert.equal(detail.ownerSession, sessionId);
     assert.equal(detail.goal?.revision, done.brief?.revision);
-    assert.match(detail.goal!.report, /业务验收待确认/);
-    assert.match(detail.goal!.report, /尚未完成全部验收/);
+    assert.match(detail.goal!.report, /人工验收可选，未要求/);
+    assert.match(detail.goal!.report, /尚未完成全部检查/);
+    assert.doesNotMatch(detail.goal!.report, /等待用户要求的人工验收/);
     assert.equal(detail.recovery?.title, '指定检查已通过');
     assert.match(detail.goal!.recovery!, /保留已通过的结果/);
     assert.ok(detail.result!.verifyChecks?.every(check => check.ok && check.executed));
@@ -329,7 +336,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     assert.deepEqual(JSON.parse(audits[4]!.input!), input);
     assert.match(audits[1]!.output!, /"safe":true/);
     assert.equal(agent.session.snapshotEvents().length, events.length, 'auxiliary review does not change the conversation log');
-    assert.equal(model.calls, 7, 'the tool-less reviewer does not create another agent turn');
+    assert.equal(model.calls, 8, 'the tool-less reviewer does not create another agent turn');
     assert.equal(await ctx.sessions.flush(agent.session), true);
     const persisted = await ctx.sessionPersistence.open(sessionId, 'read');
     try { assert.equal((await persisted.read()).events.length, events.length); }
@@ -371,7 +378,7 @@ export async function apply(ctx: Context, config: { phase: number; workspace: st
     finally { await reopened.close(); }
     await writeFile(config.reportFile, JSON.stringify({ passed: true, phase: config.phase, modelCalls: model.calls, sessionId,
       checks: ['native_owner_approval_receipt_scoped_and_persisted', 'native_per_criterion_file_evidence_persisted', 'native_direct_write_conflict_rejected_before_approval', 'native_read_available_during_coder', 'native_bash_job_keeps_workspace_lease', 'native_bash_notice_origin_persists_by_message_id', 'native_channel_task_origin_persisted', 'native_task_question_delivery_correlation', 'native_job_notice_origin_verified', 'planned_dispatch_uses_saved_description', 'bound_project_snapshot_survives_native_storage_reopen', 'empty_review_retries_once_through_native_llm_without_new_turn_or_prompt', 'review_failure_and_usage_audit_survives_native_storage_reopen', 'task_cards_link_native_notice_by_owner_and_stable_task_id', 'task_card_placement_survives_storage_reopen_without_replay', 'transient_failure_resumes_same_native_job_and_session', 'automatic_resume_audit_survives_native_storage_reopen', 'task_recovery_keeps_native_approval_scope', 'task_recovery_preserves_verified_steps_and_exposes_checks', 'task_detail_reads_owner_and_goal_acceptance_without_new_execution', 'native_safety_review_uses_owner_model_and_task_audit_without_changing_history', 'local_check_uses_native_sandbox_and_private_loopback', 'coder_task_dispatches_native_job', 'brief_links_task_without_claiming_entire_goal_complete', 'validated_plan_supplies_native_job_verification', 'hard_rule_denies_credential_read_without_user', 'escalation_reaches_channel_after_turn_end',
-        'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
+        'native_brief_review_requires_explicit_user_request', 'standard_command_reviewed_without_user', 'steps_recorded_while_waiting', 'job_panel_shows_steps_outside_the_model_read', 'channel_answer_resumes_claude', 'online_verification_gets_scoped_dsh_review', 'coder_research_uses_native_web_providers', 'job_completion_wakes_idle_agent', 'report_delivered_to_channel'],
     }, null, 2));
   }
 }

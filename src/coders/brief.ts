@@ -2,7 +2,7 @@ import { CODER_WORK_GUIDANCE } from './prompt.js';
 import { sameChat } from '../channels/protocol.js';
 import { analyzeChange, type BriefChange } from './change.js';
 import { recoveryReport } from './recovery.js';
-import { briefTasks, criterionEvidence, deliveryReport, type AcceptanceReview } from './delivery.js';
+import { acceptanceDeferralKey, briefTasks, criterionEvidence, deliveryReport, reviewDeferred, type AcceptanceReview } from './delivery.js';
 import { planSchema, validatePlan } from './plan.js';
 import type { Context } from '@deepseek-ai/cordis';
 import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
@@ -20,6 +20,7 @@ import { currentArtifactEvidence, expectedArtifacts } from './artifacts.js';
 export const briefSnapshotSchema = z.object({
   id: z.string(), revision: z.number().int().positive(), objective: z.string().min(1).max(4000), constraints: z.string().max(4000),
   cwd: z.string().min(1).optional(),
+  requireUserReview: z.boolean().optional(),
   acceptance: z.array(z.object({ id: z.string(), text: z.string().min(1).max(500) })).min(1).max(20),
 });
 export type BriefSnapshot = z.infer<typeof briefSnapshotSchema>;
@@ -27,6 +28,7 @@ const briefSchema = briefSnapshotSchema.extend({ answers: z.array(z.object({ key
 export type CoderBrief = z.infer<typeof briefSchema>;
 const inputSchema = z.object({ objective: z.string().trim().min(1).max(4000), constraints: z.string().trim().max(4000).default(''),
   cwd: z.string().trim().min(1).optional(),
+  requireUserReview: z.boolean().optional(),
   acceptance: z.array(z.string().trim().min(1).max(500)).min(1).max(20) });
 export const briefDomain = defineDomain({ name: 'nexus_coder_briefs', version: 1, layout: 'per-record',
   tables: { briefs: domainTable<string, CoderBrief>(briefSchema) } });
@@ -51,7 +53,7 @@ export class BriefStore {
     if (id && this.changing.has(id)) throw new Error('说明单正在应用变更，请稍后重试。');
     const existing = id ? this.get(id, owner) : undefined;
     const fieldsInput = input && typeof input === 'object' ? input as Record<string, unknown> : {};
-    const parsed = inputSchema.safeParse({ ...fieldsInput, cwd: fieldsInput.cwd ?? existing?.cwd, constraints: fieldsInput.constraints ?? existing?.constraints ?? '' });
+    const parsed = inputSchema.safeParse({ ...fieldsInput, cwd: fieldsInput.cwd ?? existing?.cwd, constraints: fieldsInput.constraints ?? existing?.constraints ?? '', requireUserReview: fieldsInput.requireUserReview ?? existing?.requireUserReview });
     if (!parsed.success) throw new Error('请提供目标、约束和 1 至 20 条验收标准；目标与约束各最多 4000 字，单条标准最多 500 字。');
     const fields = { ...parsed.data, acceptance: parsed.data.acceptance.map((text, index) => ({ id: `a${index + 1}`, text })) };
     if (id) {
@@ -95,8 +97,20 @@ export class BriefStore {
   async review(id: string, owner: string, revision: number, review: AcceptanceReview): Promise<void> {
     this.get(id, owner);
     await this.table.update(id, current => {
-      if (!sameChat(current.ownerSession, owner) || current.revision !== revision) throw new Error('验收期间目标已变化，请重新核对。');
-      return { ...current, updatedAt: Date.now(), reviews: [...(current.reviews ?? []).filter(item => item.criterion !== review.criterion), review] };
+      if (!sameChat(current.ownerSession, owner) || current.revision !== revision || this.changing.has(id)) throw new Error('验收期间目标已变化，请重新核对。');
+      return { ...current, updatedAt: Date.now(), reviews: [...(current.reviews ?? []).filter(item => item.criterion !== review.criterion), review],
+        answers: current.answers?.filter(item => item.key !== acceptanceDeferralKey(review.criterion, review.evidence)) };
+    });
+  }
+  async deferReview(id: string, owner: string, revision: number, criterion: string, evidence: string): Promise<void> {
+    this.get(id, owner);
+    await this.table.update(id, current => {
+      if (!sameChat(current.ownerSession, owner) || current.revision !== revision || this.changing.has(id)) throw new Error('验收期间目标已变化，请重新核对。');
+      const key = acceptanceDeferralKey(criterion, evidence);
+      return { ...current, updatedAt: Date.now(),
+        // A new uncertain answer replaces a positive verdict, while unresolved negative feedback still needs work.
+        reviews: current.reviews?.filter(review => !(review.criterion === criterion && review.evidence === evidence && review.accepted)),
+        answers: [...(current.answers ?? []).filter(item => item.key !== key), { key, answers: { accept: '暂时无法判断' } }].slice(-50) };
     });
   }
   async amend(id: string, owner: string, revision: number | undefined, change: BriefChange, stop: () => Promise<void>): Promise<CoderBrief> {
@@ -132,7 +146,7 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
   for (const criterion of brief.acceptance) {
     const related = tasks.filter(task => task.brief!.acceptance.some(item => item.id === criterion.id));
     const state = !related.length ? '尚未安排' : related.some(isActive) ? '进行中或等待中' : related.some(task => ['failed', 'cancelled', 'interrupted'].includes(task.status))
-      ? '有失败、取消或中断，需复核' : criterionEvidence(brief, records, criterion.id).checked ? '本项独立检查通过，待需求验收' : '任务执行结束，本项检查未通过或未登记';
+      ? '有失败、取消或中断，需复核' : criterionEvidence(brief, records, criterion.id).checked ? `本项独立检查通过，人工验收${brief.requireUserReview ? '按用户要求确认' : '可选'}` : '任务执行结束，本项检查未通过或未登记';
     lines.push(`- ${criterion.id}：${criterion.text} — ${state}${related.length ? `（${related.map(task => task.id).join('、')}）` : ''}`);
   }
   if (brief.plan) lines.push('步骤计划（依赖顺序；尚未派发不代表已执行）：', ...brief.plan.map(step => `${step.id}：${step.description}；验收项 ${step.acceptance_ids.join('、')}；前置步骤 ${step.depends_on.join('、') || '无'}；验证 ${step.verify}`));
@@ -143,7 +157,7 @@ export function briefReport(brief: CoderBrief, records: TaskRecord[]): string {
     return `${task.id}${task.planStep ? `（步骤 ${task.planStep}）` : ''} ${taskStatusLabel(task)}：${task.description.slice(0, 160)}${task.verify ? `；验证：${[task.verify, ...(task.verifyCommands ?? [])].join('；')}` : ''}${task.result ? `；项目文件 ${changes.project.length}，依赖 ${changes.dependencies.length}，测试/缓存产物 ${changes.generated.length}；${(task.result.detail || task.result.summary).slice(0, 240)}` : ''}`;
   }) : ['尚无本版本的关联任务。']),
     ...(tasks.length > 50 ? [`另有 ${tasks.length - 50} 个任务未展开；验收覆盖仍统计全部关联任务。`] : []),
-    '以上仅汇总任务与检查证据，不代表完整目标已验收；未关联的要求和实际业务效果仍需主助手核对。');
+    '以上汇总任务与检查证据；未关联的要求和实际业务效果仍需主助手核对。默认按自动检查交付，人工验收仅按用户明确要求进行。');
   return lines.join('\n');
 }
 
@@ -160,17 +174,21 @@ export function coderPrompt(task: Pick<TaskRecord, 'description' | 'continuation
 
 export async function installBriefs(ctx: Context, records: () => TaskRecord[], stopTasks?: (tasks: TaskRecord[]) => Promise<void>, askUser?: (request: Parameters<typeof ctx.userQuestions.ask>[0]) => ReturnType<typeof ctx.userQuestions.ask>, resolveDirectory?: (path: string, exec: ToolRunContext) => Promise<string>): Promise<BriefStore> {
   const store = new BriefStore(await ctx.storageDomain.open(briefDomain));
+  const reviewing = new Set<string>();
   ctx.effect(() => () => { void store.close(); });
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'coder_brief',
-    description: '记录和查看编码需求的目标、共同约束与验收项。复杂需求先保存说明单，局部小改动或普通修复无需创建；需要派发时以完整工作为单位，确需独立验收或阶段依赖时才 plan 拆分，每步声明验收项、前置步骤、验证和 outputs。先核实运行环境，项目初始化不能用改写测试掩盖服务启动失败。已有说明单的续接保留计划、约束和验收；目标变更先 impact 再 amend，失败用 recover，交付用 delivery 并按需 review。它不启动任务，也不创建、完成或恢复原生 goal；查询时汇总当前版本的任务和验证证据，不能把子任务完成当作整个目标完成。',
+    description: '记录和查看编码需求的目标、共同约束与验收项。复杂需求先保存说明单，局部小改动或普通修复无需创建；需要派发时以完整工作为单位，确需独立验收或阶段依赖时才 plan 拆分，每步声明验收项、前置步骤、验证和 outputs。先核实运行环境，项目初始化不能用改写测试掩盖服务启动失败。已有说明单的续接保留计划、约束和验收；目标变更先 impact 再 amend，失败用 recover，交付用 delivery。默认自动检查通过即可按约定交付，不自动发起人工验收；仅用户明确要求时才 review。同一结果默认不重复询问，未满足反馈仍需处理。它不启动任务，也不创建、完成或恢复原生 goal；查询汇总当前版本任务和验证证据，不能把子任务完成当作整个目标完成。',
     parameters: {
-      action: { type: 'string', enum: ['save', 'plan', 'get', 'list', 'delivery', 'review', 'recover', 'impact', 'amend'], required: true, description: 'save 新建或修改（清除旧步骤计划）；plan 保存完整步骤计划并检查覆盖、引用和循环依赖；get 查询覆盖；list 列表；delivery 交付汇总；review 用户验收；recover 恢复清单；impact 预览变更；amend 停止旧版活动任务后应用新版本。' },
+      action: { type: 'string', enum: ['save', 'plan', 'get', 'list', 'delivery', 'review', 'recover', 'impact', 'amend'], required: true, description: 'save 新建或修改（清除旧步骤计划）；plan 保存完整步骤计划并检查覆盖、引用和循环依赖；get 查询覆盖；list 列表；delivery 交付汇总，不提问；review 按用户明确要求人工验收；recover 恢复清单；impact 预览变更；amend 停止旧版活动任务后应用新版本。' },
       brief_id: { type: 'string', description: 'get 或修改时必填。' },
       revision: { type: 'integer', description: '修改时填写刚读取的版本；旧版本会被拒绝。' },
       cwd: { type: 'string', description: 'save 时可指定项目根目录（相对于当前会话工作区）；新项目应在这里绑定目录。省略时首次派发会固定实际目录。后续步骤默认沿用，不能越出项目或会话边界。' },
       criterion: { type: 'string', description: 'review 必填，向用户确认的具体验收项 ID。' },
       note: { type: 'string', description: 'review 可填，向用户说明核验方式与实际结果，最多 1000 字；不能代替用户确认。' },
+      require_user_review: { type: 'boolean', description: '仅 save 使用。只有用户明确要求人工验收作为交付条件时设 true，默认 false。不要因为测试通过、界面或业务效果等字样自行开启。修改时省略会保留原设置。' },
+      user_requested: { type: 'boolean', description: '仅 review 使用。只有用户在本次明确要求查看并确认结果时设 true；否则仅说明单已要求人工验收时可提问。' },
+      reconfirm: { type: 'boolean', description: '仅 review 使用。同一结果默认不重复询问，包含已满足、未满足和暂时无法判断。仅用户明确要求重新确认时设 true，并同时 user_requested=true。' },
       steps: { type: 'array', description: 'plan 必填，完整步骤列表。保存成功会生成新版本；不启动任务。preflight 登记环境自检；verify_commands 追加 verify 之后的检查；acceptance_checks 对应逐项验收；outputs 列需实际核验的预期交付文件。', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string', required: true }, description: { type: 'string', required: true }, acceptance_ids: { type: 'array', items: { type: 'string' }, required: true }, depends_on: { type: 'array', items: { type: 'string' }, required: true }, verify: { type: 'string', required: true }, verify_commands: { type: 'array', items: { type: 'string' } }, acceptance_checks: acceptanceChecksParameter, preflight: { type: 'string' }, outputs: { type: 'array', items: { type: 'string' } } } } },
       objective: { type: 'string', description: '用户目标，不自行扩大范围。save 必填。' },
       constraints: { type: 'string', description: '用户已明确的范围、约束及关键决定。save 时完整填写。' },
@@ -198,17 +216,47 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
       if (args.action === 'recover') return { text: recoveryReport(store.get(args.brief_id!, owner), records()) };
       if (args.action === 'delivery' || args.action === 'review') {
         const brief = store.get(args.brief_id!, owner);
+        const evidenceRecords = await currentArtifactEvidence(briefTasks(brief, records()), exec.signal);
         if (args.action === 'review') {
           if (brief.revision !== args.revision || !args.criterion) throw new Error('review 需要当前 revision 和 criterion。');
-          const state = criterionEvidence(brief, await currentArtifactEvidence(briefTasks(brief, records()), exec.signal), args.criterion);
+          const state = criterionEvidence(brief, evidenceRecords, args.criterion);
+          if (!brief.requireUserReview && !args.user_requested) return { text: deliveryReport(brief, evidenceRecords) };
+          const previous = brief.reviews?.some(review => review.criterion === args.criterion && review.evidence === state.evidence)
+            || reviewDeferred(brief, args.criterion, state.evidence);
+          if (previous && !(args.user_requested && args.reconfirm)) return { text: deliveryReport(brief, evidenceRecords) };
           if (!state.settled) throw new Error('该验收项尚未关联任务或任务仍在执行，请先完成工作。');
-          const note = (args.note ?? '').slice(0, 1000);
-          const answer = await (askUser ?? (request => ctx.userQuestions.ask(request)))({ agent: exec.agent, signal: exec.signal, wait: { callId: exec.callId }, questions: [{ id: 'accept', question: `请确认业务验收：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
-            detail: `${state.checked ? '关联任务的独立检查已通过。' : '关联任务尚未全部通过独立检查。'}${note}\n任务：${state.tasks.map(task => task.id).join('、')}`, options: [{ label: '已满足' }, { label: '未满足' }] }] });
-          if (criterionEvidence(brief, await currentArtifactEvidence(briefTasks(brief, records()), exec.signal), args.criterion).evidence !== state.evidence) throw new Error('验收期间任务证据已变化，请重新核对。');
-          const selected = answer.answers.find(item => item.id === 'accept');
-          if (!selected || selected.selected.length !== 1 || !['已满足', '未满足'].includes(selected.selected[0]!)) throw new Error('未取得明确的业务验收回答。');
-          await store.review(brief.id, owner, brief.revision, { criterion: args.criterion, evidence: state.evidence, accepted: selected.selected.includes('已满足'), note: selected.custom?.slice(0, 1000) ?? note, at: Date.now() });
+          const reviewKey = `${brief.id}:${brief.revision}:${args.criterion}`;
+          if (reviewing.has(reviewKey)) return { text: `${deliveryReport(brief, evidenceRecords)}\n本项正在等待用户反馈，请在原问题回答。` };
+          reviewing.add(reviewKey);
+          try {
+            const note = (args.note ?? '').slice(0, 1000);
+            const files = [...new Set(state.tasks.flatMap(task => task.result?.artifactChecks?.filter(check => check.ok).map(check => check.path) ?? []))];
+            const detail = [
+              `目标：${brief.objective}`,
+              `需要你查看：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
+              note ? `查看方法与结果：${note}` : '查看方法：打开交付文件或查看下方结果摘要，再按这项要求判断；不清楚怎么核对时请选择“暂时无法判断”。',
+              state.checked ? '自动检查：本项已通过。' : `自动检查：本项尚未全部通过。${state.gaps.join('；')}`,
+              ...state.tasks.slice(0, 10).map(task => `结果摘要（${task.id}）：${(task.result?.detail || task.result?.summary || task.description).slice(0, 240)}`),
+              ...(files.length ? ['已核验交付文件：', ...files.slice(0, 20).map(path => `- ${path}`), ...(files.length > 20 ? ['其余文件见交付汇总。'] : [])] : []),
+              '请按实际结果反馈；选择“未满足”时可补充哪里有问题。“暂时无法判断”会保留待确认。',
+            ].join('\n');
+            const answer = await (askUser ?? (request => ctx.userQuestions.ask(request)))({ agent: exec.agent, signal: exec.signal, wait: { callId: exec.callId }, questions: [{ id: 'accept', header: '结果确认', question: `查看结果后，这项要求是否已经做到：${brief.acceptance.find(item => item.id === args.criterion)!.text}`,
+              detail, options: [
+                { label: '已满足', description: '我已查看结果，符合这项要求。' },
+                { label: '未满足', description: '我已查看结果，还有问题；可补充具体原因。' },
+                { label: '暂时无法判断', description: '我还没查看，或不清楚怎么核对；保留待确认。' },
+              ] }] });
+            const current = store.get(brief.id, owner);
+            if (current.revision !== brief.revision || store.isChanging(brief.id)) throw new Error('验收期间目标已变化，请重新核对。');
+            if (criterionEvidence(current, await currentArtifactEvidence(briefTasks(current, records()), exec.signal), args.criterion).evidence !== state.evidence) throw new Error('验收期间任务证据已变化，请重新核对。');
+            const selected = answer.answers.find(item => item.id === 'accept');
+            if (!selected || selected.selected.length !== 1 || !['已满足', '未满足', '暂时无法判断'].includes(selected.selected[0]!)) throw new Error('未取得有效的人工验收回答。');
+            if (selected.selected[0] === '暂时无法判断') {
+              await store.deferReview(brief.id, owner, brief.revision, args.criterion, state.evidence);
+            } else {
+              await store.review(brief.id, owner, brief.revision, { criterion: args.criterion, evidence: state.evidence, accepted: selected.selected[0] === '已满足', note: selected.custom?.slice(0, 1000) ?? note, at: Date.now() });
+            }
+          } finally { reviewing.delete(reviewKey); }
         }
         return { text: deliveryReport(store.get(brief.id, owner), await currentArtifactEvidence(briefTasks(brief, records()), exec.signal)) };
       }
@@ -217,7 +265,7 @@ export async function installBriefs(ctx: Context, records: () => TaskRecord[], s
         if (args.action !== 'save' || !resolveDirectory) throw new Error('项目目录只能通过可验证工作区边界的 save 操作设置。');
         cwd = await resolveDirectory(args.cwd, exec);
       }
-      const brief = args.action === 'plan' ? await store.plan(args.brief_id!, owner, args.revision, args.steps) : args.action === 'save' ? await store.save(owner, { ...args, cwd }, args.brief_id, args.revision) : store.get(args.brief_id!, owner);
+      const brief = args.action === 'plan' ? await store.plan(args.brief_id!, owner, args.revision, args.steps) : args.action === 'save' ? await store.save(owner, { ...args, cwd, requireUserReview: args.require_user_review }, args.brief_id, args.revision) : store.get(args.brief_id!, owner);
       return { text: briefReport(brief, records()) };
     },
   })));

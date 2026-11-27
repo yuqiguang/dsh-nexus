@@ -309,6 +309,55 @@ test('reopening settings shows an existing Claude install, refresh failures and 
   assert.equal(codex.querySelector('footer button')!.textContent, '安装托管版本');
 });
 
+test('installing Gemini keeps an installed Claude visible as waiting and restores readiness without reinstalling it', async t => {
+  const view = initial();
+  view.settings.defaultCoder = 'claude';
+  const installedClaude = { ...view.claude, managed: { installed: true, version: '0.3.273' }, active: 'managed' as const,
+    ready: true, problem: undefined, credentialState: 'configured' as const };
+  view.claude = installedClaude;
+  const installs: unknown[] = [];
+  const ui = await page(t, async (method, payload) => {
+    if (method === 'install') {
+      installs.push(payload);
+      view.install = { coder: 'gemini', phase: 'installing', stage: 'packages', startedAt: Date.now(), log: '' };
+      view.gemini = { ...view.gemini, waitingForInstall: 'gemini', problem: 'Gemini CLI 正在进行托管安装，请等待安装结束。' };
+      view.claude = { ...installedClaude, active: 'none', ready: false, waitingForInstall: 'gemini',
+        problem: 'Claude Code 已完成托管安装；Gemini CLI 安装中，暂时等待共用目录释放。' };
+    }
+    return structuredClone(view);
+  });
+  const claude = ui.field('claude-source').closest('article')!;
+  const gemini = ui.field('gemini-source').closest('article')!;
+  const readiness = () => ui.dom.window.document.querySelector('[aria-label="工具状态检查"]')!;
+  await act(async () => { (gemini.querySelector('footer button') as HTMLButtonElement).click(); });
+  assert.deepEqual(installs, [{ coder: 'gemini', revision: 0 }]);
+  assert.equal(claude.querySelector('header .nexus-channel-state')!.textContent, '已安装，暂时等待');
+  assert.match(claude.textContent!, /托管安装：0\.3\.273/);
+  assert.match(claude.textContent!, /Claude Code 已完成托管安装；Gemini CLI 安装中/);
+  assert.match(claude.textContent!, /本次安装结束后自动重新检查/);
+  assert.doesNotMatch(claude.textContent!, /不会自动排队|再点击安装|正在启动 Claude/);
+  assert.equal(claude.querySelector('[role=alert]'), null);
+  assert.equal(claude.querySelector('.nexus-install-activity'), null);
+  assert.equal(gemini.querySelector('header .nexus-channel-state')!.textContent, '托管安装中');
+  assert.match(readiness().textContent!, /默认工具暂时等待/);
+  assert.match(readiness().textContent!, /安装：已检测到托管安装/);
+  assert.doesNotMatch(readiness().textContent!, /尚未安装|默认工具待配置/);
+  const claudeInstall = claude.querySelector('footer button') as HTMLButtonElement;
+  assert.equal(claudeInstall.disabled, true);
+  await act(async () => { claudeInstall.click(); });
+  assert.equal(installs.length, 1);
+  view.install = { ...view.install!, phase: 'installed', finishedAt: Date.now() };
+  view.claude = installedClaude;
+  view.gemini = { ...view.gemini, waitingForInstall: undefined };
+  await act(async () => { await delay(1700); });
+  assert.match(claude.querySelector('header .nexus-channel-state')!.textContent!, /可用（Nexus 托管）/);
+  assert.match(readiness().textContent!, /默认工具配置已准备/);
+  assert.doesNotMatch(claude.textContent!, /暂时等待|自动重新检查|Gemini CLI 安装中/);
+  assert.equal(claudeInstall.disabled, false);
+  assert.equal(claudeInstall.textContent, '重新安装托管版本');
+  assert.equal(installs.length, 1, 'completion must not queue a Claude reinstall');
+});
+
 test('a rejected install request gives feedback next to its button and releases the starting state', async t => {
   const ui = await page(t, async method => {
     if (method === 'install') throw new Error('connection_failed');

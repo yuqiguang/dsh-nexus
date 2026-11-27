@@ -174,7 +174,7 @@ export function coderTaskPanel(api: TaskApi = taskApi, openSession?: (id: string
           {view.result.changedFiles.length > 0 && <ul>{view.result.changedFiles.slice(0, 40).map(file => <li key={file}>{file}</li>)}</ul>}
           {!!view.result.outsideRoots.length && <p role="alert">发现 {view.result.outsideRoots.length} 项工作区外改动，请先检查改动范围。</p>}
           <h4>独立验证</h4>
-          <p className="nexus-channel-hint">仅表示以下检查的结果，业务验收见“目标与验收”。没有记录的检查不能视为通过。</p>
+          <p className="nexus-channel-hint">以下是自动检查结果，完整要求与用户反馈见“目标与验收”。人工验收仅在你明确要求时进行；没有记录的检查不能视为通过。</p>
           {view.result.verifyChecks?.length ? <ol>{view.result.verifyChecks.map((check, index) => <li key={index}>
             <details><summary>{check.executed ? check.ok ? '通过' : '失败' : '未执行'}：{check.command}</summary><pre>{check.output || '（无输出）'}</pre></details>
           </li>)}</ol> : <p>没有逐条检查记录。</p>}
